@@ -32,10 +32,20 @@ scripts/vm/        run on the VM (as ubuntu)
 config/            NetworkManager keyfiles, GRUB override, interim netplan
 lists/             package lists from the export (all, manual, portable, repacked, ...)
 docs/              README from the export folder
+  datto-siris-registration-flow.md  registration workflow notes; PDF built from Markdown
 ```
 
 The scripts in `scripts/vm/` are the **corrected** versions. They include the fixes for each
 problem hit during the session (SSH lockout, needrestart re-run, overlay, snapctl link).
+
+## Registration workflow document
+
+The editable source is `docs/datto-siris-registration-flow.md`. Build the checked-in PDF
+with PowerShell 7 and Chrome or Edge:
+
+```powershell
+pwsh -File tools/build-registration-pdf.ps1
+```
 
 ## Not in the repo
 
