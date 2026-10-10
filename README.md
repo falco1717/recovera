@@ -54,12 +54,16 @@ sudo ./setup.sh
 
 `OFFLINE_MODE=yes` is the default. Package operations are confined to a private network namespace
 and to the bundle's local `file:` apt repository; package service starts are suppressed during the
-install. A machine with no default route or DNS can use `NET_GATEWAY="none"` and `NET_DNS="none"`
-in `setup.conf`. See [setup/README.txt](setup/README.txt) for the full workflow.
+install. The Datto post-install script's `npyscreen` Python dependency is vendored under
+`setup/wheels/`, and pip is forced into no-index mode. A machine with no default route or DNS can
+use `NET_GATEWAY="none"` and `NET_DNS="none"` in `setup.conf`. See
+[setup/README.txt](setup/README.txt) for the full workflow.
 
 This removes Internet access as a provisioning requirement. It does not make Datto account
 registration, licensing, updates, or cloud services work offline; those are separate Datto
-product behaviors.
+product behaviors. Optional Apache cloud-client certificate authorization and its boot-time CA
+download are disabled on the replica so the local web UI can start without registration or
+Internet access.
 
 ## Registration workflow document
 

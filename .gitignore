@@ -1,6 +1,7 @@
 # Package files and images live outside the repo (1.6 GB / 711 MB)
 *.deb
 *.ova
+scripts/vcenter/ova/SHA256SUMS
 debs/
 Packages.gz
 

@@ -23,7 +23,7 @@ BACKUP_DIR=/root/spf-datto-backup
 UNIT=spf-datto-setup
 LOCAL_LIST=/etc/apt/sources.list.d/spf-datto-local.list
 LOCAL_ONLY=(-o "Dir::Etc::sourcelist=$LOCAL_LIST" -o "Dir::Etc::sourceparts=/nonexistent" -o "DPkg::Lock::Timeout=900" -o "Acquire::Retries=0")
-EXPECTED_FAILED="openipmi.service datto-speedsync-cache-update.service datto-system-speedsync-check.service datto-telegraf-configure.service datto-update-assets.service"
+EXPECTED_FAILED="openipmi.service datto-ipmi-setup.service datto-asset-replication-reconcile.service datto-speedsync-cache-update.service datto-system-speedsync-check.service datto-telegraf-configure.service datto-update-assets.service"
 # spf-datto config files NOT copied to a replica: identity (Datto support root keys, log-shipping
 # identity) and hardware (watchdog device). Everything else that differs is applied in p45.
 CONFFILE_DENY_RE='^(/root/|/etc/filebeat/|/etc/watchdog\.conf$|/etc/ssh/ssh_host_|/etc/hostname$|/etc/machine-id$)'
@@ -54,9 +54,12 @@ offline_run() {
   if command -v systemd-run >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
     systemd-run --quiet --wait --pipe --collect \
       --unit="${UNIT}-offline-${BASHPID:-$$}-$RANDOM" --property=PrivateNetwork=yes \
-      --setenv=DEBIAN_FRONTEND=noninteractive --setenv=NEEDRESTART_SUSPEND=1 -- "$@"
+      --setenv=DEBIAN_FRONTEND=noninteractive --setenv=NEEDRESTART_SUSPEND=1 \
+      --setenv=PIP_NO_INDEX=1 --setenv="PIP_FIND_LINKS=$INSTALL_DIR/wheels" \
+      --setenv=PIP_DISABLE_PIP_VERSION_CHECK=1 -- "$@"
   elif command -v unshare >/dev/null 2>&1; then
-    unshare --net -- "$@"
+    PIP_NO_INDEX=1 PIP_FIND_LINKS="$INSTALL_DIR/wheels" PIP_DISABLE_PIP_VERSION_CHECK=1 \
+      unshare --net -- "$@"
   else
     log "no private-network runner is available (need systemd-run or unshare)"
     return 1
@@ -117,6 +120,10 @@ preflight() {
   local home; home="$(getent passwd "$LOGIN_USER" | cut -d: -f6)"
   [ -s "$home/.ssh/authorized_keys" ] || echo "WARNING: $home/.ssh/authorized_keys is empty; key login for $LOGIN_USER won't work"
   [ -d "$BUNDLE/debs" ] || [ -d "$INSTALL_DIR/debs" ] || { echo "no debs/ folder next to setup.sh"; exit 1; }
+  compgen -G "$BUNDLE/wheels/npyscreen-4.10.5-*.whl" >/dev/null || \
+    compgen -G "$INSTALL_DIR/wheels/npyscreen-4.10.5-*.whl" >/dev/null || {
+      echo "missing bundled npyscreen 4.10.5 wheel required by datto-siris-os-2"; exit 1;
+    }
 }
 
 stage_bundle() {   # copy the bundle to /opt/spf-datto so nothing depends on /home (which may move to ZFS)
@@ -129,6 +136,7 @@ stage_bundle() {   # copy the bundle to /opt/spf-datto so nothing depends on /ho
   mkdir -p "$INSTALL_DIR"
   cp -a "$BUNDLE/setup.sh" "$BUNDLE/setup.conf" "$INSTALL_DIR/"
   [ -f "$BUNDLE/README.txt" ] && cp -a "$BUNDLE/README.txt" "$INSTALL_DIR/"
+  rm -rf "$INSTALL_DIR/wheels"; cp -a "$BUNDLE/wheels" "$INSTALL_DIR/"
   rm -rf "$INSTALL_DIR/lists"; cp -a "$BUNDLE/lists" "$INSTALL_DIR/"
   if [ -d "$BUNDLE/conffiles" ]; then rm -rf "$INSTALL_DIR/conffiles"; cp -a "$BUNDLE/conffiles" "$INSTALL_DIR/"; fi
   if [ ! -f "$INSTALL_DIR/debs/.verified" ]; then
@@ -217,6 +225,22 @@ p40_install() {
 
 restore_conf() { local f; for f in "$@"; do [ -e "$BACKUP_DIR/conffiles$f" ] && cp -a "$BACKUP_DIR/conffiles$f" "$f"; done; }
 
+remove_cloud_client_cert_auth() {
+  # A registered appliance downloads cloud-api-ca at boot and uses it for optional
+  # client-certificate authentication. An air-gapped replica cannot fetch that CA;
+  # snapctl otherwise leaves a zero-byte bundle which prevents Apache from starting.
+  # This replica has no registration flow, so remove the unused client-auth directives
+  # and stop the boot-time downloader instead of manufacturing cloud credentials.
+  local f
+  for f in /etc/apache2/sites-available/device.conf \
+           /etc/apache2/sites-available/server.conf \
+           /etc/apache2/sites-enabled/device.conf; do
+    [ -f "$f" ] || continue
+    sed -Ei '/^[[:space:]]*(SSLCACertificateFile|SSLVerifyClient|SSLVerifyDepth)[[:space:]]/d' "$f"
+  done
+  systemctl disable --now datto-apache-ca-update-boot.service >/dev/null 2>&1 || true
+}
+
 p45_conffiles() {
   # Packages downloaded from Ubuntu carry stock config files, but Datto's mirror ships rebuilds
   # with the same version numbers and different config files (e.g. apache2's ports.conf, whose
@@ -238,6 +262,8 @@ p45_conffiles() {
   done < "$src/manifest.tsv"
   rm -rf "$tmp"
   log "applied $n spf-datto config files ($skip withheld: identity/hardware); list in $applied"
+
+  remove_cloud_client_cert_auth
 
   # validate each group; put the replica's own copy back if spf-datto's doesn't pass here
   if grep -q '^/etc/sudoers' "$applied" && ! visudo -c >/dev/null 2>&1; then
@@ -331,10 +357,13 @@ p70_zfs() {
     rsync -aHAX /home/ /mnt/spf-newhome/ || return 1
     diff -rq /home /mnt/spf-newhome >/dev/null || { log "/home copy differs"; return 1; }
     log "/home copied and verified"
-    zfs set overlay=on "$P/home"            # original /home stays underneath as a fallback
+    zfs set overlay=on "$P/home" || return 1 # original /home stays underneath as a fallback
     zfs set mountpoint=/home "$P/home" || return 1
     rmdir /mnt/spf-newhome 2>/dev/null || true
   fi
+  # Enforce this on resumed runs too. Some appliance ZFS defaults reset overlay,
+  # and a populated fallback /home must not make zfs-mount.service fail at boot.
+  zfs set overlay=on "$P/home" || return 1
   zfs list "$P/home/agents"       >/dev/null 2>&1 || zfs create "$P/home/agents"
   zfs list "$P/home/configBackup" >/dev/null 2>&1 || zfs create "$P/home/configBackup"
   local home; home="$(getent passwd "$LOGIN_USER" | cut -d: -f6)"
@@ -418,6 +447,13 @@ EOF
   log "switching networking to NetworkManager (an SSH session may drop if the address changes)"
   rm -f /etc/netplan/*.yaml
   netplan apply
+  # Package service starts are suppressed during the offline install, so NetworkManager
+  # may be enabled without running yet. Start it before the first nmcli operation.
+  systemctl enable --now NetworkManager.service >/dev/null 2>&1 || {
+    log "NetworkManager did not start; reverting to the previous netplan config"
+    net_revert "$ifc"
+    return 2
+  }
   ip addr flush dev "$ifc"
   nmcli connection reload
   nmcli connection up "$ifc" >/dev/null 2>&1
@@ -593,7 +629,8 @@ case "$MODE" in
   verify)
     [ "$(id -u)" -eq 0 ] || { echo "run with sudo"; exit 1; }
     if [ "${2:-}" = --after-boot ]; then
-      for i in $(seq 1 60); do [ "$(systemctl is-system-running)" = starting ] || break; sleep 5; done
+      # The timer already waits three minutes after boot. Polling
+      # is-system-running here deadlocks on this verification job itself.
       verify > "$VERIFY_LOG" 2>&1; rc=$?
       systemctl disable spf-datto-verify.timer >/dev/null 2>&1
       exit $rc

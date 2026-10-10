@@ -14,8 +14,10 @@ NEEDS
 AIR-GAPPED MODE
   OFFLINE_MODE=yes is the default. Every apt update, simulation, install, and purge runs in
   a private network namespace and is restricted to the bundled file: repository. Package
-  maintainer scripts are prevented from starting services during installation. At the end,
-  public apt sources and automatic update timers are disabled.
+  maintainer scripts are prevented from starting services during installation. The exact
+  npyscreen wheel required by datto-siris-os-2 is bundled too, and pip is forced to use that
+  local wheel directory without querying an online index. At the end, public apt sources and
+  automatic update timers are disabled.
 
   A default route and DNS are not required. For a static isolated LAN, set these in setup.conf:
     NET_GATEWAY="none"
@@ -49,6 +51,8 @@ WHAT IT DOES (in order)
        makes Apache work: stock ports.conf "Listen 80/443" duplicates Datto's device.conf and
        Apache fails to bind. Withheld: /root/* (Datto support root keys), filebeat (log-shipping
        identity), watchdog.conf (hardware). sudoers/sshd/apache are validated, else rolled back.
+       Optional Datto cloud-client certificate authorization and its boot-time CA download are
+       removed because this replica has no registration flow and must start without Internet.
   p50  GRUB: 6.8 generic kernel without fips=1, like spf-datto (FIPS packages stay installed)
   p60  purges snapd + cloud-init (they make boot ordering cycles with Datto's units) and
        restores the /usr/bin/snapctl link

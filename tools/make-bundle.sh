@@ -17,6 +17,7 @@ echo "checking export checksums..."
 
 rm -rf "$B"; mkdir -p "$B/lists"
 cp "$REPO/setup/setup.sh" "$REPO/setup/setup.conf" "$REPO/setup/README.txt" "$B/"
+cp -r "$REPO/setup/wheels" "$B/wheels"
 sed -i 's/\r$//' "$B/setup.sh" "$B/setup.conf" "$B/README.txt"
 chmod 755 "$B/setup.sh"
 cp "$EXPORT/lists/all-packages-versions.txt" "$EXPORT/lists/manual.txt" "$EXPORT/lists/portable.txt" \
