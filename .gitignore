@@ -12,3 +12,6 @@ vc-session.txt
 *.key
 *password*
 *creds*
+
+# built bundles
+dist/
