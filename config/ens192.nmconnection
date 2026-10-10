@@ -1,0 +1,11 @@
+[connection]
+id=ens192
+type=ethernet
+interface-name=ens192
+master=br0
+slave-type=bridge
+zone=datto
+
+[ethernet]
+
+[bridge-port]
