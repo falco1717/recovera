@@ -9,6 +9,21 @@ NEEDS
   - Ubuntu 22.04 amd64 (cloud image or server install), SSH key login for your user
   - about 8 GB free on /   (bundle copy + install)
   - for ZFS: a second, BLANK disk of at least ZFS_MIN_GB (default 20 GB); the largest blank disk is used
+  - no Internet connection on the target; build/copy the complete bundle from another machine
+
+AIR-GAPPED MODE
+  OFFLINE_MODE=yes is the default. Every apt update, simulation, install, and purge runs in
+  a private network namespace and is restricted to the bundled file: repository. Package
+  maintainer scripts are prevented from starting services during installation. At the end,
+  public apt sources and automatic update timers are disabled.
+
+  A default route and DNS are not required. For a static isolated LAN, set these in setup.conf:
+    NET_GATEWAY="none"
+    NET_DNS="none"
+
+  This makes provisioning and the local web UI work without Internet access. It does not make
+  Datto account registration, licensing, updates, or cloud services work offline; those remain
+  subject to Datto's own connectivity requirements.
 
 RUN
   scp spf-datto-setup.tar ubuntu@VM:
@@ -27,7 +42,8 @@ WHAT IT DOES (in order)
   p20  apt dry run; aborts on errors or if it would remove a protected package
   p30  creates group remote-users and adds your user. Datto's sshd config, applied at every
        boot, has "AllowGroups remote-users"; without this you are locked out after the reboot.
-  p40  installs all packages at exact versions (downgrades allowed; your config files kept)
+  p40  installs all packages at exact versions inside a private network namespace; package
+       service starts are suppressed until installation is complete
   p45  applies spf-datto's copy of every package config file that differs (Datto's mirror ships
        rebuilt Ubuntu packages with the same version but different configs). This is what
        makes Apache work: stock ports.conf "Listen 80/443" duplicates Datto's device.conf and
@@ -38,8 +54,9 @@ WHAT IT DOES (in order)
        restores the /usr/bin/snapctl link
   p70  ZFS homePool on the blank disk with spf-datto's layout; /home copied onto it (the
        original stays underneath, overlay=on)
-  p80  NetworkManager bridge br0 (port = your NIC, zone datto). It checks that the gateway
-       answers and reverts to netplan automatically if not. Then networkd is disabled.
+  p80  NetworkManager bridge br0 (port = your NIC, zone datto). With a gateway configured it
+       checks that the gateway answers; without one it checks the bridge address. It reverts to
+       netplan automatically if the check fails. Then networkd is disabled.
   p85  APT_FREEZE=yes: Ubuntu sources disabled and backed up, unattended-upgrades off
   p90  verification timer: 3 min after the reboot, writes /var/log/spf-datto-verify.log
 
@@ -53,6 +70,7 @@ WEB UI
   https://<VM IP>/  ->  "Control Panel - Register a Device" (the Datto UI of an unregistered
   appliance). Apache listens once on 0.0.0.0:80 and 0.0.0.0:443; verify checks both.
   It uses spf-datto's TLS certificate/key (they are config files of datto-siris-os-2).
+  The page is locally accessible offline; completing Datto registration may require Internet.
 
 EXPECTED FAILED SERVICES (no IPMI hardware / no Datto registration)
   openipmi, datto-speedsync-cache-update, datto-system-speedsync-check,

@@ -22,7 +22,7 @@ VERIFY_LOG=/var/log/spf-datto-verify.log
 BACKUP_DIR=/root/spf-datto-backup
 UNIT=spf-datto-setup
 LOCAL_LIST=/etc/apt/sources.list.d/spf-datto-local.list
-LOCAL_ONLY=(-o "Dir::Etc::sourcelist=$LOCAL_LIST" -o "Dir::Etc::sourceparts=/nonexistent" -o "DPkg::Lock::Timeout=900")
+LOCAL_ONLY=(-o "Dir::Etc::sourcelist=$LOCAL_LIST" -o "Dir::Etc::sourceparts=/nonexistent" -o "DPkg::Lock::Timeout=900" -o "Acquire::Retries=0")
 EXPECTED_FAILED="openipmi.service datto-speedsync-cache-update.service datto-system-speedsync-check.service datto-telegraf-configure.service datto-update-assets.service"
 # spf-datto config files NOT copied to a replica: identity (Datto support root keys, log-shipping
 # identity) and hardware (watchdog device). Everything else that differs is applied in p45.
@@ -43,6 +43,36 @@ warn() { echo "[$(ts)] WARNING: $*"; }
 die()  { echo "[$(ts)] FAILED: $*"; echo "SETUP-FAILED"; exit 1; }
 done_p()  { [ -f "$STATE_DIR/$1.done" ]; }
 mark_p()  { mkdir -p "$STATE_DIR"; date '+%F %T' > "$STATE_DIR/$1.done"; }
+primary_iface() {
+  local ifc
+  ifc=$(ip route show default 2>/dev/null | awk '{print $5; exit}')
+  [ -n "$ifc" ] || ifc=$(ip -4 -o addr show scope global 2>/dev/null | awk '$2 != "lo" {print $2; exit}')
+  echo "$ifc"
+}
+offline_run() {
+  if [ "${OFFLINE_MODE:-yes}" != yes ]; then "$@"; return $?; fi
+  if command -v systemd-run >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
+    systemd-run --quiet --wait --pipe --collect \
+      --unit="${UNIT}-offline-${BASHPID:-$$}-$RANDOM" --property=PrivateNetwork=yes \
+      --setenv=DEBIAN_FRONTEND=noninteractive --setenv=NEEDRESTART_SUSPEND=1 -- "$@"
+  elif command -v unshare >/dev/null 2>&1; then
+    unshare --net -- "$@"
+  else
+    log "no private-network runner is available (need systemd-run or unshare)"
+    return 1
+  fi
+}
+restore_policy_rc() {
+  local policy=/usr/sbin/policy-rc.d
+  local policy_backup=$STATE_DIR/policy-rc.d.before-p40
+  local policy_marker=$STATE_DIR/policy-rc.d.setup-state
+  [ -f "$policy_marker" ] || return 0
+  rm -f "$policy"
+  if [ "$(cat "$policy_marker")" = original ] && { [ -e "$policy_backup" ] || [ -L "$policy_backup" ]; }; then
+    cp -a "$policy_backup" "$policy" || return 1
+  fi
+  rm -f "$policy_backup" "$policy_marker"
+}
 phase() {   # phase <id> <description> <function>; function returns 2 = skipped, retry on next run
   if done_p "$1"; then log "== $1: $2 (already done, skipping)"; return 0; fi
   log "== $1: $2"
@@ -61,9 +91,18 @@ load_conf() {
   . "$c"
   : "${NET_CONFIGURE:=yes}" "${NET_IP:=current}" "${NET_GATEWAY:=}" "${NET_DNS:=}" "${NET_IFACE:=}"
   : "${ZFS_CONFIGURE:=yes}" "${ZFS_DISK:=auto}" "${ZFS_MIN_GB:=20}" "${ZFS_POOL:=homePool}" "${ZFS_MOVE_HOME:=yes}"
-  : "${FIPS_OFF:=yes}" "${REMOVE_SNAPD:=yes}" "${REMOVE_CLOUD_INIT:=yes}" "${APT_FREEZE:=yes}" "${AUTO_REBOOT:=yes}"
+  : "${FIPS_OFF:=yes}" "${REMOVE_SNAPD:=yes}" "${REMOVE_CLOUD_INIT:=yes}" "${APT_FREEZE:=yes}" "${OFFLINE_MODE:=yes}" "${AUTO_REBOOT:=yes}"
   LOGIN_USER="${LOGIN_USER:-${SUDO_USER:-}}"
   [ -n "$LOGIN_USER" ] || LOGIN_USER="$(getent passwd 1000 | cut -d: -f1)"
+}
+
+validate_conf() {
+  case "$OFFLINE_MODE" in yes|no) ;; *) die "OFFLINE_MODE must be yes or no" ;; esac
+  if [ "$OFFLINE_MODE" = yes ]; then
+    [ "$APT_FREEZE" = yes ] || die "OFFLINE_MODE=yes requires APT_FREEZE=yes"
+    command -v systemd-run >/dev/null 2>&1 || command -v unshare >/dev/null 2>&1 || \
+      die "OFFLINE_MODE=yes needs systemd-run or unshare for private-network package operations"
+  fi
 }
 
 # ------------------------------------------------------------------------ preflight
@@ -73,6 +112,7 @@ preflight() {
   [ "${VERSION_ID:-}" = "22.04" ] || { echo "needs Ubuntu 22.04 (this is ${PRETTY_NAME:-unknown}); the packages are jammy builds"; exit 1; }
   [ "$(dpkg --print-architecture)" = amd64 ] || { echo "needs amd64"; exit 1; }
   load_conf
+  validate_conf
   id "$LOGIN_USER" >/dev/null 2>&1 || { echo "LOGIN_USER '$LOGIN_USER' does not exist"; exit 1; }
   local home; home="$(getent passwd "$LOGIN_USER" | cut -d: -f6)"
   [ -s "$home/.ssh/authorized_keys" ] || echo "WARNING: $home/.ssh/authorized_keys is empty; key login for $LOGIN_USER won't work"
@@ -109,14 +149,18 @@ p10_repo() {
   echo "deb [trusted=yes] file:$INSTALL_DIR/debs ./" > "$LOCAL_LIST"
   # fresh cloud VMs run apt-daily/unattended-upgrades right after boot; get them out of the way
   systemctl stop apt-daily.timer apt-daily-upgrade.timer apt-daily.service apt-daily-upgrade.service unattended-upgrades.service 2>/dev/null || true
-  apt-get -qq "${LOCAL_ONLY[@]}" update
+  offline_run apt-get -qq "${LOCAL_ONLY[@]}" update
 }
 
 p20_dryrun() {
-  local sim=$STATE_DIR/dryrun.txt rem bad
+  local sim=$STATE_DIR/dryrun.txt rem bad rc
+  local -a packages
   mkdir -p "$STATE_DIR"
-  apt-get -s "${LOCAL_ONLY[@]}" install --allow-downgrades --allow-change-held-packages \
-    $(cat "$INSTALL_DIR/lists/all-packages-versions.txt") > "$sim" 2>&1
+  mapfile -t packages < "$INSTALL_DIR/lists/all-packages-versions.txt"
+  offline_run apt-get -s "${LOCAL_ONLY[@]}" install --allow-downgrades --allow-change-held-packages \
+    "${packages[@]}" > "$sim" 2>&1
+  rc=$?
+  [ "$rc" -eq 0 ] || { cat "$sim"; return "$rc"; }
   grep -q '^E:' "$sim" && { grep '^E:' "$sim"; return 1; }
   rem=$(awk '/^Remv/{print $2}' "$sim")
   log "dry run: install $(grep -c ^Inst "$sim"), downgrades $(grep -c '^Inst.*\[.*\] (' "$sim"), remove $(echo "$rem" | grep -c .)"
@@ -138,10 +182,29 @@ p30_prep() {
 }
 
 p40_install() {
+  local policy=/usr/sbin/policy-rc.d policy_backup=$STATE_DIR/policy-rc.d.before-p40
+  local policy_marker=$STATE_DIR/policy-rc.d.setup-state rc=0
+  local -a packages
   log "installing (about 15 min: metalibvirt compiles libvirt 10.9 from source)"
-  apt-get -y "${LOCAL_ONLY[@]}" -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold \
+  mapfile -t packages < "$INSTALL_DIR/lists/all-packages-versions.txt"
+  mkdir -p "$STATE_DIR"
+  restore_policy_rc
+  if [ -e "$policy" ] || [ -L "$policy" ]; then
+    rm -f "$policy_backup"; cp -a "$policy" "$policy_backup" || return 1
+    echo original > "$policy_marker"
+  else
+    rm -f "$policy_backup"
+    echo absent > "$policy_marker"
+  fi
+  trap restore_policy_rc EXIT
+  printf '#!/bin/sh\nexit 101\n' > "$policy" || return 1
+  chmod 755 "$policy" || return 1
+  offline_run apt-get -y "${LOCAL_ONLY[@]}" -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold \
     install --allow-downgrades --allow-change-held-packages \
-    $(cat "$INSTALL_DIR/lists/all-packages-versions.txt") || return 1
+    "${packages[@]}" || rc=$?
+  restore_policy_rc || return 1
+  trap - EXIT
+  [ "$rc" -eq 0 ] || return "$rc"
   local audit; audit=$(dpkg --audit)
   [ -z "$audit" ] || { echo "$audit"; return 1; }
   local want have
@@ -210,11 +273,11 @@ EOF
 
 p60_cleanup() {
   if [ "$REMOVE_SNAPD" = yes ] && dpkg -s snapd >/dev/null 2>&1; then
-    apt-get -y -q -o DPkg::Lock::Timeout=900 purge snapd >/dev/null || return 1
+    offline_run apt-get -y -q "${LOCAL_ONLY[@]}" purge snapd >/dev/null || return 1
     log "snapd purged"
   fi
   if [ "$REMOVE_CLOUD_INIT" = yes ] && dpkg -s cloud-init >/dev/null 2>&1; then
-    apt-get -y -q -o DPkg::Lock::Timeout=900 purge cloud-init >/dev/null || return 1
+    offline_run apt-get -y -q "${LOCAL_ONLY[@]}" purge cloud-init >/dev/null || return 1
     log "cloud-init purged"
   fi
   # snapd owns /usr/bin/snapctl; Datto repoints it. Purging snapd deletes Datto's link.
@@ -291,19 +354,25 @@ net_revert() {
 p80_network() {
   [ "$NET_CONFIGURE" = yes ] || { log "network change disabled in setup.conf"; return 0; }
   if nmcli -t -f DEVICE,STATE dev 2>/dev/null | grep -q '^br0:connected'; then log "br0 already up"; return 0; fi
-  local ifc mac cidr gw dns zone ipv4
-  ifc="${NET_IFACE:-$(ip route show default | awk '{print $5; exit}')}"
+  local ifc mac cidr gw dns zone ipv4 address_line
+  ifc="${NET_IFACE:-$(primary_iface)}"
   [ -n "$ifc" ] && [ -e "/sys/class/net/$ifc" ] || { log "cannot find the primary interface"; return 1; }
   mac=$(cat "/sys/class/net/$ifc/address")
   cidr=$(ip -4 -o addr show dev "$ifc" | awk '{print $4; exit}')
   gw="${NET_GATEWAY:-$(ip route show default dev "$ifc" | awk '{print $3; exit}')}"
   dns="${NET_DNS:-$(resolvectl dns "$ifc" 2>/dev/null | cut -d: -f2- | xargs)}"
+  [ "$gw" = none ] && gw=""
+  [ "$dns" = none ] && dns=""
   dns="${dns:-$gw}"
   case "$NET_IP" in
     dhcp)    ipv4=$'method=auto' ;;
     current) [ -n "$cidr" ] || { log "no current IPv4 on $ifc"; return 1; }
-             ipv4="method=manual"$'\n'"address1=$cidr,$gw"$'\n'"dns=$(echo "$dns" | tr ' ' ';');" ;;
-    *)       ipv4="method=manual"$'\n'"address1=$NET_IP,$gw"$'\n'"dns=$(echo "$dns" | tr ' ' ';');" ;;
+             address_line="address1=$cidr${gw:+,$gw}"
+             ipv4="method=manual"$'\n'"$address_line"
+             [ -z "$dns" ] || ipv4+=$'\n'"dns=$(echo "$dns" | tr ' ' ';');" ;;
+    *)       address_line="address1=$NET_IP${gw:+,$gw}"
+             ipv4="method=manual"$'\n'"$address_line"
+             [ -z "$dns" ] || ipv4+=$'\n'"dns=$(echo "$dns" | tr ' ' ';');" ;;
   esac
   zone=""; firewall-cmd --get-zones 2>/dev/null | grep -qw datto && zone="zone=datto"
   log "bridge br0 <- $ifc ($mac); ipv4: $(echo "$ipv4" | tr '\n' ' '); $zone"
@@ -356,16 +425,22 @@ EOF
 
   local ok="" i
   for i in $(seq 1 45); do
-    if ip -4 -o addr show dev br0 | grep -q inet && ping -c1 -W2 "$gw" >/dev/null 2>&1; then ok=1; break; fi
+    if ip -4 -o addr show dev br0 | grep -q inet; then
+      if [ -z "$gw" ] || ping -c1 -W2 "$gw" >/dev/null 2>&1; then ok=1; break; fi
+    fi
     sleep 2
   done
   if [ -z "$ok" ]; then
-    log "br0 did not reach the gateway $gw; reverting to the previous netplan config"
+    log "br0 did not become usable${gw:+ or reach gateway $gw}; reverting to the previous netplan config"
     net_revert "$ifc"
     warn "network left on netplan/networkd; see $LOG"
     return 2
   fi
-  log "br0 up: $(ip -4 -o addr show dev br0 | awk '{print $4}'), gateway $gw reachable"
+  if [ -n "$gw" ]; then
+    log "br0 up: $(ip -4 -o addr show dev br0 | awk '{print $4}'), gateway $gw reachable"
+  else
+    log "br0 up: $(ip -4 -o addr show dev br0 | awk '{print $4}'), no gateway configured"
+  fi
   # spf-datto has no networkd; otherwise its wait-online adds ~2 min to every boot
   systemctl disable --now systemd-networkd-wait-online.service systemd-networkd.socket systemd-networkd.service >/dev/null 2>&1
 }
@@ -383,7 +458,7 @@ p85_apt() {
     systemctl start apt-daily.timer apt-daily-upgrade.timer 2>/dev/null || true
     log "apt left on Ubuntu sources; unattended-upgrades will drift from spf-datto's versions"
   fi
-  apt-get -qq update 2>/dev/null || true
+  offline_run apt-get -qq "${LOCAL_ONLY[@]}" update 2>/dev/null || true
 }
 
 p90_verify_timer() {
@@ -440,7 +515,8 @@ verify() {
   local dup ip code
   dup=$(grep -rhoE '^\s*Listen\s+\S+' /etc/apache2/ports.conf /etc/apache2/sites-enabled/ /etc/apache2/conf-enabled/ 2>/dev/null \
         | awk '{print $2}' | sed -E 's/.*://' | sort | uniq -d | xargs)
-  ip=$(ip -4 -o addr show dev "$(ip route show default | awk '{print $5; exit}')" | awk '{sub(/\/.*/,"",$4); print $4; exit}')
+  ip=$(ip -4 -o addr show dev br0 2>/dev/null | awk '{sub(/\/.*/,"",$4); print $4; exit}')
+  [ -n "$ip" ] || ip=$(ip -4 -o addr show dev "$(primary_iface)" 2>/dev/null | awk '{sub(/\/.*/,"",$4); print $4; exit}')
   for _ in 1 2 3 4; do   # the first request after an Apache/PHP restart can be slow
     code=$(curl -sk -o /dev/null -w '%{http_code}' --max-time 15 "https://$ip/" 2>/dev/null)
     case "$code" in 200|301|302|303) break ;; esac; sleep 5
@@ -462,8 +538,9 @@ verify() {
 # ----------------------------------------------------------------------------- main
 run_all() {
   load_conf
+  validate_conf
   log "spf-datto replica setup starting on $(hostname) ($(. /etc/os-release; echo "$PRETTY_NAME"), kernel $(uname -r))"
-  log "config: login=$LOGIN_USER net=$NET_CONFIGURE/$NET_IP zfs=$ZFS_CONFIGURE/$ZFS_DISK fips_off=$FIPS_OFF freeze=$APT_FREEZE"
+  log "config: login=$LOGIN_USER offline=$OFFLINE_MODE net=$NET_CONFIGURE/$NET_IP zfs=$ZFS_CONFIGURE/$ZFS_DISK fips_off=$FIPS_OFF freeze=$APT_FREEZE"
   phase p10 "local apt repo from $INSTALL_DIR/debs"           p10_repo
   phase p20 "dry run"                                         p20_dryrun
   phase p30 "SSH guard (remote-users) and cloud-init network" p30_prep

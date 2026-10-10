@@ -38,6 +38,29 @@ docs/              README from the export folder
 The scripts in `scripts/vm/` are the **corrected** versions. They include the fixes for each
 problem hit during the session (SSH lockout, needrestart re-run, overlay, snapctl link).
 
+## Air-gapped setup
+
+The supported installation path is the self-contained bundle under `setup/`. Build it on a
+connected or staging workstation, transfer the resulting tar file to the isolated Ubuntu 22.04
+machine, and run it there:
+
+```bash
+tools/make-bundle.sh /path/to/pkgexport /path/to/output
+tar xf spf-datto-setup.tar
+cd spf-datto-setup
+sudo ./setup.sh check
+sudo ./setup.sh
+```
+
+`OFFLINE_MODE=yes` is the default. Package operations are confined to a private network namespace
+and to the bundle's local `file:` apt repository; package service starts are suppressed during the
+install. A machine with no default route or DNS can use `NET_GATEWAY="none"` and `NET_DNS="none"`
+in `setup.conf`. See [setup/README.txt](setup/README.txt) for the full workflow.
+
+This removes Internet access as a provisioning requirement. It does not make Datto account
+registration, licensing, updates, or cloud services work offline; those are separate Datto
+product behaviors.
+
 ## Registration workflow document
 
 The editable source is `docs/datto-siris-registration-flow.md`. Build the checked-in PDF
