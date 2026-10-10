@@ -165,4 +165,3 @@ refresh mechanism, and observed effect.
   browser code alone.
 - The conditions controlling the update and storage panes need controlled-state testing.
 - Upgrade rollback and interrupted-storage behavior still need explicit failure tests.
-

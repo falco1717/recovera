@@ -89,4 +89,3 @@ try {
 finally {
   if (Test-Path -LiteralPath $tempHtml) { Remove-Item -LiteralPath $tempHtml -Force }
 }
-
