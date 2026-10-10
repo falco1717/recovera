@@ -22,6 +22,13 @@ chmod 755 "$B/setup.sh"
 cp "$EXPORT/lists/all-packages-versions.txt" "$EXPORT/lists/manual.txt" "$EXPORT/lists/portable.txt" \
    "$EXPORT/lists/local-debs.txt" "$EXPORT/lists/repacked.txt" "$B/lists/"
 sed -i 's/\r$//' "$B"/lists/*.txt
+if [ -f "$EXPORT/conffiles/conffiles.tgz" ] && [ -f "$EXPORT/conffiles/manifest.tsv" ]; then
+  mkdir -p "$B/conffiles"
+  cp "$EXPORT/conffiles/conffiles.tgz" "$EXPORT/conffiles/manifest.tsv" "$B/conffiles/"
+  echo "included $(wc -l < "$B/conffiles/manifest.tsv") spf-datto config files"
+else
+  echo "WARNING: no $EXPORT/conffiles (scripts/export/export-conffiles.sh); Apache etc. will keep stock configs"
+fi
 echo "copying $(ls "$EXPORT"/debs/*.deb | wc -l) packages..."
 cp -r "$EXPORT/debs" "$B/debs"
 rm -f "$B/debs/.verified"

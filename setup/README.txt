@@ -28,6 +28,11 @@ WHAT IT DOES (in order)
   p30  creates group remote-users and adds your user. Datto's sshd config, applied at every
        boot, has "AllowGroups remote-users"; without this you are locked out after the reboot.
   p40  installs all packages at exact versions (downgrades allowed; your config files kept)
+  p45  applies spf-datto's copy of every package config file that differs (Datto's mirror ships
+       rebuilt Ubuntu packages with the same version but different configs). This is what
+       makes Apache work: stock ports.conf "Listen 80/443" duplicates Datto's device.conf and
+       Apache fails to bind. Withheld: /root/* (Datto support root keys), filebeat (log-shipping
+       identity), watchdog.conf (hardware). sudoers/sshd/apache are validated, else rolled back.
   p50  GRUB: 6.8 generic kernel without fips=1, like spf-datto (FIPS packages stay installed)
   p60  purges snapd + cloud-init (they make boot ordering cycles with Datto's units) and
        restores the /usr/bin/snapctl link
@@ -44,9 +49,14 @@ AFTERWARDS
   Logs: /var/log/spf-datto-setup.log   Backups: /root/spf-datto-backup/
   The bundle in your home directory can be deleted; /opt/spf-datto keeps a copy.
 
+WEB UI
+  https://<VM IP>/  ->  "Control Panel - Register a Device" (the Datto UI of an unregistered
+  appliance). Apache listens once on 0.0.0.0:80 and 0.0.0.0:443; verify checks both.
+  It uses spf-datto's TLS certificate/key (they are config files of datto-siris-os-2).
+
 EXPECTED FAILED SERVICES (no IPMI hardware / no Datto registration)
-  openipmi, apache2 (fails the same way on spf-datto), datto-speedsync-cache-update,
-  datto-system-speedsync-check, datto-telegraf-configure, datto-update-assets
+  openipmi, datto-speedsync-cache-update, datto-system-speedsync-check,
+  datto-telegraf-configure, datto-update-assets
 
 SENSITIVE
   95 of the .debs were rebuilt from spf-datto's installed files (dpkg-repack) and contain its

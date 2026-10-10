@@ -23,7 +23,10 @@ BACKUP_DIR=/root/spf-datto-backup
 UNIT=spf-datto-setup
 LOCAL_LIST=/etc/apt/sources.list.d/spf-datto-local.list
 LOCAL_ONLY=(-o "Dir::Etc::sourcelist=$LOCAL_LIST" -o "Dir::Etc::sourceparts=/nonexistent" -o "DPkg::Lock::Timeout=900")
-EXPECTED_FAILED="openipmi.service apache2.service datto-speedsync-cache-update.service datto-system-speedsync-check.service datto-telegraf-configure.service datto-update-assets.service"
+EXPECTED_FAILED="openipmi.service datto-speedsync-cache-update.service datto-system-speedsync-check.service datto-telegraf-configure.service datto-update-assets.service"
+# spf-datto config files NOT copied to a replica: identity (Datto support root keys, log-shipping
+# identity) and hardware (watchdog device). Everything else that differs is applied in p45.
+CONFFILE_DENY_RE='^(/root/|/etc/filebeat/|/etc/watchdog\.conf$|/etc/ssh/ssh_host_|/etc/hostname$|/etc/machine-id$)'
 # Removals the dry run may propose on a cloud image. Anything in PROTECTED aborts.
 PROTECTED_RE='^(openssh-server|sudo|systemd|network-manager|netplan\.io|zfsutils-linux|grub-pc|grub-efi-amd64|grub-efi-amd64-signed|shim-signed|linux-image-.*)$'
 
@@ -87,6 +90,7 @@ stage_bundle() {   # copy the bundle to /opt/spf-datto so nothing depends on /ho
   cp -a "$BUNDLE/setup.sh" "$BUNDLE/setup.conf" "$INSTALL_DIR/"
   [ -f "$BUNDLE/README.txt" ] && cp -a "$BUNDLE/README.txt" "$INSTALL_DIR/"
   rm -rf "$INSTALL_DIR/lists"; cp -a "$BUNDLE/lists" "$INSTALL_DIR/"
+  if [ -d "$BUNDLE/conffiles" ]; then rm -rf "$INSTALL_DIR/conffiles"; cp -a "$BUNDLE/conffiles" "$INSTALL_DIR/"; fi
   if [ ! -f "$INSTALL_DIR/debs/.verified" ]; then
     rm -rf "$INSTALL_DIR/debs"; cp -a "$BUNDLE/debs" "$INSTALL_DIR/"
   fi
@@ -146,6 +150,49 @@ p40_install() {
                   <(dpkg-query -W -f='${Package}=${Version}\n' | sort) | wc -l)
   log "exact versions installed: $have/$want"
   [ "$have" -eq "$want" ] || return 1
+}
+
+restore_conf() { local f; for f in "$@"; do [ -e "$BACKUP_DIR/conffiles$f" ] && cp -a "$BACKUP_DIR/conffiles$f" "$f"; done; }
+
+p45_conffiles() {
+  # Packages downloaded from Ubuntu carry stock config files, but Datto's mirror ships rebuilds
+  # with the same version numbers and different config files (e.g. apache2's ports.conf, whose
+  # stock "Listen 80/443" duplicates device.conf's and stops Apache from binding). Apply
+  # spf-datto's copy of every package config file that differs, except CONFFILE_DENY_RE.
+  local src="$INSTALL_DIR/conffiles" tmp n=0 skip=0 sum f pkg cur applied=$STATE_DIR/conffiles-applied.txt
+  [ -f "$src/conffiles.tgz" ] || { log "no conffiles in bundle; skipping"; return 0; }
+  tmp=$(mktemp -d)
+  tar -C "$tmp" -xzf "$src/conffiles.tgz" || return 1
+  mkdir -p "$BACKUP_DIR/conffiles" "$STATE_DIR"; : > "$applied"
+  while IFS=$'\t' read -r sum f pkg; do
+    [ -f "$tmp$f" ] || continue
+    cur=$(md5sum "$f" 2>/dev/null | cut -d' ' -f1)
+    [ "$cur" = "$sum" ] && continue
+    if [[ "$f" =~ $CONFFILE_DENY_RE ]]; then skip=$((skip+1)); continue; fi
+    if [ -e "$f" ]; then mkdir -p "$BACKUP_DIR/conffiles$(dirname "$f")"; cp -a "$f" "$BACKUP_DIR/conffiles$f"; fi
+    mkdir -p "$(dirname "$f")"; cp -a "$tmp$f" "$f"
+    printf '%s\t%s\n' "$f" "$pkg" >> "$applied"; n=$((n+1))
+  done < "$src/manifest.tsv"
+  rm -rf "$tmp"
+  log "applied $n spf-datto config files ($skip withheld: identity/hardware); list in $applied"
+
+  # validate each group; put the replica's own copy back if spf-datto's doesn't pass here
+  if grep -q '^/etc/sudoers' "$applied" && ! visudo -c >/dev/null 2>&1; then
+    restore_conf $(cut -f1 "$applied" | grep '^/etc/sudoers'); log "sudoers failed visudo -c; restored"
+  fi
+  if grep -q '^/etc/ssh/' "$applied" && ! sshd -t >/dev/null 2>&1; then
+    restore_conf $(cut -f1 "$applied" | grep '^/etc/ssh/'); log "ssh config failed sshd -t; restored"
+  fi
+  if grep -q '^/etc/apache2/' "$applied" && ! apache2ctl configtest >/dev/null 2>&1; then
+    restore_conf $(cut -f1 "$applied" | grep '^/etc/apache2/'); log "apache config failed configtest; restored"
+  fi
+  systemctl daemon-reload
+  # spf-datto's firewalld.conf switches the backend (nftables -> iptables); a reload doesn't do
+  # that cleanly and leaves rules half-applied until reboot, so restart instead
+  grep -q '^/etc/firewalld/' "$applied" && systemctl is-active --quiet firewalld && systemctl restart firewalld
+  systemctl reset-failed apache2 2>/dev/null; systemctl restart apache2 2>/dev/null
+  log "apache2: $(systemctl is-active apache2); listening: $(ss -Hltn '( sport = :80 or sport = :443 )' | awk '{print $4}' | sort -u | xargs)"
+  return 0
 }
 
 p50_boot() {
@@ -389,6 +436,19 @@ verify() {
   if [ "$NET_CONFIGURE" = yes ]; then
     check "br0 managed by NetworkManager: $(ip -4 -o addr show dev br0 2>/dev/null | awk '{print $4}')" "nmcli -t -f DEVICE,STATE dev | grep -q '^br0:connected'"
   fi
+  # Apache / Datto web UI
+  local dup ip code
+  dup=$(grep -rhoE '^\s*Listen\s+\S+' /etc/apache2/ports.conf /etc/apache2/sites-enabled/ /etc/apache2/conf-enabled/ 2>/dev/null \
+        | awk '{print $2}' | sed -E 's/.*://' | sort | uniq -d | xargs)
+  ip=$(ip -4 -o addr show dev "$(ip route show default | awk '{print $5; exit}')" | awk '{sub(/\/.*/,"",$4); print $4; exit}')
+  for _ in 1 2 3 4; do   # the first request after an Apache/PHP restart can be slow
+    code=$(curl -sk -o /dev/null -w '%{http_code}' --max-time 15 "https://$ip/" 2>/dev/null)
+    case "$code" in 200|301|302|303) break ;; esac; sleep 5
+  done
+  check "apache2 active"                                   "systemctl is-active apache2"
+  check "no duplicate Apache Listen ports${dup:+ (duplicated: $dup)}" "[ -z \"$dup\" ]"
+  check "apache bound to :80 and :443"                     "ss -Hltn '( sport = :80 )' | grep -q . && ss -Hltn '( sport = :443 )' | grep -q ."
+  check "web UI https://$ip/ answers (HTTP $code)"         "case '$code' in 200|301|302|303) true;; *) false;; esac"
   [ "$NET_CONFIGURE" = yes ] || EXPECTED_FAILED="$EXPECTED_FAILED NetworkManager-wait-online.service datto-network-repair.service"
   [ "$ZFS_CONFIGURE" = yes ] || EXPECTED_FAILED="$EXPECTED_FAILED datto-zfs-cache-update.service"
   failed=$(systemctl --failed --no-legend --plain | awk '{print $1}')
@@ -408,12 +468,14 @@ run_all() {
   phase p20 "dry run"                                         p20_dryrun
   phase p30 "SSH guard (remote-users) and cloud-init network" p30_prep
   phase p40 "install all packages at exact versions"          p40_install
+  phase p45 "spf-datto config files (apache, sudoers, audit, ...)" p45_conffiles
   phase p50 "boot config (FIPS off)"                          p50_boot
   phase p60 "remove snapd + cloud-init, restore snapctl"      p60_cleanup
   phase p70 "ZFS $ZFS_POOL"                                   p70_zfs
   phase p80 "NetworkManager bridge br0"                       p80_network
   phase p85 "apt sources"                                     p85_apt
-  phase p90 "post-boot verification timer"                    p90_verify_timer
+  log "== p90: post-boot verification timer (re-armed every run)"
+  p90_verify_timer
   verify || true
   log "setup finished; report above. Post-reboot check: $VERIFY_LOG"
   echo "SETUP-COMPLETE"
