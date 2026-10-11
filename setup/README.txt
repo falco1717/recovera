@@ -9,6 +9,7 @@ kernel packages after validating the retained package dependency closure.
 
 NEEDS
   - Ubuntu 22.04 amd64 (cloud image or server install), SSH key login for your user
+  - at least 8 GB RAM (more when local recovery/verification VMs require it)
   - about 12 GB free on /   (archive extraction + bundle copy + install)
   - a second, BLANK disk of at least ZFS_MIN_GB (default 20 GB) for homePool
   - hardware virtualization; for a VM, enable nested virtualization before boot

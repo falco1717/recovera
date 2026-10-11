@@ -93,7 +93,7 @@ load_conf() {
   # shellcheck source=/dev/null
   . "$c"
   : "${NET_CONFIGURE:=yes}" "${NET_IP:=current}" "${NET_GATEWAY:=}" "${NET_DNS:=}" "${NET_IFACE:=}"
-  : "${REQUIRE_KVM:=yes}"
+  : "${REQUIRE_KVM:=yes}" "${MIN_RAM_GB:=8}"
   : "${ZFS_CONFIGURE:=yes}" "${ZFS_DISK:=auto}" "${ZFS_MIN_GB:=20}" "${ZFS_POOL:=homePool}" "${ZFS_MOVE_HOME:=yes}"
   : "${FIPS_OFF:=yes}" "${REMOVE_SNAPD:=yes}" "${REMOVE_CLOUD_INIT:=yes}" "${APT_FREEZE:=yes}" "${OFFLINE_MODE:=yes}" "${AUTO_REBOOT:=yes}"
   LOGIN_USER="${LOGIN_USER:-${SUDO_USER:-}}"
@@ -103,6 +103,7 @@ load_conf() {
 validate_conf() {
   case "$OFFLINE_MODE" in yes|no) ;; *) die "OFFLINE_MODE must be yes or no" ;; esac
   case "$REQUIRE_KVM" in yes|no) ;; *) die "REQUIRE_KVM must be yes or no" ;; esac
+  [[ "$MIN_RAM_GB" =~ ^[1-9][0-9]*$ ]] || die "MIN_RAM_GB must be a positive integer"
   case "$ZFS_CONFIGURE" in yes|no|auto) ;; *) die "ZFS_CONFIGURE must be yes, no, or auto" ;; esac
   if [ "$OFFLINE_MODE" = yes ]; then
     [ "$APT_FREEZE" = yes ] || die "OFFLINE_MODE=yes requires APT_FREEZE=yes"
@@ -133,6 +134,16 @@ preflight() {
   [ "$(dpkg --print-architecture)" = amd64 ] || { echo "needs amd64"; exit 1; }
   load_conf
   validate_conf
+  local mem_kb mem_gb
+  mem_kb=$(awk '/^MemTotal:/{print $2}' /proc/meminfo)
+  # Linux reserves a small part of configured VM memory, so compare the
+  # ceiling of MemTotal rather than rejecting an 8 GB VM that reports ~7.8 GiB.
+  mem_gb=$(( (${mem_kb:-0} + 1024*1024 - 1) / 1024 / 1024 ))
+  [ "$mem_gb" -ge "$MIN_RAM_GB" ] || {
+    echo "needs at least ${MIN_RAM_GB} GB RAM for local recovery-point boot verification (detected ${mem_gb} GB)"
+    echo "increase the appliance VM memory while powered off, then retry"
+    exit 1
+  }
   if [ "$REQUIRE_KVM" = yes ] && ! kvm_ready; then
     local virt
     virt=$(systemd-detect-virt 2>/dev/null || echo unknown)
@@ -1009,7 +1020,7 @@ EOF
 # --------------------------------------------------------------------------- verify
 verify() {
   load_conf
-  local fails=0 failed unexpected cyc want have sshlink
+  local fails=0 failed unexpected cyc want have sshlink mem_kb mem_gb
   check() { if eval "$2" >/dev/null 2>&1; then printf '  ok    %s\n' "$1"; else printf '  FAIL  %s\n' "$1"; fails=$((fails+1)); fi; }
   echo "spf-datto replica verification $(ts) on $(hostname)"
   echo "  kernel $(uname -r), fips_enabled=$(cat /proc/sys/crypto/fips_enabled 2>/dev/null || echo n/a)"
@@ -1017,6 +1028,8 @@ verify() {
   have=$(comm -12 <(sort "$INSTALL_DIR/lists/all-packages-versions.txt") <(dpkg-query -W -f='${Package}=${Version}\n' | sort) | wc -l)
   cyc=$(journalctl -b -o cat 2>/dev/null | grep -c 'Found ordering cycle')
   sshlink=$(readlink /etc/ssh/sshd_config)
+  mem_kb=$(awk '/^MemTotal:/{print $2}' /proc/meminfo)
+  mem_gb=$(( (mem_kb + 1024*1024 - 1) / 1024 / 1024 ))
   check "packages at spf-datto versions: $have/$want"      "[ $have -eq $want ]"
   check "dpkg --audit clean"                               "[ -z \"\$(dpkg --audit)\" ]"
   check "no systemd ordering cycles this boot ($cyc)"      "[ $cyc -eq 0 ]"
@@ -1026,6 +1039,8 @@ verify() {
   check "php8.1-fpm active (/run/php)"                     "systemctl is-active php8.1-fpm"
   # libvirtd is socket-activated with --timeout 120, so "inactive" is normal; ask it instead
   check "libvirt answers (virsh version)"                  "virsh -c qemu:///system version"
+  check "RAM for recovery verification: ${mem_gb} GB >= ${MIN_RAM_GB} GB" \
+                                                            "[ $mem_gb -ge $MIN_RAM_GB ]"
   if [ "$REQUIRE_KVM" = yes ]; then
     check "hardware virtualization available (/dev/kvm)"  "kvm_ready"
     check "libguestfs/KVM self-test passed"                "grep -q 'TEST FINISHED OK' /var/log/spf-datto-libguestfs-test.log"

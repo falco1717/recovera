@@ -11,11 +11,14 @@ application. It also removes copied appliance credentials and private keys.
 
 ## Install on an existing Ubuntu VM
 
-The VM needs Ubuntu 22.04 amd64, a normal user with `sudo` access, about
-12 GB free on `/`, and a blank second disk of at least 20 GB for `homePool`.
+The VM needs Ubuntu 22.04 amd64, at least 8 GB RAM, a normal user with `sudo`
+access, about 12 GB free on `/`, and a blank second disk of at least 20 GB for `homePool`.
 Hardware virtualization must be available. If the appliance runs as a VM,
 enable nested virtualization before powering it on (in VMware, expose
 hardware-assisted virtualization to the guest).
+
+Eight GB supports screenshot/boot verification of small protected VMs. Size the
+appliance with additional RAM when recovery VMs need more memory.
 
 ```bash
 gh auth login
