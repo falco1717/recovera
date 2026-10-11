@@ -59,12 +59,13 @@ install. The Datto post-install script's `npyscreen` Python dependency is vendor
 use `NET_GATEWAY="none"` and `NET_DNS="none"` in `setup.conf`. See
 [setup/README.txt](setup/README.txt) for the full workflow.
 
-This removes Internet access as a provisioning requirement. It does not make Datto account
-registration, licensing, updates, or cloud services work offline; those are separate Datto
-product behaviors. Optional Apache cloud-client certificate authorization and its boot-time CA
-download are disabled on the replica so the local web UI can start without registration or
-Internet access. The first-run wizard also skips its online-update pane and connectivity polling,
-allowing offline setup to proceed directly to naming the device.
+This removes Internet access as a provisioning requirement, including the appliance's initial
+local registration and administrator setup. Optional Apache cloud-client certificate
+authorization and its boot-time CA download are disabled, and the first-run wizard skips its
+online-update pane and connectivity polling. At final submission, a same-origin local endpoint
+uses Datto's native registration service while satisfying only its `registerNow` cloud RPC inside
+the process; no network connection is opened. Datto account enrollment, licensing, updates, and
+other cloud services are not emulated and remain unavailable offline.
 
 ## Registration workflow document
 

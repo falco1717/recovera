@@ -40,6 +40,7 @@ h2 { font-size: 17pt; margin: 24pt 0 8pt; break-after: avoid; }
 p { margin: 0 0 8pt; }
 ul, ol { margin: 5pt 0 10pt 19pt; padding: 0; }
 li { margin: 2pt 0; }
+h2 + ul, h2 + ol { break-inside: avoid; }
 table { border-collapse: collapse; font-size: 8.6pt; margin: 10pt 0 14pt; width: 100%; }
 thead { display: table-header-group; }
 tr { break-inside: avoid; }

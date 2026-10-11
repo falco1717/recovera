@@ -23,9 +23,10 @@ AIR-GAPPED MODE
     NET_GATEWAY="none"
     NET_DNS="none"
 
-  This makes provisioning and the local web UI work without Internet access. It does not make
-  Datto account registration, licensing, updates, or cloud services work offline; those remain
-  subject to Datto's own connectivity requirements.
+  This makes provisioning, the local web UI, and the appliance's initial local registration and
+  administrator setup work without Internet access. The final registration action uses Datto's
+  native local registration service but satisfies only its registerNow cloud RPC inside the
+  process. Datto account enrollment, licensing, updates, and cloud services are not emulated.
 
 RUN
   scp spf-datto-setup.tar ubuntu@VM:
@@ -52,9 +53,9 @@ WHAT IT DOES (in order)
        Apache fails to bind. Withheld: /root/* (Datto support root keys), filebeat (log-shipping
        identity), watchdog.conf (hardware). sudoers/sshd/apache are validated, else rolled back.
        Optional Datto cloud-client certificate authorization and its boot-time CA download are
-       removed because this replica has no registration flow and must start without Internet.
-       The first-run wizard's online-update pane and perpetual connectivity polling are also
-       removed, so offline setup begins directly at "Name the Device."
+       removed so this replica can start without Internet. The first-run wizard's online-update
+       pane and perpetual connectivity polling are removed, and a one-time same-origin finalizer
+       completes Datto's native local registration without contacting the cloud.
   p50  GRUB: 6.8 generic kernel without fips=1, like spf-datto (FIPS packages stay installed)
   p60  purges snapd + cloud-init (they make boot ordering cycles with Datto's units) and
        restores the /usr/bin/snapctl link
@@ -77,7 +78,9 @@ WEB UI
   appliance). Apache listens once on 0.0.0.0:80 and 0.0.0.0:443; verify checks both.
   It uses spf-datto's TLS certificate/key (they are config files of datto-siris-os-2).
   The page is locally accessible offline and starts at "Name the Device" without running the
-  online update check. Completing Datto registration may still require Internet.
+  online update check. Name, administrator, configuration, confirmation, local login, and the
+  registration marker can all complete without Internet. Cloud enrollment and licensing remain
+  outside this offline replica workflow.
 
 EXPECTED FAILED SERVICES (no IPMI hardware / no Datto registration)
   openipmi, datto-speedsync-cache-update, datto-system-speedsync-check,

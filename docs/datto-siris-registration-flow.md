@@ -7,7 +7,8 @@ _Observed on October 10, 2026_
 This document maps the locally observable registration workflow in Datto SIRIS OS 2
 5.6.3: page load, the stock network/update behavior, the optional storage pane, the
 required name/admin/configure/review panes, and final submission. It also records the
-offline-replica override that removes the network/update gate.
+offline-replica overrides that remove the network/update gate and complete native local
+registration without a Datto Cloud connection.
 
 The browser calls JSON-RPC methods on the appliance itself. The appliance's PHP services
 perform the server-side work. Browser behavior is described directly from readable
@@ -37,7 +38,8 @@ that every unpackaged file is byte-identical.
 | 6 | Administrator | Always | Collects admin credentials and rates password strength. |
 | 7 | Configure | Always | Loads the default offsite location and collects configuration. |
 | 8 | Review | Always | Presents the values before submission. |
-| 9 | Submit | Always | Calls `send` with the completed wizard data. |
+| 9 | Submit | Stock | Calls `send`, whose registration service calls Datto Cloud. |
+| 10 | Offline submit | Air-gapped replica | Calls a same-origin local finalizer, then logs in locally. |
 
 ```text
 page load
@@ -61,7 +63,8 @@ the panes present in the rendered page. On the air-gapped replica, setup forces 
 update-pane switch off and suppresses the network poll when no online-only pane remains:
 
 ```text
-offline page load -> name -> administrator -> configure -> review -> send
+offline page load -> name -> administrator -> configure -> review
+                  -> local finalizer -> local login
 ```
 
 ## Where the code lives
@@ -81,6 +84,8 @@ Registration is implemented in `/usr/lib/datto/device` (part of the
 | Wizard page | `templates/commonlookandfeel/Registration/Register/index.html.twig` | Yes |
 | Wizard panes | `update`, `storage`, `name`, `admin`, `configure`, `review` pane templates | Yes |
 | Wizard logic | `/datto/web/commonlookandfeel/js/App/Registration/RegisterWizard.js` | Yes |
+| Offline final-submit override | `/datto/web/commonlookandfeel/js/App/Registration/OfflineRegister.js` | Yes |
+| Offline local finalizer | `/datto/web/offline-register.php` | Yes |
 | Wizard framework | `/datto/web/commonlookandfeel/js/Widget/Wizard3.js` | Yes |
 | API client | `/datto/web/commonlookandfeel/UI/scripts/classes/Datto/API/Client.js` | Yes |
 | Shell feature library | `/datto/scripts/feature_utils` | Yes |
@@ -90,7 +95,7 @@ Registration is implemented in `/usr/lib/datto/device` (part of the
 
 ## Browser-to-device API
 
-Wizard actions are JSON-RPC 2.0 POST requests to `/api?<method>` on the appliance. The
+Stock wizard actions are JSON-RPC 2.0 POST requests to `/api?<method>` on the appliance. The
 method is also present in the JSON request body. `RegisterWizard.js` creates the API
 client, and the client sends `{jsonrpc: "2.0", method, params, ...}` with jQuery.
 
@@ -108,6 +113,10 @@ during a reboot as one signal while it waits for the appliance to return.
 | `getDefaultLocation` | Configure pane | Load the default offsite datacenter. |
 | `v1/device/security/getPasswordStrength` | Administrator pane | Rate the proposed password. |
 | `send` | Finish | Submit the completed workflow. |
+
+On the air-gapped replica, only the finish action differs: `OfflineRegister.js` sends the
+same collected values as JSON to `/offline-register.php`. That endpoint is local to the
+appliance, requires a same-origin AJAX POST, and does not expose a general JSON-RPC client.
 
 The wizard also loads `/register?devicetable` with a plain AJAX GET to render the storage
 pane's drive table.
@@ -154,16 +163,38 @@ visually enables **Next**, but the update pane's validator still rejects the cli
 `networkConnected === false`. Production Twig caches are invalidated during setup so
 the offline template takes effect immediately.
 
+The stock final `send` action still fails offline because the encoded
+`RegistrationService` first calls Datto Cloud method
+`v1/device/registration/registerNow`. The air-gapped setup therefore installs a narrow,
+one-time local finalizer and a browser override for the finish action:
+
+1. The endpoint accepts only POST, verifies the AJAX header and same-host referrer,
+   validates the submitted values, and takes a nonblocking registration lock.
+2. It boots the installed Datto application and obtains the native
+   `RegistrationService` and `Registrant` classes.
+3. For this call only, it replaces the service's cloud client with an in-process client
+   that returns success exclusively for `v1/device/registration/registerNow`. Any other
+   cloud method is rejected, and the substitute opens no network connection.
+4. It calls the native `register` routine, preserving the local hostname,
+   administrator, timezone, session/login, and registration-marker behavior, then
+   verifies the native `isRegistered()` result.
+5. The browser performs the stock local login and redirect after the endpoint succeeds.
+
+This is local appliance onboarding, not Datto Cloud account enrollment. Licensing,
+updates, remote management, and other cloud services are not emulated and remain
+unavailable without connectivity.
+
 ## Storage and final configuration
 
 The storage pane calls `checkStorage` to populate the device table and `createStorage`
 for the selected drive. The later panes collect the device name, administrator settings,
 offsite location, and remaining configuration. The review pane presents the completed
-values before `send` submits them.
+values before the stock `send` action or the offline local finalizer submits them.
 
-The precise server-side persistence order is not visible in the encoded PHP. A failed
-or interrupted run should therefore be evaluated through logs and before/after state,
-not inferred from the browser sequence alone.
+The encoded native service was observed to begin its local work only after the cloud
+`registerNow` result. The exact persistence order inside that local work remains encoded;
+a failed or interrupted run should therefore be evaluated through logs and before/after
+state, not inferred from the browser sequence alone.
 
 ## Feature flags
 
@@ -179,8 +210,9 @@ refresh mechanism, and observed effect.
 
 - Browser request order, pane construction, polling intervals, and client-side gates are
   directly observable.
-- PHP controller and service internals are encoded; their effects require logs, network
-  traces, or before/after state to confirm.
+- PHP controller and service internals are encoded; the `registerNow` dependency and
+  subsequent native local actions were confirmed through controlled runtime tracing,
+  while exact persistence details still require before/after observation.
 - The exact destination tested by `testNetworkConnection` was not established from the
   browser code alone.
 - The conditions controlling the update and storage panes need controlled-state testing.

@@ -129,6 +129,13 @@ preflight() {
 stage_bundle() {   # copy the bundle to /opt/spf-datto so nothing depends on /home (which may move to ZFS)
   if [ "$BUNDLE" = "$INSTALL_DIR" ]; then return 0; fi
   local need_kb free_kb
+  # Validate every required source before replacing an already-staged copy. This
+  # prevents an incomplete extraction from deleting a usable offline bundle.
+  [ -f "$BUNDLE/setup.sh" ] || die "missing setup.sh in bundle: $BUNDLE"
+  [ -f "$BUNDLE/setup.conf" ] || die "missing setup.conf in bundle: $BUNDLE"
+  [ -d "$BUNDLE/debs" ] || die "missing debs/ in bundle: $BUNDLE"
+  [ -d "$BUNDLE/lists" ] || die "missing lists/ in bundle: $BUNDLE"
+  [ -d "$BUNDLE/wheels" ] || die "missing wheels/ in bundle: $BUNDLE"
   need_kb=$(( $(du -sk "$BUNDLE" | cut -f1) + 6*1024*1024 ))   # bundle + ~6 GB for the install itself
   free_kb=$(df -Pk / | awk 'NR==2{print $4}')
   [ "$free_kb" -ge "$need_kb" ] || { echo "not enough space on /: need ~$((need_kb/1024/1024)) GB, have $((free_kb/1024/1024)) GB"; exit 1; }
@@ -267,8 +274,234 @@ disable_online_registration_gates() {
   # Production Twig caches do not check source mtimes. Invalidate only the two
   # compiled registration index templates, then let Twig rebuild them on demand.
   if [ -d /var/cache/datto/device/prod/twig ]; then
-    find /var/cache/datto/device/prod/twig -type f -name '*.php' -exec \
-      grep -lZ 'Registration/Register/index.html.twig' {} + 2>/dev/null | xargs -0 -r rm -f || return 1
+    { find /var/cache/datto/device/prod/twig -type f -name '*.php' -exec \
+      grep -lZ 'Registration/Register/index.html.twig' {} + 2>/dev/null || true; } | xargs -0 -r rm -f || return 1
+  fi
+  systemctl restart php8.1-fpm >/dev/null 2>&1 || return 1
+}
+
+install_offline_registration_finalizer() {
+  # RegistrationService performs the important local work (hostname, administrator,
+  # timezone, local login, and the registration marker) only after Datto Cloud's
+  # registerNow RPC succeeds. Preserve that native routine, but replace its cloud
+  # client for this one flow with an in-process client that returns success without
+  # opening a network connection.
+  install -d -m 0755 /datto/web/commonlookandfeel/js/App/Registration \
+    /datto/web/vintage/js/App/Registration
+
+  cat > /datto/web/offline-register.php <<'PHP'
+<?php
+declare(strict_types=1);
+
+use Datto\AppKernel;
+use Datto\Cloud\JsonRpcClient;
+use Datto\Service\Registration\Registrant;
+
+header('Content-Type: application/json');
+header('Cache-Control: no-store');
+
+function failOfflineRegistration(int $status, string $message): never
+{
+    http_response_code($status);
+    echo json_encode(['ok' => false, 'error' => $message]);
+    exit;
+}
+
+if (($_SERVER['REQUEST_METHOD'] ?? '') !== 'POST') {
+    failOfflineRegistration(405, 'POST required');
+}
+if (strcasecmp($_SERVER['HTTP_X_REQUESTED_WITH'] ?? '', 'XMLHttpRequest') !== 0) {
+    failOfflineRegistration(403, 'Invalid request');
+}
+
+$host = strtolower(preg_replace('/:\\d+$/', '', $_SERVER['HTTP_HOST'] ?? ''));
+$refererHost = strtolower((string) parse_url($_SERVER['HTTP_REFERER'] ?? '', PHP_URL_HOST));
+if ($host === '' || $refererHost === '' || !hash_equals($host, $refererHost)) {
+    failOfflineRegistration(403, 'Invalid request origin');
+}
+
+$lock = fopen('/run/lock/spf-datto-offline-registration.lock', 'c');
+if ($lock === false || !flock($lock, LOCK_EX | LOCK_NB)) {
+    failOfflineRegistration(409, 'Registration is already in progress');
+}
+
+$input = json_decode((string) file_get_contents('php://input'), true);
+if (!is_array($input)) {
+    failOfflineRegistration(400, 'Invalid registration data');
+}
+
+$user = trim((string) ($input['user'] ?? ''));
+$password = (string) ($input['password'] ?? '');
+$hostname = trim((string) ($input['hostname'] ?? ''));
+$timezone = trim((string) ($input['timezone'] ?? ''));
+$email = trim((string) ($input['email'] ?? ''));
+$datacenter = trim((string) ($input['datacenterLocation'] ?? ''));
+$recommendedDatacenter = trim((string) ($input['recommendedDatacenter'] ?? ''));
+
+if (!preg_match('/^[a-z_][a-z0-9_-]{0,31}$/i', $user)) {
+    failOfflineRegistration(400, 'Invalid administrator username');
+}
+if (strlen($password) < 8 || str_contains($password, "\0")) {
+    failOfflineRegistration(400, 'Invalid administrator password');
+}
+if (!preg_match('/^(?=.{1,63}$)[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?$/', $hostname)) {
+    failOfflineRegistration(400, 'Invalid device name');
+}
+if (!in_array($timezone, timezone_identifiers_list(), true)) {
+    failOfflineRegistration(400, 'Invalid timezone');
+}
+if (filter_var($email, FILTER_VALIDATE_EMAIL) === false) {
+    failOfflineRegistration(400, 'Invalid email address');
+}
+
+require '/usr/lib/datto/device/vendor/autoload.php';
+
+final class SpfDattoOfflineRegistrationClient extends JsonRpcClient
+{
+    public function __construct()
+    {
+    }
+
+    private function answer(string $method, $arguments = null)
+    {
+        if ($method !== 'v1/device/registration/registerNow') {
+            throw new RuntimeException("Offline registration blocked unexpected cloud method: $method");
+        }
+        return true;
+    }
+
+    public function query($method, $arguments = null)
+    {
+        return $this->answer((string) $method, $arguments);
+    }
+
+    public function queryWithId($method, $arguments = null)
+    {
+        return $this->answer((string) $method, $arguments);
+    }
+
+    public function notify($method, $arguments = null)
+    {
+        return $this->answer((string) $method, $arguments);
+    }
+
+    public function notifyWithId($method, $arguments = null)
+    {
+        return $this->answer((string) $method, $arguments);
+    }
+}
+
+try {
+    $kernel = AppKernel::getBootedInstance();
+    $container = $kernel->getContainer();
+    $controller = $container->get('Datto\\App\\Controller\\Api\\V1\\Device\\Register');
+
+    $serviceProperty = new ReflectionProperty($controller, 'registrationService');
+    $serviceProperty->setAccessible(true);
+    $registrationService = $serviceProperty->getValue($controller);
+
+    if ($registrationService->isRegistered()) {
+        failOfflineRegistration(409, 'Device is already registered');
+    }
+
+    $clientProperty = new ReflectionProperty($registrationService, 'client');
+    $clientProperty->setAccessible(true);
+    $clientProperty->setValue($registrationService, new SpfDattoOfflineRegistrationClient());
+
+    $registrant = new Registrant(
+        $user,
+        $password,
+        $hostname,
+        $timezone,
+        $email,
+        $datacenter,
+        $recommendedDatacenter
+    );
+    $registrationService->register($registrant);
+
+    if (!$registrationService->isRegistered()) {
+        throw new RuntimeException('Local registration did not set the completion marker');
+    }
+
+    echo json_encode(['ok' => true]);
+} catch (Throwable $error) {
+    error_log('Offline registration failed: ' . $error->getMessage());
+    failOfflineRegistration(500, 'Could not complete local registration');
+}
+PHP
+  chmod 0644 /datto/web/offline-register.php || return 1
+
+  cat > /datto/web/commonlookandfeel/js/App/Registration/OfflineRegister.js <<'JS'
+(function ($, RegisterWizard) {
+    "use strict";
+
+    // Replace only the final submission. The server-side finalizer invokes the
+    // appliance's native RegistrationService with its cloud call stubbed locally.
+    RegisterWizard.prototype.finish = function (done) {
+        const self = this;
+        const user = self.$userName.val();
+        const password = self.$password.val();
+        const $deviceMigrationBox = $("#deviceMigrationRedirect");
+
+        const pass = function () {
+            const params = {
+                user: user,
+                password: password,
+                email: self.$email.val(),
+                hostname: self.$deviceName.val(),
+                timezone: self.$timeZone.val(),
+                datacenterLocation: self.$datacenter.val(),
+                recommendedDatacenter: self.recommendedDataCenter
+            };
+
+            $.ajax({
+                url: '/offline-register.php',
+                method: 'POST',
+                contentType: 'application/json',
+                dataType: 'json',
+                data: JSON.stringify(params)
+            }).done(function () {
+                const formData = {};
+                formData.username = user;
+                formData.password = password;
+                formData[self.context.csrfTokenId] = self.context.csrfToken;
+                const redirectUrl = $deviceMigrationBox.prop('checked') ?
+                    self.context.urls.successDeviceMigration : self.context.urls.success;
+                $.post(self.context.loginPath, formData).always(function () {
+                    self.close(redirectUrl);
+                    done();
+                });
+            }).fail(function () {
+                self.displayValidation.setError(
+                    self.$navFinish,
+                    self.translator.trans('registration.register.pane.review.errors.registrationFailed')
+                );
+                done();
+            });
+        };
+
+        this.panes[this.currentPane].validate(pass, done);
+    };
+})(jQuery, Datto.App.RegisterWizard);
+JS
+  cp -a /datto/web/commonlookandfeel/js/App/Registration/OfflineRegister.js \
+    /datto/web/vintage/js/App/Registration/OfflineRegister.js || return 1
+
+  local f asset
+  for f in \
+    /usr/lib/datto/device/templates/commonlookandfeel/Registration/Register/index.html.twig \
+    /usr/lib/datto/device/templates/vintage/Registration/Register/index.html.twig; do
+    [ -f "$f" ] || continue
+    if ! grep -q 'OfflineRegister.js' "$f"; then
+      if [[ "$f" == *commonlookandfeel* ]]; then asset=commonlookandfeel; else asset=vintage; fi
+      sed -i "/RegisterWizard\.js/a\\    <script type=\"text/javascript\" src=\"{{ asset('$asset/js/App/Registration/OfflineRegister.js') }}\"></script>" "$f" || return 1
+    fi
+  done
+
+  php -l /datto/web/offline-register.php >/dev/null || return 1
+  if [ -d /var/cache/datto/device/prod/twig ]; then
+    { find /var/cache/datto/device/prod/twig -type f -name '*.php' -exec \
+      grep -lZ 'Registration/Register/index.html.twig' {} + 2>/dev/null || true; } | xargs -0 -r rm -f || return 1
   fi
   systemctl restart php8.1-fpm >/dev/null 2>&1 || return 1
 }
@@ -308,6 +541,7 @@ p45_conffiles() {
 
   remove_cloud_client_cert_auth
   disable_online_registration_gates || return 1
+  install_offline_registration_finalizer || return 1
   fix_optional_sensor_logrotate || return 1
 
   # validate each group; put the replica's own copy back if spf-datto's doesn't pass here
