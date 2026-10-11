@@ -53,6 +53,8 @@ WHAT IT DOES (in order)
        identity), watchdog.conf (hardware). sudoers/sshd/apache are validated, else rolled back.
        Optional Datto cloud-client certificate authorization and its boot-time CA download are
        removed because this replica has no registration flow and must start without Internet.
+       The first-run wizard's online-update pane and perpetual connectivity polling are also
+       removed, so offline setup begins directly at "Name the Device."
   p50  GRUB: 6.8 generic kernel without fips=1, like spf-datto (FIPS packages stay installed)
   p60  purges snapd + cloud-init (they make boot ordering cycles with Datto's units) and
        restores the /usr/bin/snapctl link
@@ -74,7 +76,8 @@ WEB UI
   https://<VM IP>/  ->  "Control Panel - Register a Device" (the Datto UI of an unregistered
   appliance). Apache listens once on 0.0.0.0:80 and 0.0.0.0:443; verify checks both.
   It uses spf-datto's TLS certificate/key (they are config files of datto-siris-os-2).
-  The page is locally accessible offline; completing Datto registration may require Internet.
+  The page is locally accessible offline and starts at "Name the Device" without running the
+  online update check. Completing Datto registration may still require Internet.
 
 EXPECTED FAILED SERVICES (no IPMI hardware / no Datto registration)
   openipmi, datto-speedsync-cache-update, datto-system-speedsync-check,

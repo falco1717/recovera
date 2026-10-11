@@ -241,6 +241,49 @@ remove_cloud_client_cert_auth() {
   systemctl disable --now datto-apache-ca-update-boot.service >/dev/null 2>&1 || true
 }
 
+disable_online_registration_gates() {
+  # The stock first-run wizard renders an online-update pane even when the
+  # authorization pane is disabled. Its failure path enables Next visually but
+  # its validator still rejects the click while networkConnected=false. Remove
+  # that pane on this deliberately offline replica and stop its perpetual
+  # connectivity poll when no online-only pane remains.
+  local f
+  for f in \
+    /usr/lib/datto/device/templates/commonlookandfeel/Registration/Register/index.html.twig \
+    /usr/lib/datto/device/templates/vintage/Registration/Register/index.html.twig; do
+    [ -f "$f" ] || continue
+    if ! grep -q 'spf-datto offline replica: skip online update pane' "$f"; then
+      sed -i "/^{% set panes = \[\] %}$/i\\{% set updatePaneEnabled = false %} {# spf-datto offline replica: skip online update pane #}" "$f" || return 1
+    fi
+  done
+  for f in \
+    /datto/web/commonlookandfeel/js/App/Registration/RegisterWizard.js \
+    /datto/web/vintage/js/App/Registration/RegisterWizard.js; do
+    [ -f "$f" ] || continue
+    if ! grep -q 'spf-datto offline replica: no online panes' "$f"; then
+      sed -i '/^[[:space:]]*this\.checkNetworkConnectivity();$/c\        // spf-datto offline replica: no online panes, so do not poll forever\n        if (this.context.authorizationPaneEnabled || this.context.updatePaneEnabled) {\n            this.checkNetworkConnectivity();\n        } else {\n            this.networkConnected = true;\n        }' "$f" || return 1
+    fi
+  done
+  # Production Twig caches do not check source mtimes. Invalidate only the two
+  # compiled registration index templates, then let Twig rebuild them on demand.
+  if [ -d /var/cache/datto/device/prod/twig ]; then
+    find /var/cache/datto/device/prod/twig -type f -name '*.php' -exec \
+      grep -lZ 'Registration/Register/index.html.twig' {} + 2>/dev/null | xargs -0 -r rm -f || return 1
+  fi
+  systemctl restart php8.1-fpm >/dev/null 2>&1 || return 1
+}
+
+fix_optional_sensor_logrotate() {
+  # Falcon is not enrolled on the replica, so its log may never be created.
+  # The package rule lacks missingok and otherwise fails the entire daily timer.
+  local f=/etc/logrotate.d/falcon-sensor
+  if [ -f "$f" ] && ! grep -q '^[[:space:]]*missingok[[:space:]]*$' "$f"; then
+    sed -i '/^[[:space:]]*daily[[:space:]]*$/a\    missingok' "$f" || return 1
+  fi
+  systemctl reset-failed logrotate.service 2>/dev/null || true
+  systemctl start logrotate.service >/dev/null 2>&1 || return 1
+}
+
 p45_conffiles() {
   # Packages downloaded from Ubuntu carry stock config files, but Datto's mirror ships rebuilds
   # with the same version numbers and different config files (e.g. apache2's ports.conf, whose
@@ -264,6 +307,8 @@ p45_conffiles() {
   log "applied $n spf-datto config files ($skip withheld: identity/hardware); list in $applied"
 
   remove_cloud_client_cert_auth
+  disable_online_registration_gates || return 1
+  fix_optional_sensor_logrotate || return 1
 
   # validate each group; put the replica's own copy back if spf-datto's doesn't pass here
   if grep -q '^/etc/sudoers' "$applied" && ! visudo -c >/dev/null 2>&1; then

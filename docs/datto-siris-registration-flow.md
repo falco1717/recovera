@@ -5,8 +5,9 @@ _Observed on October 10, 2026_
 ## Overview and scope
 
 This document maps the locally observable registration workflow in Datto SIRIS OS 2
-5.6.3: page load, network gating, the optional update and storage panes, the required
-name/admin/configure/review panes, and final submission.
+5.6.3: page load, the stock network/update behavior, the optional storage pane, the
+required name/admin/configure/review panes, and final submission. It also records the
+offline-replica override that removes the network/update gate.
 
 The browser calls JSON-RPC methods on the appliance itself. The appliance's PHP services
 perform the server-side work. Browser behavior is described directly from readable
@@ -29,8 +30,8 @@ that every unpackaged file is byte-identical.
 | Order | Pane or action | Condition | Browser-visible behavior |
 |---:|---|---|---|
 | 1 | Page load | Always | Server chooses the panes and embeds session/CSRF data. |
-| 2 | Network check | Always | Retries every five seconds until connectivity succeeds. |
-| 3 | Update | Server-selected | Starts an OS upgrade and polls progress once per second. |
+| 2 | Network check | Stock workflow only | Retries every five seconds until connectivity succeeds. |
+| 3 | Update | Stock server-selected | Starts an OS upgrade and polls progress once per second. |
 | 4 | Storage | Server-selected | Inspects drives and creates the selected storage pool. |
 | 5 | Name | Always | Collects the device name. |
 | 6 | Administrator | Always | Collects admin credentials and rates password strength. |
@@ -56,7 +57,12 @@ name -> administrator -> configure -> review -> send
 ```
 
 The server decides whether the update and storage panes exist. The browser builds only
-the panes present in the rendered page.
+the panes present in the rendered page. On the air-gapped replica, setup forces the
+update-pane switch off and suppresses the network poll when no online-only pane remains:
+
+```text
+offline page load -> name -> administrator -> configure -> review -> send
+```
 
 ## Where the code lives
 
@@ -116,9 +122,10 @@ pane's drive table.
    always added.
 3. **The browser builds the wizard.** `RegisterWizard` inherits from `Wizard3` and
    attaches validation and load/unload hooks to each pane.
-4. **The network check starts immediately.** A successful response hides the warning
-   and sets `networkConnected = true`. Other results show the warning and schedule a
-   retry five seconds later. The update pane cannot advance while the flag is false.
+4. **The stock network check starts immediately.** A successful response hides the
+   warning and sets `networkConnected = true`. Other results show the warning and
+   schedule a retry five seconds later. The stock update pane cannot advance while the
+   flag is false.
 
 The rules that select optional panes are server-side and encoded. Their exact conditions
 should not be inferred solely from variable names.
@@ -133,6 +140,19 @@ HTTP 403 responses are expected while the appliance restarts.
 The browser-side polling behavior is confirmed. Package selection, rollback behavior,
 and the internal actions performed by `/usr/local/bin/upgradectl` remain server-side or
 binary implementation details and require separate observation.
+
+## Offline replica override
+
+The air-gapped setup modifies both registration templates so
+`updatePaneEnabled = false` before the pane list and browser context are built. It also
+changes `RegisterWizard` to call `checkNetworkConnectivity()` only when an authorization
+or update pane is present. With both online-only panes absent, the wizard sets
+`networkConnected = true` locally and begins at **Name the Device**.
+
+This override fixes an inconsistency in the stock failure path: `setUpgradeError()`
+visually enables **Next**, but the update pane's validator still rejects the click while
+`networkConnected === false`. Production Twig caches are invalidated during setup so
+the offline template takes effect immediately.
 
 ## Storage and final configuration
 

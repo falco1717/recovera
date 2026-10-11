@@ -63,7 +63,8 @@ This removes Internet access as a provisioning requirement. It does not make Dat
 registration, licensing, updates, or cloud services work offline; those are separate Datto
 product behaviors. Optional Apache cloud-client certificate authorization and its boot-time CA
 download are disabled on the replica so the local web UI can start without registration or
-Internet access.
+Internet access. The first-run wizard also skips its online-update pane and connectivity polling,
+allowing offline setup to proceed directly to naming the device.
 
 ## Registration workflow document
 
