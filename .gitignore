@@ -1,8 +1,9 @@
-# Package files and images live outside the repo (1.6 GB / 711 MB)
+# Large package payloads and appliance images live outside the Git repository.
 *.deb
 *.ova
 scripts/vcenter/ova/SHA256SUMS
 debs/
+Packages
 Packages.gz
 
 # vc-login.ps1 writes the live vCenter session secret here

@@ -1,10 +1,10 @@
 #!/bin/bash
 # spf-datto replica: one-shot setup for a fresh Ubuntu 22.04 (jammy, amd64) VM.
 #
-# Installs every package from spf-datto at its exact version from the bundled .debs
-# (no internet needed), then applies everything learned building spf-datto-pkgs:
+# Installs the reviewed application package set at its exact versions from the bundled
+# .debs (no internet needed), then applies everything learned building spf-datto-pkgs:
 # SSH lockout guard, FIPS-off boot, snapd/cloud-init removal, ZFS homePool, and a
-# NetworkManager bridge with a self-check and automatic revert. See ../WALKTHROUGH.md.
+# NetworkManager bridge with a self-check and automatic revert.
 #
 #   sudo ./setup.sh            run (detaches into a systemd unit and follows the log)
 #   sudo ./setup.sh check      preflight + apt dry run only (stages /opt/spf-datto and adds the
@@ -23,10 +23,10 @@ BACKUP_DIR=/root/spf-datto-backup
 UNIT=spf-datto-setup
 LOCAL_LIST=/etc/apt/sources.list.d/spf-datto-local.list
 LOCAL_ONLY=(-o "Dir::Etc::sourcelist=$LOCAL_LIST" -o "Dir::Etc::sourceparts=/nonexistent" -o "DPkg::Lock::Timeout=900" -o "Acquire::Retries=0")
-EXPECTED_FAILED="openipmi.service datto-ipmi-setup.service datto-asset-replication-reconcile.service datto-speedsync-cache-update.service datto-system-speedsync-check.service datto-telegraf-configure.service datto-update-assets.service"
-# spf-datto config files NOT copied to a replica: identity (Datto support root keys, log-shipping
-# identity) and hardware (watchdog device). Everything else that differs is applied in p45.
-CONFFILE_DENY_RE='^(/root/|/etc/filebeat/|/etc/watchdog\.conf$|/etc/ssh/ssh_host_|/etc/hostname$|/etc/machine-id$)'
+EXPECTED_FAILED="openipmi.service datto-ipmi-setup.service datto-asset-replication-reconcile.service datto-speedsync-cache-update.service datto-system-speedsync-check.service datto-update-assets.service"
+# Source-appliance identity, removed telemetry, and physical watchdog configuration
+# are never copied to a replica. Everything else that differs is applied in p45.
+CONFFILE_DENY_RE='^(/root/|/etc/(filebeat|fluent-bit|telegraf)/|/etc/apache2/ssl/|/etc/bash\.bashrc$|/etc/watchdog\.conf$|/etc/ssh/ssh_host_|/etc/hostname$|/etc/machine-id$)'
 # Removals the dry run may propose on a cloud image. Anything in PROTECTED aborts.
 PROTECTED_RE='^(openssh-server|sudo|systemd|network-manager|netplan\.io|zfsutils-linux|grub-pc|grub-efi-amd64|grub-efi-amd64-signed|shim-signed|linux-image-.*)$'
 
@@ -191,6 +191,12 @@ p30_prep() {
   groupadd -f remote-users
   usermod -aG remote-users "$LOGIN_USER"
   log "$LOGIN_USER added to remote-users"
+  # Some appliance packages replace generic host files during installation.
+  # Preserve the target VM's identity and usable system-wide shell defaults.
+  mkdir -p "$STATE_DIR/target-base"
+  for f in /etc/hosts /etc/bash.bashrc; do
+    [ -e "$f" ] && cp -a "$f" "$STATE_DIR/target-base/$(basename "$f")"
+  done
   # keep cloud-init (until it is removed) from rewriting the network config
   if [ -d /etc/cloud/cloud.cfg.d ]; then
     echo "network: {config: disabled}" > /etc/cloud/cloud.cfg.d/99-disable-network-config.cfg
@@ -237,8 +243,9 @@ remove_cloud_client_cert_auth() {
   # A registered appliance downloads cloud-api-ca at boot and uses it for optional
   # client-certificate authentication. An air-gapped replica cannot fetch that CA;
   # snapctl otherwise leaves a zero-byte bundle which prevents Apache from starting.
-  # This replica has no registration flow, so remove the unused client-auth directives
-  # and stop the boot-time downloader instead of manufacturing cloud credentials.
+  # This replica has no cloud authorization/enrollment flow, so remove the unused
+  # client-auth directives and stop the boot-time downloader instead of manufacturing
+  # cloud credentials. The local first-run wizard remains available.
   local f
   for f in /etc/apache2/sites-available/device.conf \
            /etc/apache2/sites-available/server.conf \
@@ -600,15 +607,30 @@ JS
   systemctl restart php8.1-fpm >/dev/null 2>&1 || return 1
 }
 
-fix_optional_sensor_logrotate() {
-  # Falcon is not enrolled on the replica, so its log may never be created.
-  # The package rule lacks missingok and otherwise fails the entire daily timer.
-  local f=/etc/logrotate.d/falcon-sensor
-  if [ -f "$f" ] && ! grep -q '^[[:space:]]*missingok[[:space:]]*$' "$f"; then
-    sed -i '/^[[:space:]]*daily[[:space:]]*$/a\    missingok' "$f" || return 1
+generate_local_tls_certificate() {
+  local dir key cert cn ip san cert_cn
+  dir=/etc/apache2/ssl
+  key=$dir/www.key
+  cert=$dir/www.crt
+  cn=$(hostname -f 2>/dev/null || hostname)
+  cert_cn=$(openssl x509 -in "$cert" -noout -subject -nameopt RFC2253 2>/dev/null |
+    sed -n 's/^subject=.*CN=\([^,]*\).*$/\1/p')
+  if [ -s "$key" ] && [ -s "$cert" ] && [ "$cert_cn" = "$cn" ] &&
+     openssl x509 -in "$cert" -noout -checkend 604800 >/dev/null 2>&1; then
+    return 0
   fi
-  systemctl reset-failed logrotate.service 2>/dev/null || true
-  systemctl start logrotate.service >/dev/null 2>&1 || return 1
+
+  mkdir -p "$dir"
+  ip=$(ip -4 -o addr show scope global 2>/dev/null | awk '{sub(/\/.*/,"",$4); print $4; exit}')
+  san="DNS:$cn"
+  [ -n "$ip" ] && san="$san,IP:$ip"
+  rm -f "$key" "$cert"
+  openssl req -x509 -nodes -newkey rsa:3072 -sha256 -days 825 \
+    -subj "/CN=$cn" -addext "subjectAltName=$san" \
+    -keyout "$key" -out "$cert" >/dev/null 2>&1 || return 1
+  chown root:root "$key" "$cert"
+  chmod 0600 "$key"; chmod 0644 "$cert"
+  log "generated a fresh local TLS certificate for $cn"
 }
 
 p45_conffiles() {
@@ -616,8 +638,15 @@ p45_conffiles() {
   # with the same version numbers and different config files (e.g. apache2's ports.conf, whose
   # stock "Listen 80/443" duplicates device.conf's and stops Apache from binding). Apply
   # spf-datto's copy of every package config file that differs, except CONFFILE_DENY_RE.
-  local src="$INSTALL_DIR/conffiles" tmp n=0 skip=0 sum f pkg cur applied=$STATE_DIR/conffiles-applied.txt
+  local src="$INSTALL_DIR/conffiles" tmp n=0 skip=0 sum f pkg cur bad_owners applied=$STATE_DIR/conffiles-applied.txt
   [ -f "$src/conffiles.tgz" ] || { log "no conffiles in bundle; skipping"; return 0; }
+  bad_owners=$(tar --numeric-owner -tvzf "$src/conffiles.tgz" |
+    awk '$2 != "0/0" { if (n < 5) print; n++ }')
+  if [ -n "$bad_owners" ]; then
+    log "refusing configuration archive with non-root ownership:"
+    printf '%s\n' "$bad_owners" | tee -a "$LOG" >&2
+    return 1
+  fi
   tmp=$(mktemp -d)
   tar -C "$tmp" -xzf "$src/conffiles.tgz" || return 1
   mkdir -p "$BACKUP_DIR/conffiles" "$STATE_DIR"; : > "$applied"
@@ -633,12 +662,8 @@ p45_conffiles() {
   rm -rf "$tmp"
   log "applied $n spf-datto config files ($skip withheld: identity/hardware); list in $applied"
 
-  remove_cloud_client_cert_auth
-  disable_online_registration_gates || return 1
-  install_offline_registration_finalizer || return 1
-  fix_optional_sensor_logrotate || return 1
-
-  # validate each group; put the replica's own copy back if spf-datto's doesn't pass here
+  # Validate privileged configuration before invoking any service or helper.
+  # Put the replica's original copy back if spf-datto's version does not pass.
   if grep -q '^/etc/sudoers' "$applied" && ! visudo -c >/dev/null 2>&1; then
     restore_conf $(cut -f1 "$applied" | grep '^/etc/sudoers'); log "sudoers failed visudo -c; restored"
   fi
@@ -648,6 +673,32 @@ p45_conffiles() {
   if grep -q '^/etc/apache2/' "$applied" && ! apache2ctl configtest >/dev/null 2>&1; then
     restore_conf $(cut -f1 "$applied" | grep '^/etc/apache2/'); log "apache config failed configtest; restored"
   fi
+
+  # Put the Ubuntu VM's local identity and shell defaults back after appliance
+  # packages/configuration have run. These are host concerns, not application
+  # payload, and cloning them causes hostname lookup and interactive-shell errors.
+  for f in hosts bash.bashrc; do
+    [ -e "$STATE_DIR/target-base/$f" ] && cp -a "$STATE_DIR/target-base/$f" "/etc/$f"
+  done
+
+  # Telegraf was only the secondary socket owner. Apache already runs as
+  # www-data, so use that group and do not retain a telemetry-only dependency.
+  if [ -f /etc/php/8.1/fpm/pool.d/siris.conf ]; then
+    sed -Ei 's/^([[:space:]]*listen\.group[[:space:]]*=[[:space:]]*)telegraf([[:space:]]*)$/\1www-data\2/' \
+      /etc/php/8.1/fpm/pool.d/siris.conf || return 1
+  fi
+  rm -f /etc/default/grub.d/99-ubuntu-fips.cfg \
+    /etc/init.d/falcon-sensor \
+    /etc/logrotate.d/falcon-sensor \
+    /etc/logrotate.d/telegraf
+  rm -rf /etc/td-agent-bit
+
+  remove_cloud_client_cert_auth
+  disable_online_registration_gates || return 1
+  install_offline_registration_finalizer || return 1
+  generate_local_tls_certificate || return 1
+  systemctl reset-failed logrotate.service 2>/dev/null || true
+  systemctl start logrotate.service >/dev/null 2>&1 || return 1
   systemctl daemon-reload
   # spf-datto's firewalld.conf switches the backend (nftables -> iptables); a reload doesn't do
   # that cleanly and leaves rules half-applied until reboot, so restart instead
@@ -660,8 +711,7 @@ p45_conffiles() {
 p50_boot() {
   if [ "$FIPS_OFF" = yes ]; then
     cat > /etc/default/grub.d/99z-match-spf-datto.cfg <<'EOF'
-# Match spf-datto: 6.8 HWE generic kernel, FIPS off. ubuntu-fips stays installed;
-# this sorts after 99-fips.cfg / 99-ubuntu-fips.cfg and overrides them.
+# The VM payload contains only the supported 6.8 HWE generic kernel.
 GRUB_FLAVOUR_ORDER="generic"
 GRUB_CMDLINE_LINUX_DEFAULT="$(echo "$GRUB_CMDLINE_LINUX_DEFAULT" | sed "s/ *fips=1//g")"
 EOF
@@ -940,11 +990,14 @@ verify() {
   check "web UI https://$ip/ answers (HTTP $code)"         "case '$code' in 200|301|302|303) true;; *) false;; esac"
   [ "$NET_CONFIGURE" = yes ] || EXPECTED_FAILED="$EXPECTED_FAILED NetworkManager-wait-online.service datto-network-repair.service"
   if [ "$ZFS_CONFIGURE" = no ] || ! zpool list -H "$ZFS_POOL" >/dev/null 2>&1; then
-    EXPECTED_FAILED="$EXPECTED_FAILED datto-zfs-cache-update.service"
+    # These jobs query homePool and fail by design on a VM intentionally
+    # installed without a second data disk. They become required as soon as
+    # the configured pool exists.
+    EXPECTED_FAILED="$EXPECTED_FAILED datto-zfs-cache-update.service datto-zfs-check.service datto-metrics-statistics-collect.service"
   fi
   failed=$(systemctl --failed --no-legend --plain | awk '{print $1}')
   unexpected=$(for u in $failed; do echo " $EXPECTED_FAILED " | grep -q " $u " || echo "$u"; done)
-  echo "  expected failures (no IPMI / no Datto cloud registration): $(for u in $failed; do echo " $EXPECTED_FAILED " | grep -q " $u " && echo -n "$u "; done)"
+  echo "  expected failures for this VM profile: $(for u in $failed; do echo " $EXPECTED_FAILED " | grep -q " $u " && echo -n "$u "; done)"
   if [ -n "$unexpected" ]; then echo "  FAIL  unexpected failed units: $(echo $unexpected)"; fails=$((fails+1)); else echo "  ok    no unexpected failed units"; fi
   echo "RESULT: $([ $fails -eq 0 ] && echo PASS || echo "$fails check(s) failed")"
   return $fails

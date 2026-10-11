@@ -4,6 +4,11 @@ One command turns an existing Ubuntu 22.04 amd64 VM into a locally usable,
 offline-capable SIRIS replica. This branch does not deploy, modify, or require
 vCenter/ESXi.
 
+The installation payload contains 1,329 packages. The bundle builder removes
+22 source-appliance-only security, telemetry, debug, and legacy FIPS-kernel
+packages while preserving the complete dependency closure needed by the local
+application. It also removes copied appliance credentials and private keys.
+
 ## Install on an existing Ubuntu VM
 
 The VM needs Ubuntu 22.04 amd64, a normal user with `sudo` access, and about
@@ -45,6 +50,10 @@ Copy this repository and `spf-datto-setup.tar` to the VM, then run:
 All package and registration steps then run without network access. Apt uses
 only the bundle's local repository and pip uses only vendored wheels.
 
+Each installed VM generates its own local TLS key and certificate. The source
+appliance's web and log-shipping identities, active factory password hashes,
+and configuration for excluded telemetry agents are not included.
+
 ## Status and verification
 
 ```bash
@@ -61,10 +70,10 @@ safely; completed phases are skipped.
 - `setup/setup.sh` contains the idempotent installation phases.
 - `setup/setup.conf` contains user-editable defaults.
 - `setup/release.env` pins the private release payload and checksum.
-- `tools/make-bundle.sh` builds the payload from the package export.
-- `scripts/export/` and `scripts/vm/` preserve lower-level tooling but are not
-  needed for the normal install.
-- `docs/datto-siris-registration-flow.md` documents the registration changes.
+- `setup/prune-packages.txt` is the reviewed source-appliance-only exclusion list.
+- `tools/make-bundle.sh` builds and validates the sanitized payload from the
+  package export; `tools/sanitize-datto-package.py` removes embedded identity.
 
-The payload contains repacked appliance packages and configuration files. Keep
-the repository and release private and treat the payload as sensitive.
+The payload still contains proprietary/repacked appliance packages and selected
+configuration files. Keep the repository and release private and treat the
+payload as sensitive even though source-appliance credentials are removed.

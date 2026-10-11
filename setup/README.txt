@@ -2,8 +2,10 @@ spf-datto replica: single-script setup
 =======================================
 
 Turns a fresh Ubuntu 22.04 (jammy, amd64) VM into a replica of the Datto SIRIS spf-datto:
-all 1,351 packages at spf-datto's exact versions, installed offline from debs/, plus every
-fix from the original build (see WALKTHROUGH.md in the spf-datto-replica repo).
+1,329 retained packages at spf-datto's exact versions, installed offline from debs/, plus
+the fixes required to run that application stack on a normal Ubuntu VM.
+The bundle excludes 22 source-appliance-only security, telemetry, debug, and legacy FIPS
+kernel packages after validating the retained package dependency closure.
 
 NEEDS
   - Ubuntu 22.04 amd64 (cloud image or server install), SSH key login for your user
@@ -53,13 +55,15 @@ WHAT IT DOES (in order)
   p45  applies spf-datto's copy of every package config file that differs (Datto's mirror ships
        rebuilt Ubuntu packages with the same version but different configs). This is what
        makes Apache work: stock ports.conf "Listen 80/443" duplicates Datto's device.conf and
-       Apache fails to bind. Withheld: /root/* (Datto support root keys), filebeat (log-shipping
-       identity), watchdog.conf (hardware). sudoers/sshd/apache are validated, else rolled back.
+       Apache fails to bind. Withheld: /root/* (Datto support root keys), telemetry/log-shipping
+       configuration, copied TLS keys, and watchdog.conf (hardware). A fresh per-VM TLS key and
+       certificate are generated. sudoers/sshd/apache are validated, else rolled back.
        Optional Datto cloud-client certificate authorization and its boot-time CA download are
        removed so this replica can start without Internet. The first-run wizard's online-update
        pane and perpetual connectivity polling are removed, and a one-time same-origin finalizer
        completes Datto's native local registration without contacting the cloud.
-  p50  GRUB: 6.8 generic kernel without fips=1, like spf-datto (FIPS packages stay installed)
+  p50  GRUB: 6.8 generic kernel without fips=1, like spf-datto. The unused legacy FIPS kernel
+       and its meta-packages are not included in the bundle.
   p60  purges snapd + cloud-init (they make boot ordering cycles with Datto's units) and
        restores the /usr/bin/snapctl link
   p70  when a suitable blank disk exists, creates ZFS homePool with spf-datto's layout and
@@ -79,7 +83,8 @@ AFTERWARDS
 WEB UI
   https://<VM IP>/  ->  "Control Panel - Register a Device" (the Datto UI of an unregistered
   appliance). Apache listens once on 0.0.0.0:80 and 0.0.0.0:443; verify checks both.
-  It uses spf-datto's TLS certificate/key (they are config files of datto-siris-os-2).
+  It uses a fresh local TLS certificate/key generated for this VM; the source appliance's
+  private key and certificate are removed while the payload is built.
   The page is locally accessible offline and starts at "Name the Device" without running the
   online update check. Name, administrator, configuration, confirmation, local login, and the
   registration marker can all complete without Internet. The resulting login page accepts the
@@ -88,8 +93,10 @@ WEB UI
 
 EXPECTED FAILED SERVICES (no IPMI hardware / no Datto cloud registration)
   openipmi, datto-speedsync-cache-update, datto-system-speedsync-check,
-  datto-telegraf-configure, datto-update-assets
+  datto-update-assets
 
 SENSITIVE
-  95 of the .debs were rebuilt from spf-datto's installed files (dpkg-repack) and contain its
-  current config files. Treat this bundle as sensitive.
+  Some .debs were rebuilt from spf-datto's installed files (dpkg-repack). The builder removes
+  known source-appliance TLS/log-shipping keys and locks exported factory password hashes, but
+  the payload still contains proprietary packages and selected configs. Keep it private and
+  treat it as sensitive.

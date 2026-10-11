@@ -1,0 +1,32 @@
+# Packages intentionally excluded from the Ubuntu VM payload.
+#
+# These are source-appliance security/telemetry agents or an unused FIPS kernel.
+# They are not part of local SIRIS backup, restore, storage, or virtualization.
+al-agent
+falcon-sensor
+filebeat
+fluent-bit
+fluent-bit-headers
+telegraf
+td-agent-bit
+td-agent-bit-headers
+wiz-sensor
+
+# Debug symbols are not required at runtime.
+libc6-dbg
+
+# The VM boots the supported Ubuntu 6.8 generic kernel with FIPS disabled.
+# Keep linux-firmware because the generic HWE kernel declares it as required;
+# remove only the older appliance-specific FIPS kernel and its meta-packages.
+fips-initramfs
+linux-fips
+linux-fips-headers-5.15.0-170
+linux-headers-5.15.0-170-fips
+linux-headers-fips
+linux-image-5.15.0-170-fips
+linux-image-fips
+linux-image-hmac-5.15.0-170-fips
+linux-modules-5.15.0-170-fips
+linux-modules-extra-5.15.0-170-fips
+ubuntu-fips
+ubuntu-fips-userspace
