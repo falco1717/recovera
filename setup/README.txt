@@ -7,8 +7,8 @@ fix from the original build (see WALKTHROUGH.md in the spf-datto-replica repo).
 
 NEEDS
   - Ubuntu 22.04 amd64 (cloud image or server install), SSH key login for your user
-  - about 8 GB free on /   (bundle copy + install)
-  - for ZFS: a second, BLANK disk of at least ZFS_MIN_GB (default 20 GB); the largest blank disk is used
+  - about 12 GB free on /   (archive extraction + bundle copy + install)
+  - optional for ZFS: a second, BLANK disk of at least ZFS_MIN_GB (default 20 GB)
   - no Internet connection on the target; build/copy the complete bundle from another machine
 
 AIR-GAPPED MODE
@@ -30,12 +30,14 @@ AIR-GAPPED MODE
   Datto account enrollment, licensing, updates, and cloud services are not emulated.
 
 RUN
-  scp spf-datto-setup.tar ubuntu@VM:
-  ssh ubuntu@VM
-  tar xf spf-datto-setup.tar && cd spf-datto-setup
-  nano setup.conf          # optional; the defaults keep the VM's current IP
-  sudo ./setup.sh check    # optional dry run
-  sudo ./setup.sh          # about 20 min, then reboots
+  From the cloned repository:
+    nano setup/setup.conf                 # optional; defaults keep the current IP
+    ./install.sh --check                  # optional dry run
+    ./install.sh                          # about 20 min, then reboots
+
+  With a manually transferred archive on an isolated VM:
+    ./install.sh --bundle /path/to/spf-datto-setup.tar --check
+    ./install.sh --bundle /path/to/spf-datto-setup.tar
 
   It runs as the systemd unit "spf-datto-setup", so losing the SSH session doesn't stop it.
   Reconnect and run:  sudo ./setup.sh status       (or: sudo /opt/spf-datto/setup.sh status)
@@ -60,8 +62,8 @@ WHAT IT DOES (in order)
   p50  GRUB: 6.8 generic kernel without fips=1, like spf-datto (FIPS packages stay installed)
   p60  purges snapd + cloud-init (they make boot ordering cycles with Datto's units) and
        restores the /usr/bin/snapctl link
-  p70  ZFS homePool on the blank disk with spf-datto's layout; /home copied onto it (the
-       original stays underneath, overlay=on)
+  p70  when a suitable blank disk exists, creates ZFS homePool with spf-datto's layout and
+       copies /home onto it. The default auto mode skips ZFS when no second disk is present.
   p80  NetworkManager bridge br0 (port = your NIC, zone datto). With a gateway configured it
        checks that the gateway answers; without one it checks the bridge address. It reverts to
        netplan automatically if the check fails. Then networkd is disabled.

@@ -93,7 +93,7 @@ load_conf() {
   # shellcheck source=/dev/null
   . "$c"
   : "${NET_CONFIGURE:=yes}" "${NET_IP:=current}" "${NET_GATEWAY:=}" "${NET_DNS:=}" "${NET_IFACE:=}"
-  : "${ZFS_CONFIGURE:=yes}" "${ZFS_DISK:=auto}" "${ZFS_MIN_GB:=20}" "${ZFS_POOL:=homePool}" "${ZFS_MOVE_HOME:=yes}"
+  : "${ZFS_CONFIGURE:=auto}" "${ZFS_DISK:=auto}" "${ZFS_MIN_GB:=20}" "${ZFS_POOL:=homePool}" "${ZFS_MOVE_HOME:=yes}"
   : "${FIPS_OFF:=yes}" "${REMOVE_SNAPD:=yes}" "${REMOVE_CLOUD_INIT:=yes}" "${APT_FREEZE:=yes}" "${OFFLINE_MODE:=yes}" "${AUTO_REBOOT:=yes}"
   LOGIN_USER="${LOGIN_USER:-${SUDO_USER:-}}"
   [ -n "$LOGIN_USER" ] || LOGIN_USER="$(getent passwd 1000 | cut -d: -f1)"
@@ -101,6 +101,7 @@ load_conf() {
 
 validate_conf() {
   case "$OFFLINE_MODE" in yes|no) ;; *) die "OFFLINE_MODE must be yes or no" ;; esac
+  case "$ZFS_CONFIGURE" in yes|no|auto) ;; *) die "ZFS_CONFIGURE must be yes, no, or auto" ;; esac
   if [ "$OFFLINE_MODE" = yes ]; then
     [ "$APT_FREEZE" = yes ] || die "OFFLINE_MODE=yes requires APT_FREEZE=yes"
     command -v systemd-run >/dev/null 2>&1 || command -v unshare >/dev/null 2>&1 || \
@@ -698,7 +699,7 @@ zfs_pick_disk() {
 }
 
 p70_zfs() {
-  [ "$ZFS_CONFIGURE" = yes ] || { log "ZFS disabled in setup.conf"; return 0; }
+  [ "$ZFS_CONFIGURE" != no ] || { log "ZFS disabled in setup.conf"; return 0; }
   modprobe zfs || return 1
   local P="$ZFS_POOL"
   if ! zpool list -H "$P" >/dev/null 2>&1; then
@@ -709,7 +710,11 @@ p70_zfs() {
     local dev="$ZFS_DISK"
     [ "$dev" = auto ] && dev=$(zfs_pick_disk) && [ -n "$dev" ] && dev=/dev/$dev
     if [ -z "$dev" ] || [ "$dev" = auto ]; then
-      warn "no blank disk >= ${ZFS_MIN_GB} GB found; skipping ZFS (attach one and re-run setup.sh)"
+      if [ "$ZFS_CONFIGURE" = auto ]; then
+        log "no blank disk >= ${ZFS_MIN_GB} GB found; continuing without ZFS"
+        return 0
+      fi
+      warn "no blank disk >= ${ZFS_MIN_GB} GB found; attach one and re-run setup.sh"
       return 2
     fi
     local id="" l
@@ -909,7 +914,7 @@ verify() {
   check "php8.1-fpm active (/run/php)"                     "systemctl is-active php8.1-fpm"
   # libvirtd is socket-activated with --timeout 120, so "inactive" is normal; ask it instead
   check "libvirt answers (virsh version)"                  "virsh -c qemu:///system version"
-  if [ "$ZFS_CONFIGURE" = yes ] && zpool list -H "$ZFS_POOL" >/dev/null 2>&1; then
+  if [ "$ZFS_CONFIGURE" != no ] && zpool list -H "$ZFS_POOL" >/dev/null 2>&1; then
     check "$ZFS_POOL ONLINE"                               "[ \"\$(zpool list -H -o health $ZFS_POOL)\" = ONLINE ]"
     check "zfs-mount active"                               "systemctl is-active zfs-mount"
     [ "$ZFS_MOVE_HOME" = yes ] && check "/home on $ZFS_POOL/home" "[ \"\$(findmnt -no SOURCE /home)\" = $ZFS_POOL/home ]"
@@ -934,10 +939,12 @@ verify() {
   check "apache bound to :80 and :443"                     "ss -Hltn '( sport = :80 )' | grep -q . && ss -Hltn '( sport = :443 )' | grep -q ."
   check "web UI https://$ip/ answers (HTTP $code)"         "case '$code' in 200|301|302|303) true;; *) false;; esac"
   [ "$NET_CONFIGURE" = yes ] || EXPECTED_FAILED="$EXPECTED_FAILED NetworkManager-wait-online.service datto-network-repair.service"
-  [ "$ZFS_CONFIGURE" = yes ] || EXPECTED_FAILED="$EXPECTED_FAILED datto-zfs-cache-update.service"
+  if [ "$ZFS_CONFIGURE" = no ] || ! zpool list -H "$ZFS_POOL" >/dev/null 2>&1; then
+    EXPECTED_FAILED="$EXPECTED_FAILED datto-zfs-cache-update.service"
+  fi
   failed=$(systemctl --failed --no-legend --plain | awk '{print $1}')
   unexpected=$(for u in $failed; do echo " $EXPECTED_FAILED " | grep -q " $u " || echo "$u"; done)
-  echo "  expected failures (no IPMI / no Datto registration): $(for u in $failed; do echo " $EXPECTED_FAILED " | grep -q " $u " && echo -n "$u "; done)"
+  echo "  expected failures (no IPMI / no Datto cloud registration): $(for u in $failed; do echo " $EXPECTED_FAILED " | grep -q " $u " && echo -n "$u "; done)"
   if [ -n "$unexpected" ]; then echo "  FAIL  unexpected failed units: $(echo $unexpected)"; fails=$((fails+1)); else echo "  ok    no unexpected failed units"; fi
   echo "RESULT: $([ $fails -eq 0 ] && echo PASS || echo "$fails check(s) failed")"
   return $fails

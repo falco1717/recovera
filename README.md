@@ -1,107 +1,70 @@
-# spf-datto replica
+# backops
 
-This repo exports every installed package from the Datto SIRIS appliance **spf-datto**
-(10.0.3.147) and rebuilds it as a VM, **spf-datto-pkgs** (10.0.3.200), on vCenter 10.0.3.12.
-The VM has the same 1,351 packages at the same versions, a ZFS `homePool` and a NetworkManager bridge.
+One command turns an existing Ubuntu 22.04 amd64 VM into a locally usable,
+offline-capable SIRIS replica. This branch does not deploy, modify, or require
+vCenter/ESXi.
 
-- **[WALKTHROUGH.md](WALKTHROUGH.md)**: what was done, step by step, including the dead ends
-- **[GOTCHAS.md](GOTCHAS.md)**: the traps, in short form
+## Install on an existing Ubuntu VM
 
-## Layout
-
-```
-scripts/export/    run on spf-datto (as roseadmin)
-  run.sh, pkgplan.py      attempt 1: download from the box's Datto repos (failed: gateway blocks Datto)
-  run2.sh, pkgplan2.py    public Ubuntu mirror (private apt root) + Launchpad + Elastic
-  run3.sh                 dpkg-repack everything still missing (runs after run2.sh)
-scripts/vcenter/   run on this PC (PowerShell 7 + PowerCLI 13)
-  vc-login.ps1            interactive sign-in; saves only the session secret
-  vc-connect.ps1          reuse that session (dot-sourced by the others)
-  vc-inventory.ps1        hosts / datastores / port groups
-  vc-deploy.ps1           attempt 1: OVA + cloud-init over DHCP (hit an IP conflict)
-  vc-redeploy.ps1         delete + re-import (its network-config property was ignored)
-  vc-fix-ssh.ps1          cloud-init lockout recovery; did NOT work, kept for the record
-  vc-add-disk.ps1         3 TB thin disk on Farmer-NAS-VMFS
-  vc-snapshot.ps1         create / replace / revert snapshots
-scripts/vm/        run on the VM (as ubuntu)
-  01-static-ip.sh         DHCP to static 10.0.3.200; turns off cloud-init's network handling
-  02-install-packages.sh  dry run, then exact-version install from /opt/localdebs
-  03-remove-snapd-cloud-init.sh   fixes the boot ordering cycles (and php-fpm)
-  04-zfs-homepool.sh      homePool + spf-datto dataset layout, /home moved onto ZFS
-  05-networkmanager-bridge.sh     br0 like spf-datto, with automatic revert
-config/            NetworkManager keyfiles, GRUB override, interim netplan
-lists/             package lists from the export (all, manual, portable, repacked, ...)
-docs/              README from the export folder
-  datto-siris-registration-flow.md  registration workflow notes; PDF built from Markdown
-```
-
-The scripts in `scripts/vm/` are the **corrected** versions. They include the fixes for each
-problem hit during the session (SSH lockout, needrestart re-run, overlay, snapctl link).
-
-## Air-gapped setup
-
-The supported installation path is the self-contained bundle under `setup/`. Build it on a
-connected or staging workstation, transfer the resulting tar file to the isolated Ubuntu 22.04
-machine, and run it there:
+The VM needs Ubuntu 22.04 amd64, a normal user with `sudo` access, and about
+12 GB free on `/`. A blank second disk of at least 20 GB is optional for ZFS.
 
 ```bash
-tools/make-bundle.sh /path/to/pkgexport /path/to/output
-tar xf spf-datto-setup.tar
-cd spf-datto-setup
-sudo ./setup.sh check
-sudo ./setup.sh
+gh auth login
+gh repo clone falco1717/backops
+cd backops
+git switch offline/air-gapped-setup
+./install.sh --check   # optional preflight and package simulation
+./install.sh
 ```
 
-`OFFLINE_MODE=yes` is the default. Package operations are confined to a private network namespace
-and to the bundle's local `file:` apt repository; package service starts are suppressed during the
-install. The Datto post-install script's `npyscreen` Python dependency is vendored under
-`setup/wheels/`, and pip is forced into no-index mode. A machine with no default route or DNS can
-use `NET_GATEWAY="none"` and `NET_DNS="none"` in `setup.conf`. See
-[setup/README.txt](setup/README.txt) for the full workflow.
+`install.sh` prompts for `sudo`, downloads the pinned installation payload from
+this repository's private GitHub Release, verifies its checksum, and runs the
+setup workflow. The installation continues as a systemd unit if SSH disconnects
+and reboots automatically when finished.
 
-This removes Internet access as a provisioning requirement, including the appliance's initial
-local registration and administrator setup. Optional Apache cloud-client certificate
-authorization and its boot-time CA download are disabled, and the first-run wizard skips its
-online-update pane and connectivity polling. At final submission, a same-origin local endpoint
-uses Datto's native registration service while satisfying its four observed registration-only
-cloud RPCs inside the process; no network connection is opened. It then explicitly enables local
-administrator login instead of Partner Portal authentication. Datto account enrollment,
-licensing, updates, and other cloud services are not emulated and remain unavailable offline.
+The defaults preserve the VM's current IP address. Edit `setup/setup.conf` first
+to change networking, disable the automatic reboot, or require/disable ZFS.
+`ZFS_CONFIGURE=auto` uses a suitable blank disk when present and otherwise
+completes installation without ZFS.
 
-## Registration workflow document
+After reboot, open `https://<VM-IP>/`, finish the local registration wizard, and
+sign in with the local administrator. Initial setup and local login do not need
+Internet. Datto enrollment, licensing, updates, and cloud services are not
+emulated.
 
-The editable source is `docs/datto-siris-registration-flow.md`. Build the checked-in PDF
-with PowerShell 7 and Chrome or Edge:
+## Fully air-gapped install
 
-```powershell
-pwsh -File tools/build-registration-pdf.ps1
+Copy this repository and `spf-datto-setup.tar` to the VM, then run:
+
+```bash
+./install.sh --bundle /path/to/spf-datto-setup.tar --check
+./install.sh --bundle /path/to/spf-datto-setup.tar
 ```
 
-## Not in the repo
+All package and registration steps then run without network access. Apt uses
+only the bundle's local repository and pip uses only vendored wheels.
 
-| What | Where |
-|---|---|
-| The 1,351 `.deb` files (1.6 GB) + `SHA256SUMS` + `Packages.gz` | `F:\Users\jfarmer\Desktop\pkgexport-spf-datto\debs\` |
-| Ubuntu 22.04 cloud OVA (711 MB) | `cloud-images.ubuntu.com/jammy/current/jammy-server-cloudimg-amd64.ova`; put it in `scripts/vcenter/ova/` |
-| SSH key | `F:\Users\jfarmer\Documents\keys\sshkey Private` / `sshkey Public.pub` |
-| Passwords | never stored; typed into terminal prompts |
+## Status and verification
 
-## Rebuilding from scratch
+```bash
+sudo /opt/spf-datto/setup.sh status
+sudo /opt/spf-datto/setup.sh verify
+sudo cat /var/log/spf-datto-verify.log
+```
 
-1. **Export:** on spf-datto, run `run2.sh` and then `run3.sh`. Copy the result off and run `sha256sum -c SHA256SUMS`.
-   Or reuse the export already on the Desktop.
-2. **Deploy:** run `vc-login.ps1`, then `vc-redeploy.ps1`.
-3. **On the VM:**
-   1. Run `01-static-ip.sh`, then snapshot `pre-package-install`.
-   2. Copy `debs` and `lists`, then run `02-install-packages.sh` (a dry run) and `02-install-packages.sh --install`.
-   3. **Prove a new SSH login works under Datto's sshd config before rebooting** (see GOTCHAS #10).
-   4. Run `03-remove-snapd-cloud-init.sh` and reboot.
-4. **Storage:** run `vc-add-disk.ps1`, then `04-zfs-homepool.sh`.
-5. **Network:** run `05-networkmanager-bridge.sh` and cancel the revert. Disable networkd, reboot, and snapshot `configured`.
+A successful build reports `RESULT: PASS`. Re-running the installer resumes
+safely; completed phases are skipped.
 
-## Open items
+## Maintainer notes
 
-- Gateway 10.0.3.1 rejects Datto destinations, so **spf-datto's offsite sync is broken** (WALKTHROUGH, Phase 3).
-- `00:e0:ed:97:68:33` statically holds 10.0.3.21 inside the DHCP range.
-- Rotate the `administrator@vsphere.local` and `roseadmin` passwords.
-- Delete the `pre-package-install` snapshot when you no longer need it.
+- `setup/setup.sh` contains the idempotent installation phases.
+- `setup/setup.conf` contains user-editable defaults.
+- `setup/release.env` pins the private release payload and checksum.
+- `tools/make-bundle.sh` builds the payload from the package export.
+- `scripts/export/` and `scripts/vm/` preserve lower-level tooling but are not
+  needed for the normal install.
+- `docs/datto-siris-registration-flow.md` documents the registration changes.
+
+The payload contains repacked appliance packages and configuration files. Keep
+the repository and release private and treat the payload as sensitive.
