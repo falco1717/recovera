@@ -172,13 +172,22 @@ one-time local finalizer and a browser override for the finish action:
    validates the submitted values, and takes a nonblocking registration lock.
 2. It boots the installed Datto application and obtains the native
    `RegistrationService` and `Registrant` classes.
-3. For this call only, it replaces the service's cloud client with an in-process client
-   that returns success exclusively for `v1/device/registration/registerNow`. Any other
-   cloud method is rejected, and the substitute opens no network connection.
+3. For this call only, it replaces every cloud client reachable from the registration
+   service with one in-process client. The four observed methods are explicitly allowed:
+   `v1/device/registration/registerNow`,
+   `v1/device/contactInformation/setDeviceContactInformation`,
+   `v1/device/billing/getServiceInfo`, and `v1/device/ddns/update`. The billing method
+   receives an empty local result; the other three receive local success. Any different
+   method is rejected, and the substitute opens no network connection.
 4. It calls the native `register` routine, preserving the local hostname,
-   administrator, timezone, session/login, and registration-marker behavior, then
-   verifies the native `isRegistered()` result.
-5. The browser performs the stock local login and redirect after the endpoint succeeds.
+   administrator, timezone, and registration-marker behavior. It then explicitly
+   enables `LocalLoginService` so the appliance accepts the new local administrator
+   instead of requiring Partner Portal authentication, and verifies the native
+   `isRegistered()` result.
+5. A pending marker lets a retry remove only an administrator created by the same
+   interrupted registration attempt. Successful registration removes that marker and
+   any stale `reg.error` file.
+6. The browser performs the local login and redirect after the endpoint succeeds.
 
 This is local appliance onboarding, not Datto Cloud account enrollment. Licensing,
 updates, remote management, and other cloud services are not emulated and remain
@@ -192,9 +201,10 @@ offsite location, and remaining configuration. The review pane presents the comp
 values before the stock `send` action or the offline local finalizer submits them.
 
 The encoded native service was observed to begin its local work only after the cloud
-`registerNow` result. The exact persistence order inside that local work remains encoded;
-a failed or interrupted run should therefore be evaluated through logs and before/after
-state, not inferred from the browser sequence alone.
+`registerNow` result. It writes the registration marker before requesting billing data
+and later updates DDNS. The retry marker protects against failures between user creation
+and final completion. Other persistence details remain encoded and should be evaluated
+through logs and before/after state, not inferred from the browser sequence alone.
 
 ## Feature flags
 
@@ -210,9 +220,9 @@ refresh mechanism, and observed effect.
 
 - Browser request order, pane construction, polling intervals, and client-side gates are
   directly observable.
-- PHP controller and service internals are encoded; the `registerNow` dependency and
-  subsequent native local actions were confirmed through controlled runtime tracing,
-  while exact persistence details still require before/after observation.
+- PHP controller and service internals are encoded; all four registration-time cloud
+  methods and subsequent native local actions were confirmed through a snapshot-protected
+  runtime trace, while exact persistence details still require before/after observation.
 - The exact destination tested by `testNetworkConnection` was not established from the
   browser code alone.
 - The conditions controlling the update and storage panes need controlled-state testing.

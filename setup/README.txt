@@ -25,8 +25,9 @@ AIR-GAPPED MODE
 
   This makes provisioning, the local web UI, and the appliance's initial local registration and
   administrator setup work without Internet access. The final registration action uses Datto's
-  native local registration service but satisfies only its registerNow cloud RPC inside the
-  process. Datto account enrollment, licensing, updates, and cloud services are not emulated.
+  native local registration service but satisfies its four observed registration-only cloud RPCs
+  inside the process, then enables local administrator login instead of Partner Portal login.
+  Datto account enrollment, licensing, updates, and cloud services are not emulated.
 
 RUN
   scp spf-datto-setup.tar ubuntu@VM:
@@ -79,10 +80,11 @@ WEB UI
   It uses spf-datto's TLS certificate/key (they are config files of datto-siris-os-2).
   The page is locally accessible offline and starts at "Name the Device" without running the
   online update check. Name, administrator, configuration, confirmation, local login, and the
-  registration marker can all complete without Internet. Cloud enrollment and licensing remain
-  outside this offline replica workflow.
+  registration marker can all complete without Internet. The resulting login page accepts the
+  local administrator rather than requiring a Partner Portal account. Cloud enrollment and
+  licensing remain outside this offline replica workflow.
 
-EXPECTED FAILED SERVICES (no IPMI hardware / no Datto registration)
+EXPECTED FAILED SERVICES (no IPMI hardware / no Datto cloud registration)
   openipmi, datto-speedsync-cache-update, datto-system-speedsync-check,
   datto-telegraf-configure, datto-update-assets
 

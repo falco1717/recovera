@@ -63,9 +63,10 @@ This removes Internet access as a provisioning requirement, including the applia
 local registration and administrator setup. Optional Apache cloud-client certificate
 authorization and its boot-time CA download are disabled, and the first-run wizard skips its
 online-update pane and connectivity polling. At final submission, a same-origin local endpoint
-uses Datto's native registration service while satisfying only its `registerNow` cloud RPC inside
-the process; no network connection is opened. Datto account enrollment, licensing, updates, and
-other cloud services are not emulated and remain unavailable offline.
+uses Datto's native registration service while satisfying its four observed registration-only
+cloud RPCs inside the process; no network connection is opened. It then explicitly enables local
+administrator login instead of Partner Portal authentication. Datto account enrollment,
+licensing, updates, and other cloud services are not emulated and remain unavailable offline.
 
 ## Registration workflow document
 

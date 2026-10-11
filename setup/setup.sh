@@ -284,8 +284,8 @@ install_offline_registration_finalizer() {
   # RegistrationService performs the important local work (hostname, administrator,
   # timezone, local login, and the registration marker) only after Datto Cloud's
   # registerNow RPC succeeds. Preserve that native routine, but replace its cloud
-  # client for this one flow with an in-process client that returns success without
-  # opening a network connection.
+  # clients reachable from this one flow with an in-process client that returns
+  # local success without opening a network connection.
   install -d -m 0755 /datto/web/commonlookandfeel/js/App/Registration \
     /datto/web/vintage/js/App/Registration
 
@@ -364,10 +364,17 @@ final class SpfDattoOfflineRegistrationClient extends JsonRpcClient
 
     private function answer(string $method, $arguments = null)
     {
-        if ($method !== 'v1/device/registration/registerNow') {
-            throw new RuntimeException("Offline registration blocked unexpected cloud method: $method");
+        error_log("Offline registration satisfied local cloud RPC: $method");
+        switch ($method) {
+            case 'v1/device/registration/registerNow':
+            case 'v1/device/contactInformation/setDeviceContactInformation':
+            case 'v1/device/ddns/update':
+                return true;
+            case 'v1/device/billing/getServiceInfo':
+                return [];
+            default:
+                throw new RuntimeException("Offline registration blocked unexpected cloud method: $method");
         }
-        return true;
     }
 
     public function query($method, $arguments = null)
@@ -391,6 +398,50 @@ final class SpfDattoOfflineRegistrationClient extends JsonRpcClient
     }
 }
 
+function replaceOfflineRegistrationCloudClients(
+    object $object,
+    JsonRpcClient $replacement,
+    SplObjectStorage $seen,
+    int $depth = 0
+): int {
+    if ($depth > 6 || $seen->contains($object)) {
+        return 0;
+    }
+    $seen->attach($object);
+    $replaced = 0;
+
+    for ($class = new ReflectionObject($object); $class; $class = $class->getParentClass()) {
+        foreach ($class->getProperties() as $property) {
+            if ($property->isStatic() || $property->getDeclaringClass()->getName() !== $class->getName()) {
+                continue;
+            }
+            $property->setAccessible(true);
+            if (method_exists($property, 'isInitialized') && !$property->isInitialized($object)) {
+                continue;
+            }
+            try {
+                $value = $property->getValue($object);
+            } catch (Throwable $error) {
+                continue;
+            }
+            if ($value instanceof JsonRpcClient) {
+                $property->setValue($object, $replacement);
+                ++$replaced;
+                continue;
+            }
+            if (is_object($value) && str_starts_with(get_class($value), 'Datto\\')) {
+                $replaced += replaceOfflineRegistrationCloudClients(
+                    $value,
+                    $replacement,
+                    $seen,
+                    $depth + 1
+                );
+            }
+        }
+    }
+    return $replaced;
+}
+
 try {
     $kernel = AppKernel::getBootedInstance();
     $container = $kernel->getContainer();
@@ -404,9 +455,41 @@ try {
         failOfflineRegistration(409, 'Device is already registered');
     }
 
-    $clientProperty = new ReflectionProperty($registrationService, 'client');
-    $clientProperty->setAccessible(true);
-    $clientProperty->setValue($registrationService, new SpfDattoOfflineRegistrationClient());
+    $userServiceProperty = new ReflectionProperty($registrationService, 'userService');
+    $userServiceProperty->setAccessible(true);
+    $userService = $userServiceProperty->getValue($registrationService);
+    $pendingPath = '/datto/config/local/offline-registration.pending.json';
+    $pending = null;
+    if (is_file($pendingPath)) {
+        $pending = json_decode((string) file_get_contents($pendingPath), true);
+        if (!is_array($pending)
+            || !hash_equals((string) ($pending['user'] ?? ''), $user)
+            || !hash_equals((string) ($pending['hostname'] ?? ''), $hostname)) {
+            failOfflineRegistration(409, 'A different incomplete registration must be cleared first');
+        }
+        if ($userService->exists($user)) {
+            $userService->delete($user);
+        }
+    } elseif ($userService->exists($user)) {
+        failOfflineRegistration(409, 'Administrator username already exists');
+    }
+    if (file_put_contents(
+        $pendingPath,
+        json_encode(['user' => $user, 'hostname' => $hostname], JSON_THROW_ON_ERROR),
+        LOCK_EX
+    ) === false) {
+        throw new RuntimeException('Could not create the offline registration retry marker');
+    }
+
+    $replacement = new SpfDattoOfflineRegistrationClient();
+    $replaced = replaceOfflineRegistrationCloudClients(
+        $registrationService,
+        $replacement,
+        new SplObjectStorage()
+    );
+    if ($replaced < 2) {
+        throw new RuntimeException('Could not isolate native registration from cloud clients');
+    }
 
     $registrant = new Registrant(
         $user,
@@ -419,10 +502,20 @@ try {
     );
     $registrationService->register($registrant);
 
+    $localLoginServiceProperty = new ReflectionProperty($registrationService, 'localLoginService');
+    $localLoginServiceProperty->setAccessible(true);
+    $localLoginService = $localLoginServiceProperty->getValue($registrationService);
+    $localLoginService->enable();
+    if (!$localLoginService->isEnabled()) {
+        throw new RuntimeException('Could not enable local administrator login');
+    }
+
     if (!$registrationService->isRegistered()) {
         throw new RuntimeException('Local registration did not set the completion marker');
     }
 
+    @unlink($pendingPath);
+    @unlink('/datto/config/local/reg.error');
     echo json_encode(['ok' => true]);
 } catch (Throwable $error) {
     error_log('Offline registration failed: ' . $error->getMessage());
@@ -915,5 +1008,9 @@ case "$MODE" in
       exit $rc
     fi
     verify ;;
+  repair-registration)
+    [ "$(id -u)" -eq 0 ] || { echo "run with sudo"; exit 1; }
+    install_offline_registration_finalizer
+    echo "offline registration finalizer repaired" ;;
   *) sed -n '2,15p' "$SELF"; exit 1 ;;
 esac
