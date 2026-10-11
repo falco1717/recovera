@@ -11,8 +11,11 @@ application. It also removes copied appliance credentials and private keys.
 
 ## Install on an existing Ubuntu VM
 
-The VM needs Ubuntu 22.04 amd64, a normal user with `sudo` access, and about
-12 GB free on `/`. A blank second disk of at least 20 GB is optional for ZFS.
+The VM needs Ubuntu 22.04 amd64, a normal user with `sudo` access, about
+12 GB free on `/`, and a blank second disk of at least 20 GB for `homePool`.
+Hardware virtualization must be available. If the appliance runs as a VM,
+enable nested virtualization before powering it on (in VMware, expose
+hardware-assisted virtualization to the guest).
 
 ```bash
 gh auth login
@@ -28,10 +31,11 @@ this repository's private GitHub Release, verifies its checksum, and runs the
 setup workflow. The installation continues as a systemd unit if SSH disconnects
 and reboots automatically when finished.
 
-The defaults preserve the VM's current IP address. Edit `setup/setup.conf` first
-to change networking, disable the automatic reboot, or require/disable ZFS.
-`ZFS_CONFIGURE=auto` uses a suitable blank disk when present and otherwise
-completes installation without ZFS.
+The defaults preserve the VM's current IP address and require both KVM and a
+blank disk for ZFS. Edit `setup/setup.conf` first to change networking or disable
+the automatic reboot. `REQUIRE_KVM=no` and `ZFS_CONFIGURE=auto/no` are available
+only for limited troubleshooting installs; agentless protection or core UI and
+storage features will not be fully functional without them.
 
 After reboot, open `https://<VM-IP>/`, finish the local registration wizard, and
 sign in with the local administrator. Initial setup and local login do not need

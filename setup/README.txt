@@ -10,7 +10,8 @@ kernel packages after validating the retained package dependency closure.
 NEEDS
   - Ubuntu 22.04 amd64 (cloud image or server install), SSH key login for your user
   - about 12 GB free on /   (archive extraction + bundle copy + install)
-  - optional for ZFS: a second, BLANK disk of at least ZFS_MIN_GB (default 20 GB)
+  - a second, BLANK disk of at least ZFS_MIN_GB (default 20 GB) for homePool
+  - hardware virtualization; for a VM, enable nested virtualization before boot
   - no Internet connection on the target; build/copy the complete bundle from another machine
 
 AIR-GAPPED MODE
@@ -66,8 +67,10 @@ WHAT IT DOES (in order)
        and its meta-packages are not included in the bundle.
   p60  purges snapd + cloud-init (they make boot ordering cycles with Datto's units) and
        restores the /usr/bin/snapctl link
-  p70  when a suitable blank disk exists, creates ZFS homePool with spf-datto's layout and
-       copies /home onto it. The default auto mode skips ZFS when no second disk is present.
+  p70  requires a suitable blank disk, creates ZFS homePool with spf-datto's layout, and
+       copies /home onto it. Limited troubleshooting installs can explicitly select auto/no.
+  p75  verifies /dev/kvm and runs the libguestfs disk-inspection self-test used by
+       agentless VM protection; this catches missing nested virtualization before registration
   p80  NetworkManager bridge br0 (port = your NIC, zone datto). With a gateway configured it
        checks that the gateway answers; without one it checks the bridge address. It reverts to
        netplan automatically if the check fails. Then networkd is disabled.
@@ -92,7 +95,7 @@ WEB UI
   licensing remain outside this offline replica workflow.
 
 EXPECTED FAILED SERVICES (no IPMI hardware / no Datto cloud registration)
-  openipmi, datto-speedsync-cache-update, datto-system-speedsync-check,
+  openipmi, datto-https-check, datto-speedsync-cache-update, datto-system-speedsync-check,
   datto-update-assets
 
 SENSITIVE

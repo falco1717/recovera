@@ -23,7 +23,7 @@ BACKUP_DIR=/root/spf-datto-backup
 UNIT=spf-datto-setup
 LOCAL_LIST=/etc/apt/sources.list.d/spf-datto-local.list
 LOCAL_ONLY=(-o "Dir::Etc::sourcelist=$LOCAL_LIST" -o "Dir::Etc::sourceparts=/nonexistent" -o "DPkg::Lock::Timeout=900" -o "Acquire::Retries=0")
-EXPECTED_FAILED="openipmi.service datto-ipmi-setup.service datto-asset-replication-reconcile.service datto-speedsync-cache-update.service datto-system-speedsync-check.service datto-update-assets.service"
+EXPECTED_FAILED="openipmi.service datto-ipmi-setup.service datto-asset-replication-reconcile.service datto-https-check.service datto-speedsync-cache-update.service datto-system-speedsync-check.service datto-update-assets.service"
 # Source-appliance identity, removed telemetry, and physical watchdog configuration
 # are never copied to a replica. Everything else that differs is applied in p45.
 CONFFILE_DENY_RE='^(/root/|/etc/(filebeat|fluent-bit|telegraf)/|/etc/apache2/ssl/|/etc/bash\.bashrc$|/etc/watchdog\.conf$|/etc/ssh/ssh_host_|/etc/hostname$|/etc/machine-id$)'
@@ -93,7 +93,8 @@ load_conf() {
   # shellcheck source=/dev/null
   . "$c"
   : "${NET_CONFIGURE:=yes}" "${NET_IP:=current}" "${NET_GATEWAY:=}" "${NET_DNS:=}" "${NET_IFACE:=}"
-  : "${ZFS_CONFIGURE:=auto}" "${ZFS_DISK:=auto}" "${ZFS_MIN_GB:=20}" "${ZFS_POOL:=homePool}" "${ZFS_MOVE_HOME:=yes}"
+  : "${REQUIRE_KVM:=yes}"
+  : "${ZFS_CONFIGURE:=yes}" "${ZFS_DISK:=auto}" "${ZFS_MIN_GB:=20}" "${ZFS_POOL:=homePool}" "${ZFS_MOVE_HOME:=yes}"
   : "${FIPS_OFF:=yes}" "${REMOVE_SNAPD:=yes}" "${REMOVE_CLOUD_INIT:=yes}" "${APT_FREEZE:=yes}" "${OFFLINE_MODE:=yes}" "${AUTO_REBOOT:=yes}"
   LOGIN_USER="${LOGIN_USER:-${SUDO_USER:-}}"
   [ -n "$LOGIN_USER" ] || LOGIN_USER="$(getent passwd 1000 | cut -d: -f1)"
@@ -101,12 +102,27 @@ load_conf() {
 
 validate_conf() {
   case "$OFFLINE_MODE" in yes|no) ;; *) die "OFFLINE_MODE must be yes or no" ;; esac
+  case "$REQUIRE_KVM" in yes|no) ;; *) die "REQUIRE_KVM must be yes or no" ;; esac
   case "$ZFS_CONFIGURE" in yes|no|auto) ;; *) die "ZFS_CONFIGURE must be yes, no, or auto" ;; esac
   if [ "$OFFLINE_MODE" = yes ]; then
     [ "$APT_FREEZE" = yes ] || die "OFFLINE_MODE=yes requires APT_FREEZE=yes"
     command -v systemd-run >/dev/null 2>&1 || command -v unshare >/dev/null 2>&1 || \
       die "OFFLINE_MODE=yes needs systemd-run or unshare for private-network package operations"
   fi
+}
+
+kvm_ready() {
+  local module=""
+  if grep -qE '(^|[[:space:]])vmx([[:space:]]|$)' /proc/cpuinfo; then
+    module=kvm_intel
+  elif grep -qE '(^|[[:space:]])svm([[:space:]]|$)' /proc/cpuinfo; then
+    module=kvm_amd
+  else
+    return 1
+  fi
+  modprobe kvm >/dev/null 2>&1 || true
+  modprobe "$module" >/dev/null 2>&1 || true
+  [ -c /dev/kvm ]
 }
 
 # ------------------------------------------------------------------------ preflight
@@ -117,6 +133,17 @@ preflight() {
   [ "$(dpkg --print-architecture)" = amd64 ] || { echo "needs amd64"; exit 1; }
   load_conf
   validate_conf
+  if [ "$REQUIRE_KVM" = yes ] && ! kvm_ready; then
+    local virt
+    virt=$(systemd-detect-virt 2>/dev/null || echo unknown)
+    if [ "$virt" != none ] && [ "$virt" != unknown ]; then
+      echo "hardware virtualization is unavailable inside this $virt VM"
+      echo "enable nested virtualization (Expose hardware-assisted virtualization) on the appliance VM, cold-start it, and retry"
+    else
+      echo "hardware virtualization is unavailable; enable Intel VT-x or AMD-V in firmware and retry"
+    fi
+    exit 1
+  fi
   id "$LOGIN_USER" >/dev/null 2>&1 || { echo "LOGIN_USER '$LOGIN_USER' does not exist"; exit 1; }
   local home; home="$(getent passwd "$LOGIN_USER" | cut -d: -f6)"
   [ -s "$home/.ssh/authorized_keys" ] || echo "WARNING: $home/.ssh/authorized_keys is empty; key login for $LOGIN_USER won't work"
@@ -125,6 +152,15 @@ preflight() {
     compgen -G "$INSTALL_DIR/wheels/npyscreen-4.10.5-*.whl" >/dev/null || {
       echo "missing bundled npyscreen 4.10.5 wheel required by datto-siris-os-2"; exit 1;
     }
+  if [ "$ZFS_CONFIGURE" = yes ] && ! { command -v zpool >/dev/null 2>&1 && zpool list -H "$ZFS_POOL" >/dev/null 2>&1; }; then
+    local zfs_dev="$ZFS_DISK"
+    [ "$zfs_dev" = auto ] && zfs_dev=$(zfs_pick_disk)
+    [ -n "$zfs_dev" ] && [ "$zfs_dev" != auto ] || {
+      echo "no blank disk >= ${ZFS_MIN_GB} GB found for required ZFS pool $ZFS_POOL"
+      echo "attach a blank second disk (recommended), or explicitly set ZFS_CONFIGURE=auto/no for a limited troubleshooting install"
+      exit 1
+    }
+  fi
 }
 
 stage_bundle() {   # copy the bundle to /opt/spf-datto so nothing depends on /home (which may move to ZFS)
@@ -791,11 +827,37 @@ p70_zfs() {
   # Enforce this on resumed runs too. Some appliance ZFS defaults reset overlay,
   # and a populated fallback /home must not make zfs-mount.service fail at boot.
   zfs set overlay=on "$P/home" || return 1
+  # Datto's boot-time ZFS policy may reset the dataset property to inherited/off.
+  # Make the systemd mount operation itself overlay-safe so a populated fallback
+  # /home cannot fail zfs-mount.service before the pool is mounted.
+  mkdir -p /etc/systemd/system/zfs-mount.service.d
+  cat > /etc/systemd/system/zfs-mount.service.d/90-spf-overlay.conf <<'EOF'
+[Service]
+ExecStart=
+ExecStart=/usr/sbin/zfs mount -a -O
+EOF
+  systemctl daemon-reload
   zfs list "$P/home/agents"       >/dev/null 2>&1 || zfs create "$P/home/agents"
   zfs list "$P/home/configBackup" >/dev/null 2>&1 || zfs create "$P/home/configBackup"
   local home; home="$(getent passwd "$LOGIN_USER" | cut -d: -f6)"
   [ -s "$home/.ssh/authorized_keys" ] || warn "$home/.ssh/authorized_keys missing after /home move"
   zpool list -H -o name,size,health "$P" | sed 's/^/  pool: /'
+}
+
+p75_protection_engine() {
+  [ "$REQUIRE_KVM" = yes ] || { log "KVM protection-engine check disabled in setup.conf"; return 0; }
+  kvm_ready || { log "KVM is not available; agentless VM protection cannot run"; return 1; }
+  local test_log=/var/log/spf-datto-libguestfs-test.log
+  log "testing the libguestfs/KVM disk-inspection engine (log: $test_log)"
+  timeout 180 libguestfs-test-tool > "$test_log" 2>&1 || {
+    tail -n 40 "$test_log"
+    return 1
+  }
+  grep -q 'TEST FINISHED OK' "$test_log" || {
+    tail -n 40 "$test_log"
+    return 1
+  }
+  log "libguestfs/KVM disk-inspection engine passed"
 }
 
 net_revert() {
@@ -964,6 +1026,10 @@ verify() {
   check "php8.1-fpm active (/run/php)"                     "systemctl is-active php8.1-fpm"
   # libvirtd is socket-activated with --timeout 120, so "inactive" is normal; ask it instead
   check "libvirt answers (virsh version)"                  "virsh -c qemu:///system version"
+  if [ "$REQUIRE_KVM" = yes ]; then
+    check "hardware virtualization available (/dev/kvm)"  "kvm_ready"
+    check "libguestfs/KVM self-test passed"                "grep -q 'TEST FINISHED OK' /var/log/spf-datto-libguestfs-test.log"
+  fi
   if [ "$ZFS_CONFIGURE" != no ] && zpool list -H "$ZFS_POOL" >/dev/null 2>&1; then
     check "$ZFS_POOL ONLINE"                               "[ \"\$(zpool list -H -o health $ZFS_POOL)\" = ONLINE ]"
     check "zfs-mount active"                               "systemctl is-active zfs-mount"
@@ -1017,6 +1083,7 @@ run_all() {
   phase p50 "boot config (FIPS off)"                          p50_boot
   phase p60 "remove snapd + cloud-init, restore snapctl"      p60_cleanup
   phase p70 "ZFS $ZFS_POOL"                                   p70_zfs
+  phase p75 "libguestfs/KVM protection engine"                 p75_protection_engine
   phase p80 "NetworkManager bridge br0"                       p80_network
   phase p85 "apt sources"                                     p85_apt
   log "== p90: post-boot verification timer (re-armed every run)"
