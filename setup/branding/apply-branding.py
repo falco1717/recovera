@@ -101,6 +101,9 @@ def main() -> int:
     css_target.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(logo_source, logo_target)
     shutil.copy2(Path(__file__).with_name("recovera-brand.css"), css_target)
+    offsite_target = WEB / "configure/offsite/index.php"
+    offsite_target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(Path(__file__).with_name("recovera-offsite.php"), offsite_target)
 
     for path in (
         ROOT / "templates/commonlookandfeel/Default/layout.base.html.twig",

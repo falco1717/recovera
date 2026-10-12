@@ -879,9 +879,44 @@ p75_protection_engine() {
   log "libguestfs/KVM disk-inspection engine passed"
 }
 
+ensure_recovera_device_id() {
+  python3 - <<'PY'
+import hashlib
+import json
+import os
+from pathlib import Path
+
+target = Path('/datto/config/deviceID')
+try:
+    current = int(target.read_text().strip())
+except (FileNotFoundError, ValueError):
+    current = 0
+if current > 0:
+    raise SystemExit(0)
+
+peer_config = Path('/etc/recovera-peer/config.json')
+value = 0
+try:
+    value = int(json.loads(peer_config.read_text()).get('numeric_id', 0))
+except (FileNotFoundError, ValueError, json.JSONDecodeError):
+    pass
+if value < 1:
+    machine_id = Path('/etc/machine-id').read_bytes().strip()
+    value = 1_000_000_000 + int.from_bytes(hashlib.sha256(machine_id).digest()[:8], 'big') % 8_000_000_000
+
+target.parent.mkdir(parents=True, exist_ok=True)
+temporary = target.with_name('.deviceID.recovera')
+temporary.write_text(str(value) + '\n')
+temporary.chmod(0o644)
+os.replace(temporary, target)
+PY
+}
+
 p77_recovera_branding() {
   [ -f "$INSTALL_DIR/branding/apply-branding.py" ] || { log "Recovera branding script is missing"; return 1; }
   [ -f "$INSTALL_DIR/branding/recovera-logo.png" ] || { log "Recovera logo is missing"; return 1; }
+  [ -f "$INSTALL_DIR/branding/recovera-offsite.php" ] || { log "Recovera off-site redirect is missing"; return 1; }
+  ensure_recovera_device_id || return 1
   python3 "$INSTALL_DIR/branding/apply-branding.py" \
     "$INSTALL_DIR/branding/recovera-logo.png" || return 1
   systemctl restart php8.1-fpm >/dev/null 2>&1 || return 1
@@ -965,6 +1000,11 @@ c = json.loads(p.read_text())
 c['port'] = int('$PEER_PORT')
 c['pool'] = '$ZFS_POOL'
 c['source_root'] = '$ZFS_POOL/home/agents'
+device_id = Path('/datto/config/deviceID')
+local_numeric_id = int(device_id.read_text().strip())
+if local_numeric_id < 1:
+    raise ValueError('invalid local Recovera device ID')
+c['numeric_id'] = local_numeric_id
 p.write_text(json.dumps(c, indent=2, sort_keys=True) + '\n')
 p.chmod(0o600)
 PY
@@ -1144,6 +1184,7 @@ verify() {
   check "sshd active, config -> ${sshlink:-regular file}"  "systemctl is-active ssh"
   check "$LOGIN_USER in remote-users"                      "id -nG $LOGIN_USER | grep -qw remote-users"
   check "snapctl works"                                    "snapctl --version"
+  check "SpeedSync recognizes the local Recovera device"   "timeout 10 speedsync version"
   check "php8.1-fpm active (/run/php)"                     "systemctl is-active php8.1-fpm"
   # libvirtd is socket-activated with --timeout 120, so "inactive" is normal; ask it instead
   check "libvirt answers (virsh version)"                  "virsh -c qemu:///system version"
