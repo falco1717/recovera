@@ -216,13 +216,12 @@ def main() -> int:
         update(path, brand_translation)
     update(WEB / "js/translations/en_US.js", brand_translation)
 
-    for cache in (
-        Path("/var/cache/datto/device/prod/twig"),
-        Path("/var/cache/datto/device/prod/translations"),
-        Path("/var/cache/datto/device/prod"),
-    ):
-        if cache.is_dir():
-            shutil.rmtree(cache)
+    cache = Path("/var/cache/datto/device/prod")
+    if cache.is_dir():
+        # PHP-FPM can recreate cache entries while this cleanup is running.
+        # A best-effort removal is sufficient because the process is restarted
+        # immediately after branding is applied.
+        shutil.rmtree(cache, ignore_errors=True)
 
     print("Recovera branding applied")
     return 0
