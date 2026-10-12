@@ -1,5 +1,5 @@
 #!/bin/bash
-# spf-datto replica: one-shot setup for a fresh Ubuntu 22.04 (jammy, amd64) VM.
+# Recovera: one-shot setup for a fresh Ubuntu 22.04 (jammy, amd64) VM.
 #
 # Installs the reviewed application package set at its exact versions from the bundled
 # .debs (no internet needed), then applies everything learned building spf-datto-pkgs:
@@ -12,6 +12,7 @@
 #   sudo ./setup.sh status     show progress / follow the log of a running setup
 #   sudo ./setup.sh verify     health check of a finished replica
 #   sudo ./setup.sh install-peer install/update only the peer-replication service
+#   sudo ./setup.sh apply-branding apply/update only the Recovera WebUI branding
 #
 # Resumable: finished phases are recorded in /var/lib/spf-datto-setup; just run it again.
 set -uo pipefail
@@ -24,7 +25,7 @@ BACKUP_DIR=/root/spf-datto-backup
 UNIT=spf-datto-setup
 LOCAL_LIST=/etc/apt/sources.list.d/spf-datto-local.list
 LOCAL_ONLY=(-o "Dir::Etc::sourcelist=$LOCAL_LIST" -o "Dir::Etc::sourceparts=/nonexistent" -o "DPkg::Lock::Timeout=900" -o "Acquire::Retries=0")
-EXPECTED_FAILED="openipmi.service datto-ipmi-setup.service datto-asset-replication-reconcile.service datto-https-check.service datto-speedsync-cache-update.service datto-system-speedsync-check.service datto-update-assets.service"
+EXPECTED_FAILED="openipmi.service datto-ipmi-setup.service datto-asset-replication-reconcile.service datto-https-check.service datto-send-volumes-to-portal.service datto-speedsync-cache-update.service datto-system-speedsync-check.service datto-update-assets.service datto-upgrade-channel-get.service"
 # Source-appliance identity, removed telemetry, and physical watchdog configuration
 # are never copied to a replica. Everything else that differs is applied in p45.
 CONFFILE_DENY_RE='^(/root/|/etc/(filebeat|fluent-bit|telegraf)/|/etc/apache2/ssl/|/etc/bash\.bashrc$|/etc/watchdog\.conf$|/etc/ssh/ssh_host_|/etc/hostname$|/etc/machine-id$)'
@@ -878,32 +879,69 @@ p75_protection_engine() {
   log "libguestfs/KVM disk-inspection engine passed"
 }
 
+p77_recovera_branding() {
+  [ -f "$INSTALL_DIR/branding/apply-branding.py" ] || { log "Recovera branding script is missing"; return 1; }
+  [ -f "$INSTALL_DIR/branding/recovera-logo.png" ] || { log "Recovera logo is missing"; return 1; }
+  python3 "$INSTALL_DIR/branding/apply-branding.py" \
+    "$INSTALL_DIR/branding/recovera-logo.png" || return 1
+  systemctl restart php8.1-fpm >/dev/null 2>&1 || return 1
+  log "Recovera branding installed"
+}
+
 p78_peer_replication() {
   [ "$PEER_REPLICATION" = yes ] || { log "peer replication disabled in setup.conf"; return 0; }
-  [ -f "$INSTALL_DIR/peer/backops-peer" ] || { log "peer replication payload is missing"; return 1; }
+  [ -f "$INSTALL_DIR/peer/recovera-peer" ] || { log "peer replication payload is missing"; return 1; }
   zpool list -H "$ZFS_POOL" >/dev/null 2>&1 || {
     warn "peer replication needs ZFS pool $ZFS_POOL; attach storage and re-run setup"
     return 2
   }
 
-  getent group remote-users >/dev/null || groupadd --system remote-users
-  if ! id backops-repl >/dev/null 2>&1; then
-    useradd --system --create-home --home-dir /var/lib/backops-peer --shell /bin/bash backops-repl || return 1
+  systemctl disable --now backops-peer.service backops-peer-sync.timer >/dev/null 2>&1 || true
+  if id backops-repl >/dev/null 2>&1 && ! id recovera-repl >/dev/null 2>&1; then
+    usermod -l recovera-repl -d /var/lib/recovera-peer -m backops-repl || return 1
+    if getent group backops-repl >/dev/null 2>&1; then
+      groupmod -n recovera-repl backops-repl || return 1
+    fi
   fi
-  usermod -aG remote-users backops-repl || return 1
-  passwd -l backops-repl >/dev/null 2>&1 || true
+  if [ -d /etc/backops-peer ] && [ ! -e /etc/recovera-peer ]; then
+    mv /etc/backops-peer /etc/recovera-peer || return 1
+  fi
+  if [ -d /var/lib/backops-peer ] && [ ! -e /var/lib/recovera-peer ]; then
+    mv /var/lib/backops-peer /var/lib/recovera-peer || return 1
+  fi
 
-  install -m 0755 "$INSTALL_DIR/peer/backops-peer" /usr/local/sbin/backops-peer
-  install -m 0644 "$INSTALL_DIR/peer/backops-peer.service" /etc/systemd/system/backops-peer.service
-  install -m 0644 "$INSTALL_DIR/peer/backops-peer-sync.service" /etc/systemd/system/backops-peer-sync.service
-  install -m 0644 "$INSTALL_DIR/peer/backops-peer-sync.timer" /etc/systemd/system/backops-peer-sync.timer
-  install -m 0644 "$INSTALL_DIR/peer/sshd-backops-peer.conf" /etc/ssh/sshd_config.d/91-backops-peer.conf
-  install -m 0440 "$INSTALL_DIR/peer/sudoers-backops-peer" /etc/sudoers.d/backops-peer
+  getent group remote-users >/dev/null || groupadd --system remote-users
+  if ! id recovera-repl >/dev/null 2>&1; then
+    useradd --system --create-home --home-dir /var/lib/recovera-peer --shell /bin/bash recovera-repl || return 1
+  fi
+  usermod -aG remote-users recovera-repl || return 1
+  passwd -l recovera-repl >/dev/null 2>&1 || true
 
-  visudo -cf /etc/sudoers.d/backops-peer >/dev/null || return 1
+  [ -f "$INSTALL_DIR/peer/recovera-auth.php" ] || { log "Recovera authentication helper is missing"; return 1; }
+  [ -f "$INSTALL_DIR/branding/recovera-logo.png" ] || { log "Recovera logo is missing"; return 1; }
+  install -m 0755 "$INSTALL_DIR/peer/recovera-peer" /usr/local/sbin/recovera-peer
+  install -m 0644 "$INSTALL_DIR/peer/recovera-peer.service" /etc/systemd/system/recovera-peer.service
+  install -m 0644 "$INSTALL_DIR/peer/recovera-peer-sync.service" /etc/systemd/system/recovera-peer-sync.service
+  install -m 0644 "$INSTALL_DIR/peer/recovera-peer-sync.timer" /etc/systemd/system/recovera-peer-sync.timer
+  install -m 0644 "$INSTALL_DIR/peer/sshd-recovera-peer.conf" /etc/ssh/sshd_config.d/91-recovera-peer.conf
+  install -m 0440 "$INSTALL_DIR/peer/sudoers-recovera-peer" /etc/sudoers.d/recovera-peer
+  install -d -m 0755 /usr/local/lib/recovera /usr/local/share/recovera
+  install -m 0644 "$INSTALL_DIR/peer/recovera-auth.php" /usr/local/lib/recovera/authenticate.php
+  install -m 0644 "$INSTALL_DIR/branding/recovera-logo.png" /usr/local/share/recovera/recovera-logo.png
+
+  if [ -f /var/lib/recovera-peer/.ssh/authorized_keys ]; then
+    sed -i 's|/usr/local/sbin/backops-peer|/usr/local/sbin/recovera-peer|g; s/backops-source=/recovera-source=/g' \
+      /var/lib/recovera-peer/.ssh/authorized_keys || return 1
+  fi
+  rm -f /etc/recovera-peer/admin.token /usr/local/sbin/backops-peer \
+    /etc/systemd/system/backops-peer.service /etc/systemd/system/backops-peer-sync.service \
+    /etc/systemd/system/backops-peer-sync.timer /etc/ssh/sshd_config.d/91-backops-peer.conf \
+    /etc/sudoers.d/backops-peer
+
+  visudo -cf /etc/sudoers.d/recovera-peer >/dev/null || return 1
   local sshd_active sshd_backup
   sshd_active=$(readlink -f /etc/ssh/sshd_config)
-  sshd_backup="$BACKUP_DIR/$(basename "$sshd_active").before-backops-peer"
+  sshd_backup="$BACKUP_DIR/$(basename "$sshd_active").before-recovera-peer"
   if ! grep -qF 'Include /etc/ssh/sshd_config.d/*.conf' "$sshd_active"; then
     mkdir -p "$BACKUP_DIR"
     cp -a "$sshd_active" "$sshd_backup" || return 1
@@ -918,11 +956,11 @@ p78_peer_replication() {
     log "peer SSH configuration failed validation and was rolled back"
     return 1
   fi
-  /usr/local/sbin/backops-peer init || return 1
+  /usr/local/sbin/recovera-peer init || return 1
   python3 - <<PY || return 1
 import json
 from pathlib import Path
-p = Path('/etc/backops-peer/config.json')
+p = Path('/etc/recovera-peer/config.json')
 c = json.loads(p.read_text())
 c['port'] = int('$PEER_PORT')
 c['pool'] = '$ZFS_POOL'
@@ -937,8 +975,8 @@ PY
   fi
   systemctl daemon-reload
   systemctl restart ssh.service || return 1
-  systemctl enable --now backops-peer.service backops-peer-sync.timer >/dev/null || return 1
-  log "peer replication: https://$(hostname -I | awk '{print $1}'):$PEER_PORT/ (user backops; token: sudo backops-peer admin-token)"
+  systemctl enable --now recovera-peer.service recovera-peer-sync.timer >/dev/null || return 1
+  log "Recovera replication: https://$(hostname -I | awk '{print $1}'):$PEER_PORT/ (use a registered local administrator)"
 }
 
 net_revert() {
@@ -1128,8 +1166,8 @@ verify() {
   if [ "$PEER_REPLICATION" = yes ]; then
     local peer_code
     peer_code=$(curl -sk -o /dev/null -w '%{http_code}' --max-time 10 "https://127.0.0.1:${PEER_PORT}/v1/info" 2>/dev/null)
-    check "peer replication service active"                 "systemctl is-active backops-peer.service"
-    check "peer scheduler enabled"                          "systemctl is-enabled backops-peer-sync.timer"
+    check "peer replication service active"                 "systemctl is-active recovera-peer.service"
+    check "peer scheduler enabled"                          "systemctl is-enabled recovera-peer-sync.timer"
     check "peer API https://127.0.0.1:${PEER_PORT}/ answers (HTTP $peer_code)" "[ '$peer_code' = 200 ]"
   fi
   # Apache / Datto web UI
@@ -1176,6 +1214,7 @@ run_all() {
   phase p60 "remove snapd + cloud-init, restore snapctl"      p60_cleanup
   phase p70 "ZFS $ZFS_POOL"                                   p70_zfs
   phase p75 "libguestfs/KVM protection engine"                 p75_protection_engine
+  phase p77 "Recovera application branding"                    p77_recovera_branding
   phase p78 "offline appliance-to-appliance replication"       p78_peer_replication
   phase p80 "NetworkManager bridge br0"                       p80_network
   phase p85 "apt sources"                                     p85_apt
@@ -1234,7 +1273,11 @@ case "$MODE" in
     echo "offline registration finalizer repaired" ;;
   install-peer)
     [ "$(id -u)" -eq 0 ] || { echo "run with sudo"; exit 1; }
-    load_conf; validate_conf; p78_peer_replication
+    load_conf; validate_conf; p77_recovera_branding; p78_peer_replication
     echo "peer replication service installed" ;;
+  apply-branding)
+    [ "$(id -u)" -eq 0 ] || { echo "run with sudo"; exit 1; }
+    p77_recovera_branding
+    echo "Recovera branding applied" ;;
   *) sed -n '2,15p' "$SELF"; exit 1 ;;
 esac

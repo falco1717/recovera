@@ -8,23 +8,23 @@ from pathlib import Path
 from unittest import mock
 
 
-SCRIPT = Path(__file__).parents[1] / "setup" / "peer" / "backops-peer"
+SCRIPT = Path(__file__).parents[1] / "setup" / "peer" / "recovera-peer"
 
 
 def load_module(root: Path):
-    os.environ["BACKOPS_PEER_ETC"] = str(root / "etc")
-    os.environ["BACKOPS_PEER_STATE"] = str(root / "state")
-    os.environ["BACKOPS_PEER_KEYS"] = str(root / "keys")
-    os.environ["BACKOPS_PEER_LOCK"] = str(root / "lock")
-    os.environ["BACKOPS_PEER_AUTHORIZED_KEYS"] = str(root / "authorized_keys")
-    loader = importlib.machinery.SourceFileLoader("backops_peer_test", str(SCRIPT))
+    os.environ["RECOVERA_PEER_ETC"] = str(root / "etc")
+    os.environ["RECOVERA_PEER_STATE"] = str(root / "state")
+    os.environ["RECOVERA_PEER_KEYS"] = str(root / "keys")
+    os.environ["RECOVERA_PEER_LOCK"] = str(root / "lock")
+    os.environ["RECOVERA_PEER_AUTHORIZED_KEYS"] = str(root / "authorized_keys")
+    loader = importlib.machinery.SourceFileLoader("recovera_peer_test", str(SCRIPT))
     spec = importlib.util.spec_from_loader(loader.name, loader)
     module = importlib.util.module_from_spec(spec)
     loader.exec_module(module)
     return module
 
 
-class BackOpsPeerTests(unittest.TestCase):
+class RecoveraPeerTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)
@@ -137,6 +137,23 @@ class BackOpsPeerTests(unittest.TestCase):
         self.assertNotIn(source, self.peer.config()["sources"])
         self.assertNotIn(source, path.read_text())
         self.assertIn("87654321", path.read_text())
+
+    def test_registered_administrator_auth_uses_php_helper(self):
+        completed = mock.Mock(returncode=0)
+        with mock.patch.object(self.peer, "run", return_value=completed) as invoke:
+            self.assertTrue(self.peer.authenticate_local_admin("jfarmer", "correct horse"))
+        invoke.assert_called_once_with(
+            ["php", str(self.peer.AUTH_HELPER_PATH), "jfarmer"],
+            check=False,
+            input_data=b"correct horse",
+            timeout=8,
+        )
+
+    def test_registered_administrator_auth_rejects_invalid_input(self):
+        with mock.patch.object(self.peer, "run") as invoke:
+            self.assertFalse(self.peer.authenticate_local_admin("../root", "password"))
+            self.assertFalse(self.peer.authenticate_local_admin("admin", ""))
+        invoke.assert_not_called()
 
     def test_peer_remove_refuses_an_assigned_target(self):
         target = "12345678-1234-1234-1234-123456789abc"

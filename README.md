@@ -1,7 +1,7 @@
-# backops
+# Recovera
 
 One command turns an existing Ubuntu 22.04 amd64 VM into a locally usable,
-offline-capable SIRIS replica. This branch does not deploy, modify, or require
+offline-capable Recovera backup appliance. This branch does not deploy, modify, or require
 vCenter/ESXi.
 
 The installation payload contains 1,329 packages. The bundle builder removes
@@ -22,9 +22,9 @@ appliance with additional RAM when recovery VMs need more memory.
 
 ```bash
 gh auth login
-gh repo clone falco1717/backops
-cd backops
-git switch offline/air-gapped-setup
+gh repo clone falco1717/recovera
+cd recovera
+git switch feature/recovera-rebrand
 ./install.sh --check   # optional preflight and package simulation
 ./install.sh
 ```
@@ -42,25 +42,20 @@ storage features will not be fully functional without them.
 
 After reboot, open `https://<VM-IP>/`, finish the local registration wizard, and
 sign in with the local administrator. Initial setup and local login do not need
-Internet. Datto enrollment, licensing, updates, and cloud services are not
+Internet. Legacy vendor enrollment, licensing, updates, and cloud services are not
 emulated.
 
 ## Offline appliance replication
 
-The installer also provides SIRIS-Private-style replication between BackOps
+The installer also provides SIRIS-Private-style replication between Recovera
 appliances. It uses a one-time pairing code and a manually verified TLS
 fingerprint, then pins the target's SSH host key. Full ZFS streams are sent for
 new assets; subsequent recovery points use incremental, resumable ZFS streams.
 The target receives protected-system metadata and invokes the appliance's local
 replication-received hook so recovery points remain locally discoverable.
 
-Retrieve the management-page password on either appliance:
-
-```bash
-sudo backops-peer admin-token
-```
-
-Open `https://<appliance-IP>:9443/` and sign in as `backops`. On the target,
+Open `https://<appliance-IP>:9443/` and sign in with the same local administrator
+username and password created during device registration. On the target,
 generate a one-time code. On the source, enter the target IP, verify its TLS
 fingerprint, enter that code, and choose the protected asset and replication
 interval. The CLI workflow is documented in

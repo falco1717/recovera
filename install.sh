@@ -6,13 +6,13 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$ROOT/setup/release.env"
 
 MODE=run
-BUNDLE="${SPF_DATTO_BUNDLE:-}"
+BUNDLE="${RECOVERA_BUNDLE:-${SPF_DATTO_BUNDLE:-}}"
 
 usage() {
   cat <<'EOF'
 Usage: ./install.sh [--bundle PATH] [--check]
 
-Installs the complete spf-datto replica on an existing Ubuntu 22.04 amd64 VM.
+Installs the complete Recovera appliance on an existing Ubuntu 22.04 amd64 VM.
 
   --bundle PATH  Use a previously downloaded spf-datto-setup.tar.
   --check        Validate the VM and simulate package installation only.
@@ -95,9 +95,9 @@ echo "payload verified: $actual_sha"
 if [ "$(id -u)" -ne 0 ]; then
   command -v sudo >/dev/null 2>&1 || die "sudo is required"
   if [ "$MODE" = check ]; then
-    exec sudo env SPF_DATTO_BUNDLE="$BUNDLE" "$ROOT/install.sh" --check
+    exec sudo env RECOVERA_BUNDLE="$BUNDLE" "$ROOT/install.sh" --check
   fi
-  exec sudo env SPF_DATTO_BUNDLE="$BUNDLE" "$ROOT/install.sh"
+  exec sudo env RECOVERA_BUNDLE="$BUNDLE" "$ROOT/install.sh"
 fi
 
 . /etc/os-release
@@ -130,6 +130,8 @@ rm -rf "$payload/wheels"
 cp -a "$ROOT/setup/wheels" "$payload/wheels"
 rm -rf "$payload/peer"
 cp -a "$ROOT/setup/peer" "$payload/peer"
+rm -rf "$payload/branding"
+cp -a "$ROOT/setup/branding" "$payload/branding"
 
-echo "starting spf-datto setup on $(hostname) ..."
+echo "starting Recovera setup on $(hostname) ..."
 "$payload/setup.sh" "$MODE"

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""BackOps appliance-to-appliance snapshot replication.
+"""Recovera appliance-to-appliance snapshot replication.
 
 Uses only Python's standard library and the OpenSSH/ZFS tools already present
 on an appliance. No cloud endpoint is contacted.
@@ -29,21 +29,26 @@ import uuid
 from pathlib import Path
 from typing import Any, BinaryIO
 
-VERSION = "0.1.0"
-ETC = Path(os.environ.get("BACKOPS_PEER_ETC", "/etc/backops-peer"))
-STATE_DIR = Path(os.environ.get("BACKOPS_PEER_STATE", "/var/lib/backops-peer"))
+VERSION = "0.2.0"
+ETC = Path(os.environ.get("RECOVERA_PEER_ETC", "/etc/recovera-peer"))
+STATE_DIR = Path(os.environ.get("RECOVERA_PEER_STATE", "/var/lib/recovera-peer"))
 CONFIG_PATH = ETC / "config.json"
 STATE_PATH = STATE_DIR / "state.json"
 PAIRING_PATH = STATE_DIR / "pairing.json"
-ADMIN_TOKEN_PATH = ETC / "admin.token"
 TLS_CERT_PATH = ETC / "tls.crt"
 TLS_KEY_PATH = ETC / "tls.key"
 SSH_KEY_PATH = ETC / "id_ed25519"
 KNOWN_HOSTS_PATH = ETC / "known_hosts"
-KEYS_DIR = Path(os.environ.get("BACKOPS_PEER_KEYS", "/datto/config/keys"))
-LOCK_PATH = Path(os.environ.get("BACKOPS_PEER_LOCK", "/run/backops-peer-sync.lock"))
+KEYS_DIR = Path(os.environ.get("RECOVERA_PEER_KEYS", "/datto/config/keys"))
+LOCK_PATH = Path(os.environ.get("RECOVERA_PEER_LOCK", "/run/recovera-peer-sync.lock"))
 AUTHORIZED_KEYS_PATH = Path(os.environ.get(
-    "BACKOPS_PEER_AUTHORIZED_KEYS", "/var/lib/backops-peer/.ssh/authorized_keys"
+    "RECOVERA_PEER_AUTHORIZED_KEYS", "/var/lib/recovera-peer/.ssh/authorized_keys"
+))
+AUTH_HELPER_PATH = Path(os.environ.get(
+    "RECOVERA_AUTH_HELPER", "/usr/local/lib/recovera/authenticate.php"
+))
+LOGO_PATH = Path(os.environ.get(
+    "RECOVERA_LOGO", "/usr/local/share/recovera/recovera-logo.png"
 ))
 
 ASSET_RE = re.compile(r"^[0-9a-fA-F]{32}$")
@@ -120,7 +125,7 @@ def default_config() -> dict[str, Any]:
 def config() -> dict[str, Any]:
     cfg = load_json(CONFIG_PATH, None)
     if not cfg:
-        raise PeerError("not initialized; run: sudo backops-peer init")
+        raise PeerError("not initialized; run: sudo recovera-peer init")
     return cfg
 
 
@@ -176,21 +181,18 @@ def init() -> None:
         save_config(default_config())
     if not STATE_PATH.exists():
         save_state({"assets": {}, "events": []})
-    if not ADMIN_TOKEN_PATH.exists():
-        ADMIN_TOKEN_PATH.write_text(secrets.token_urlsafe(32) + "\n", encoding="ascii")
-        os.chmod(ADMIN_TOKEN_PATH, 0o600)
     if not SSH_KEY_PATH.exists():
         run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C",
-             f"backops-peer@{socket.gethostname()}", "-f", str(SSH_KEY_PATH)])
+             f"recovera-peer@{socket.gethostname()}", "-f", str(SSH_KEY_PATH)])
     if not TLS_CERT_PATH.exists() or not TLS_KEY_PATH.exists():
         run(["openssl", "req", "-x509", "-newkey", "rsa:3072", "-sha256",
              "-nodes", "-days", "3650", "-subj",
-             f"/CN={socket.gethostname()}/O=BackOps Peer Replication",
+             f"/CN={socket.gethostname()}/O=Recovera Peer Replication",
              "-keyout", str(TLS_KEY_PATH), "-out", str(TLS_CERT_PATH)])
         os.chmod(TLS_KEY_PATH, 0o600)
         os.chmod(TLS_CERT_PATH, 0o644)
     KNOWN_HOSTS_PATH.touch(mode=0o600, exist_ok=True)
-    print(f"BackOps peer replication initialized ({config()['appliance_id']})")
+    print(f"Recovera peer replication initialized ({config()['appliance_id']})")
     print(f"TLS fingerprint: {local_tls_fingerprint()}")
 
 
@@ -367,7 +369,7 @@ def public_info() -> dict[str, Any]:
         size, allocated, free, health = result.stdout.decode().strip().split("\t")
         storage = {"available": True, "size": int(size), "allocated": int(allocated),
                    "free": int(free), "health": health}
-    return {"service": "backops-peer", "version": VERSION,
+    return {"service": "recovera-peer", "version": VERSION,
             "appliance_id": cfg["appliance_id"], "numeric_id": cfg["numeric_id"],
             "name": cfg["name"], "ssh_port": cfg["ssh_port"],
             "tls_fingerprint": local_tls_fingerprint(), "ssh_host_keys": ssh_host_keys(),
@@ -387,15 +389,16 @@ def authorize_source(source_id: str, name: str, public_key: str, address: str) -
     path = authorized_keys_path()
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     existing = path.read_text(encoding="ascii").splitlines() if path.exists() else []
-    marker = f"backops-source={source_id}"
-    existing = [line for line in existing if marker not in line]
-    forced = f"/usr/bin/sudo -n /usr/local/sbin/backops-peer ssh-entry {source_id}"
+    marker = f"recovera-source={source_id}"
+    legacy_marker = f"backops-source={source_id}"
+    existing = [line for line in existing if marker not in line and legacy_marker not in line]
+    forced = f"/usr/bin/sudo -n /usr/local/sbin/recovera-peer ssh-entry {source_id}"
     existing.append(f'restrict,command="{forced}" {parts[0]} {parts[1]} {marker}')
     path.write_text("\n".join(existing) + "\n", encoding="ascii")
     os.chmod(path, 0o600)
     with contextlib.suppress(KeyError):
         import pwd
-        account = pwd.getpwnam("backops-repl")
+        account = pwd.getpwnam("recovera-repl")
         os.chown(path.parent, account.pw_uid, account.pw_gid)
         os.chown(path, account.pw_uid, account.pw_gid)
     cfg = config()
@@ -474,7 +477,7 @@ def ssh_base(peer: dict[str, Any]) -> list[str]:
     return ["ssh", "-T", "-i", str(SSH_KEY_PATH), "-p", str(peer["ssh_port"]),
             "-o", "BatchMode=yes", "-o", "IdentitiesOnly=yes",
             "-o", "StrictHostKeyChecking=yes", "-o", f"UserKnownHostsFile={KNOWN_HOSTS_PATH}",
-            "-o", "ConnectTimeout=15", f"backops-repl@{peer['host']}"]
+            "-o", "ConnectTimeout=15", f"recovera-repl@{peer['host']}"]
 
 
 def remote_json(peer: dict[str, Any], command: list[str]) -> dict[str, Any]:
@@ -728,9 +731,9 @@ def source_remove(source_id: str) -> None:
     save_config(cfg)
     path = authorized_keys_path()
     if path.exists():
-        marker = f"backops-source={source_id}"
+        markers = (f"recovera-source={source_id}", f"backops-source={source_id}")
         lines = [line for line in path.read_text(encoding="ascii").splitlines()
-                 if marker not in line]
+                 if not any(marker in line for marker in markers)]
         path.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="ascii")
         os.chmod(path, 0o600)
     event("source-removed", f"Removed source {name}", source_id=source_id)
@@ -749,24 +752,45 @@ def received_forget(asset: str) -> None:
 
 def status_document() -> dict[str, Any]:
     cfg = config()
-    return {"service": "backops-peer", "version": VERSION,
+    return {"service": "recovera-peer", "version": VERSION,
             "appliance": {"id": cfg["appliance_id"], "name": cfg["name"]},
             "peers": cfg.get("peers", {}), "sources": cfg.get("sources", {}),
             "rules": cfg.get("assets", {}), "local_assets": assets_local(cfg),
             "state": state(), "tls_fingerprint": local_tls_fingerprint()}
 
 
-HTML = """<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>BackOps Peer Replication</title><style>
-body{font-family:system-ui,sans-serif;background:#0d3d4e;color:#102b36;margin:0;padding:2rem}main{max-width:1050px;margin:auto;background:#fff;border-radius:6px;padding:2rem;box-shadow:0 8px 35px #062632aa}h1{margin-top:0}h2{border-bottom:1px solid #c9d8de;padding-bottom:.4rem}label{display:block;margin:.55rem 0}input,select,button{font:inherit;padding:.55rem;border:1px solid #9db4be;border-radius:4px}input,select{min-width:18rem}button{background:#159bd3;color:white;border:0;cursor:pointer}button.secondary{background:#5e7480}table{border-collapse:collapse;width:100%}th,td{text-align:left;padding:.55rem;border-bottom:1px solid #dde6ea}pre{background:#eff5f7;padding:1rem;overflow:auto}.error{color:#b51616}.ok{color:#08733b}.row{display:flex;gap:1rem;flex-wrap:wrap}</style></head><body><main><h1>BackOps Peer Replication</h1><p>Offline appliance-to-appliance backup replication over pinned SSH.</p><div id="message"></div><h2>This appliance</h2><pre id="local">Loading…</pre><h2>Authorize this appliance as a target</h2><button onclick="pairCode()">Generate one-time pairing code</button><pre id="paircode">The source will need this code and the TLS fingerprint shown above.</pre><h2>Add a target appliance</h2><div class="row"><label>IP or hostname<br><input id="host"></label><label>HTTPS port<br><input id="port" type="number" value="9443"></label></div><button onclick="discover()">Discover and verify fingerprint</button><pre id="discover"></pre><label>One-time code<br><input id="code"></label><button onclick="addPeer()">Pair target</button><h2>Replication policy</h2><div class="row"><label>Protected asset<br><select id="asset"></select></label><label>Target<br><select id="peer"></select></label><label>Interval (minutes)<br><input id="interval" type="number" value="60" min="5"></label></div><button onclick="saveRule()">Save policy</button> <button class="secondary" onclick="syncNow()">Sync configured assets now</button><h2>Status</h2><div id="status"></div><h2>Recent events</h2><pre id="events"></pre><script>
+def authenticate_local_admin(username: str, password: str) -> bool:
+    """Use the appliance's registered local administrator credential store."""
+    if (not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_-]{0,31}", username)
+            or not password or len(password.encode("utf-8")) > 4096):
+        return False
+    try:
+        result = run(
+            ["php", str(AUTH_HELPER_PATH), username],
+            check=False,
+            input_data=password.encode("utf-8"),
+            timeout=8,
+        )
+        authorized = result.returncode == 0
+        if not authorized:
+            time.sleep(0.25)
+        return authorized
+    except (PeerError, subprocess.TimeoutExpired):
+        time.sleep(0.25)
+        return False
+
+
+HTML = """<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Recovera Peer Replication</title><style>
+body{font-family:system-ui,sans-serif;background:#0d3d4e;color:#102b36;margin:0;padding:2rem}main{max-width:1050px;margin:auto;background:#fff;border-radius:6px;padding:2rem;box-shadow:0 8px 35px #062632aa}header{align-items:center;display:flex;gap:1rem;margin-bottom:1.5rem}header img{height:64px;width:64px;object-fit:contain}header h1{margin:0}header p{color:#5e7480;margin:.2rem 0 0}h2{border-bottom:1px solid #c9d8de;padding-bottom:.4rem}label{display:block;margin:.55rem 0}input,select,button{font:inherit;padding:.55rem;border:1px solid #9db4be;border-radius:4px}input,select{min-width:18rem}button{background:#078ed1;color:white;border:0;cursor:pointer}button.secondary{background:#5e7480}table{border-collapse:collapse;width:100%}th,td{text-align:left;padding:.55rem;border-bottom:1px solid #dde6ea}pre{background:#eff5f7;padding:1rem;overflow:auto}.error{color:#b51616}.ok{color:#08733b}.row{display:flex;gap:1rem;flex-wrap:wrap}</style></head><body><main><header><img src="/assets/recovera-logo.png" alt=""><div><h1>Recovera</h1><p>Peer Replication</p></div></header><p>Offline appliance-to-appliance backup replication over pinned SSH.</p><div id="message"></div><h2>This appliance</h2><pre id="local">Loading…</pre><h2>Authorize this appliance as a target</h2><button onclick="pairCode()">Generate one-time pairing code</button><pre id="paircode">The source will need this code and the TLS fingerprint shown above.</pre><h2>Add a target appliance</h2><div class="row"><label>IP or hostname<br><input id="host"></label><label>HTTPS port<br><input id="port" type="number" value="9443"></label></div><button onclick="discover()">Discover and verify fingerprint</button><pre id="discover"></pre><label>One-time code<br><input id="code"></label><button onclick="addPeer()">Pair target</button><h2>Replication policy</h2><div class="row"><label>Protected asset<br><select id="asset"></select></label><label>Target<br><select id="peer"></select></label><label>Interval (minutes)<br><input id="interval" type="number" value="60" min="5"></label></div><button onclick="saveRule()">Save policy</button> <button class="secondary" onclick="syncNow()">Sync configured assets now</button><h2>Status</h2><div id="status"></div><h2>Recent events</h2><pre id="events"></pre><script>
 let state=null,discovered=null;async function api(path,method='GET',body=null){let r=await fetch(path,{method,headers:{'Content-Type':'application/json'},body:body?JSON.stringify(body):null});let j=await r.json();if(!r.ok)throw Error(j.error||r.statusText);return j}function msg(text,ok=true){document.getElementById('message').innerHTML=`<p class="${ok?'ok':'error'}">${text}</p>`}async function load(){try{state=await api('/v1/admin/status');local.textContent=JSON.stringify({appliance:state.appliance,tls_fingerprint:state.tls_fingerprint},null,2);asset.innerHTML=state.local_assets.filter(x=>!x.replicated).map(x=>`<option value="${x.key}">${x.key} (${x.snapshots.length} points)</option>`).join('');peer.innerHTML=Object.entries(state.peers).map(([id,x])=>`<option value="${id}">${x.name} — ${x.host}</option>`).join('');status.innerHTML='<table><tr><th>Asset</th><th>Target</th><th>Last point</th><th>Result</th></tr>'+Object.entries(state.rules).map(([a,r])=>{let s=state.state.assets[`${r.peer_id}:${a}`]||{};return `<tr><td>${a}</td><td>${state.peers[r.peer_id]?.name||r.peer_id}</td><td>${s.last_snapshot||'—'}</td><td>${s.error||s.mode||'waiting'}</td></tr>`}).join('')+'</table>';events.textContent=JSON.stringify((state.state.events||[]).slice(-20).reverse(),null,2)}catch(e){msg(e.message,false)}}async function pairCode(){try{let x=await api('/v1/admin/pairing-code','POST',{});paircode.textContent=`Code: ${x.code}\nExpires: ${new Date(x.expires*1000).toLocaleString()}\nTLS fingerprint: ${state.tls_fingerprint}`}catch(e){msg(e.message,false)}}async function discover(){try{discovered=await api('/v1/admin/discover','POST',{host:host.value,port:Number(port.value)});document.getElementById('discover').textContent=JSON.stringify(discovered,null,2);msg('Compare this fingerprint with the target appliance before pairing.')}catch(e){msg(e.message,false)}}async function addPeer(){try{if(!discovered)throw Error('Discover the appliance first');await api('/v1/admin/peer','POST',{host:host.value,port:Number(port.value),code:code.value,fingerprint:discovered.observed_fingerprint,appliance_id:discovered.appliance_id});msg('Target paired.');await load()}catch(e){msg(e.message,false)}}async function saveRule(){try{await api('/v1/admin/rule','POST',{asset:asset.value,peer_id:peer.value,interval_minutes:Number(interval.value)});msg('Replication policy saved.');await load()}catch(e){msg(e.message,false)}}async function syncNow(){try{msg('Replication started…');let x=await api('/v1/admin/sync','POST',{});msg('Replication run complete: '+JSON.stringify(x));await load()}catch(e){msg(e.message,false)}}load();setInterval(load,30000);</script></main></body></html>"""
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
-    server_version = "BackOpsPeer/" + VERSION
+    server_version = "RecoveraPeer/" + VERSION
     def log_message(self, fmt: str, *args: Any) -> None:
         sys.stderr.write("peer-http: " + fmt % args + "\n")
     def reply(self, status: int, value: Any, content_type: str = "application/json") -> None:
-        raw = value.encode() if isinstance(value, str) else json.dumps(value).encode()
+        raw = value if isinstance(value, bytes) else (value.encode() if isinstance(value, str) else json.dumps(value).encode())
         self.send_response(status)
         for key, val in (("Content-Type", content_type), ("Content-Length", str(len(raw))),
                          ("Cache-Control", "no-store"), ("X-Content-Type-Options", "nosniff"),
@@ -784,17 +808,19 @@ class Handler(http.server.BaseHTTPRequestHandler):
             raise PeerError("request must be a JSON object")
         return value
     def admin(self) -> bool:
-        expected, header = ADMIN_TOKEN_PATH.read_text(encoding="ascii").strip(), self.headers.get("Authorization", "")
+        header = self.headers.get("Authorization", "")
         try:
-            kind, encoded = header.split(" ", 1); user, password = base64.b64decode(encoded).decode().split(":", 1)
+            kind, encoded = header.split(" ", 1)
+            user, password = base64.b64decode(encoded, validate=True).decode("utf-8").split(":", 1)
         except Exception:
             kind = user = password = ""
-        if kind.lower() == "basic" and user == "backops" and hmac.compare_digest(password, expected):
+        if kind.lower() == "basic" and authenticate_local_admin(user, password):
             return True
-        self.send_response(401); self.send_header("WWW-Authenticate", 'Basic realm="BackOps Peer Replication"'); self.send_header("Content-Length", "0"); self.end_headers(); return False
+        self.send_response(401); self.send_header("WWW-Authenticate", 'Basic realm="Recovera Peer Replication"'); self.send_header("Content-Length", "0"); self.end_headers(); return False
     def do_GET(self) -> None:
         try:
             if self.path == "/v1/info": self.reply(200, public_info())
+            elif self.path == "/assets/recovera-logo.png": self.reply(200, LOGO_PATH.read_bytes(), "image/png")
             elif self.path == "/" and self.admin(): self.reply(200, HTML, "text/html; charset=utf-8")
             elif self.path == "/v1/admin/status" and self.admin(): self.reply(200, status_document())
             elif self.path not in ("/", "/v1/admin/status"): self.reply(404, {"error": "not found"})
@@ -826,7 +852,7 @@ def serve() -> None:
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER); context.minimum_version = ssl.TLSVersion.TLSv1_2
     context.load_cert_chain(str(TLS_CERT_PATH), str(TLS_KEY_PATH))
     server.socket = context.wrap_socket(server.socket, server_side=True)
-    print(f"BackOps peer service listening on https://{cfg['listen']}:{cfg['port']}", flush=True)
+    print(f"Recovera peer service listening on https://{cfg['listen']}:{cfg['port']}", flush=True)
     server.serve_forever()
 
 
@@ -840,10 +866,10 @@ def sync_lock() -> Any:
 
 
 def parser() -> argparse.ArgumentParser:
-    result = argparse.ArgumentParser(description="Offline BackOps appliance replication")
+    result = argparse.ArgumentParser(description="Offline Recovera appliance replication")
     result.add_argument("--version", action="version", version=VERSION)
     sub = result.add_subparsers(dest="command", required=True)
-    sub.add_parser("init"); sub.add_parser("serve"); sub.add_parser("status"); sub.add_parser("admin-token")
+    sub.add_parser("init"); sub.add_parser("serve"); sub.add_parser("status")
     code = sub.add_parser("pairing-code"); code.add_argument("--minutes", type=int, default=15)
     discover = sub.add_parser("discover"); discover.add_argument("host"); discover.add_argument("--port", type=int, default=9443)
     add = sub.add_parser("peer-add"); add.add_argument("host"); add.add_argument("--port", type=int, default=9443); add.add_argument("--code", required=True); add.add_argument("--fingerprint"); add.add_argument("--yes", action="store_true")
@@ -863,7 +889,6 @@ def main() -> int:
         if args.command == "init": init()
         elif args.command == "serve": serve()
         elif args.command == "status": print(json.dumps(status_document(), indent=2))
-        elif args.command == "admin-token": require_root(); print(ADMIN_TOKEN_PATH.read_text(encoding="ascii").strip())
         elif args.command == "pairing-code": print(pairing_code(args.minutes)); print(f"TLS fingerprint: {local_tls_fingerprint()}")
         elif args.command == "discover":
             info, observed = ssl_json(args.host, args.port, "/v1/info"); print(json.dumps(info | {"observed_fingerprint": observed}, indent=2))

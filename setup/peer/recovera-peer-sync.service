@@ -1,0 +1,8 @@
+[Unit]
+Description=Run scheduled Recovera appliance replication
+After=network-online.target recovera-peer.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/recovera-peer sync --all
+UMask=0077

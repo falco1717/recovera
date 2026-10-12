@@ -1,5 +1,5 @@
 [Unit]
-Description=Check BackOps appliance replication schedules
+Description=Check Recovera appliance replication schedules
 
 [Timer]
 OnBootSec=5min

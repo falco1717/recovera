@@ -1,7 +1,8 @@
-spf-datto replica: single-script setup
-=======================================
+Recovera: single-script appliance setup
+========================================
 
-Turns a fresh Ubuntu 22.04 (jammy, amd64) VM into a replica of the Datto SIRIS spf-datto:
+Turns a fresh Ubuntu 22.04 (jammy, amd64) VM into a Recovera backup appliance using
+the retained SIRIS package stack:
 1,329 retained packages at spf-datto's exact versions, installed offline from debs/, plus
 the fixes required to run that application stack on a normal Ubuntu VM.
 The bundle excludes 22 source-appliance-only security, telemetry, debug, and legacy FIPS
@@ -28,10 +29,10 @@ AIR-GAPPED MODE
     NET_DNS="none"
 
   This makes provisioning, the local web UI, and the appliance's initial local registration and
-  administrator setup work without Internet access. The final registration action uses Datto's
+  administrator setup work without Internet access. The final registration action uses the
   native local registration service but satisfies its four observed registration-only cloud RPCs
   inside the process, then enables local administrator login instead of Partner Portal login.
-  Datto account enrollment, licensing, updates, and cloud services are not emulated.
+  Original-vendor account enrollment, licensing, updates, and cloud services are not emulated.
 
 RUN
   From the cloned repository:
@@ -50,23 +51,23 @@ RUN
 WHAT IT DOES (in order)
   p10  copies the bundle to /opt/spf-datto, checks SHA256SUMS, adds it as a local apt source
   p20  apt dry run; aborts on errors or if it would remove a protected package
-  p30  creates group remote-users and adds your user. Datto's sshd config, applied at every
+  p30  creates group remote-users and adds your user. The bundled sshd config, applied at every
        boot, has "AllowGroups remote-users"; without this you are locked out after the reboot.
   p40  installs all packages at exact versions inside a private network namespace; package
        service starts are suppressed until installation is complete
-  p45  applies spf-datto's copy of every package config file that differs (Datto's mirror ships
+  p45  applies the appliance copy of every package config file that differs (the source mirror ships
        rebuilt Ubuntu packages with the same version but different configs). This is what
-       makes Apache work: stock ports.conf "Listen 80/443" duplicates Datto's device.conf and
-       Apache fails to bind. Withheld: /root/* (Datto support root keys), telemetry/log-shipping
+       makes Apache work: stock ports.conf "Listen 80/443" duplicates the appliance device.conf and
+       Apache fails to bind. Withheld: /root/* (vendor support root keys), telemetry/log-shipping
        configuration, copied TLS keys, and watchdog.conf (hardware). A fresh per-VM TLS key and
        certificate are generated. sudoers/sshd/apache are validated, else rolled back.
-       Optional Datto cloud-client certificate authorization and its boot-time CA download are
+       Optional cloud-client certificate authorization and its boot-time CA download are
        removed so this replica can start without Internet. The first-run wizard's online-update
        pane and perpetual connectivity polling are removed, and a one-time same-origin finalizer
-       completes Datto's native local registration without contacting the cloud.
+       completes the native local registration without contacting the cloud.
   p50  GRUB: 6.8 generic kernel without fips=1, like spf-datto. The unused legacy FIPS kernel
        and its meta-packages are not included in the bundle.
-  p60  purges snapd + cloud-init (they make boot ordering cycles with Datto's units) and
+  p60  purges snapd + cloud-init (they make boot ordering cycles with appliance units) and
        restores the /usr/bin/snapctl link
   p70  requires a suitable blank disk, creates ZFS homePool with spf-datto's layout, and
        copies /home onto it. Limited troubleshooting installs can explicitly select auto/no.
@@ -87,8 +88,8 @@ AFTERWARDS
   The bundle in your home directory can be deleted; /opt/spf-datto keeps a copy.
 
 WEB UI
-  https://<VM IP>/  ->  "Control Panel - Register a Device" (the Datto UI of an unregistered
-  appliance). Apache listens once on 0.0.0.0:80 and 0.0.0.0:443; verify checks both.
+  https://<VM IP>/  ->  "Set Up Recovera" on an unregistered appliance. Apache listens once
+  on 0.0.0.0:80 and 0.0.0.0:443; verify checks both.
   It uses a fresh local TLS certificate/key generated for this VM; the source appliance's
   private key and certificate are removed while the payload is built.
   The page is locally accessible offline and starts at "Name the Device" without running the
@@ -98,8 +99,8 @@ WEB UI
   licensing remain outside this offline replica workflow.
 
 PEER REPLICATION
-  Open https://<VM IP>:9443/ and sign in with username "backops". Retrieve its unique
-  local password with: sudo backops-peer admin-token
+  Open https://<VM IP>:9443/ and sign in with the same local administrator username and
+  password created during device registration. No separate replication password is stored.
 
   On the target, generate a one-time pairing code. On the source, discover the target by
   IP, compare the displayed TLS fingerprint, enter the code, select a protected asset, and
@@ -110,9 +111,9 @@ PEER REPLICATION
   For separate sites, route the appliance IPs across a site-to-site VPN and allow TCP 22 and
   TCP 9443 between only those two addresses. No default route, DNS, or Internet is required.
 
-EXPECTED FAILED SERVICES (no IPMI hardware / no Datto cloud registration)
-  openipmi, datto-https-check, datto-speedsync-cache-update, datto-system-speedsync-check,
-  datto-update-assets
+EXPECTED FAILED SERVICES (no IPMI hardware / no vendor cloud registration)
+  openipmi, datto-https-check, datto-send-volumes-to-portal, datto-speedsync-cache-update,
+  datto-system-speedsync-check, datto-update-assets, datto-upgrade-channel-get
 
 SENSITIVE
   Some .debs were rebuilt from spf-datto's installed files (dpkg-repack). The builder removes
