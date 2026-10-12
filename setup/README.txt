@@ -72,6 +72,8 @@ WHAT IT DOES (in order)
        copies /home onto it. Limited troubleshooting installs can explicitly select auto/no.
   p75  verifies /dev/kvm and runs the libguestfs disk-inspection self-test used by
        agentless VM protection; this catches missing nested virtualization before registration
+  p78  installs the offline peer-replication service, restricted SSH receiver, management UI,
+       and five-minute scheduler. Pairing and snapshot transport never use a cloud endpoint.
   p80  NetworkManager bridge br0 (port = your NIC, zone datto). With a gateway configured it
        checks that the gateway answers; without one it checks the bridge address. It reverts to
        netplan automatically if the check fails. Then networkd is disabled.
@@ -94,6 +96,19 @@ WEB UI
   registration marker can all complete without Internet. The resulting login page accepts the
   local administrator rather than requiring a Partner Portal account. Cloud enrollment and
   licensing remain outside this offline replica workflow.
+
+PEER REPLICATION
+  Open https://<VM IP>:9443/ and sign in with username "backops". Retrieve its unique
+  local password with: sudo backops-peer admin-token
+
+  On the target, generate a one-time pairing code. On the source, discover the target by
+  IP, compare the displayed TLS fingerprint, enter the code, select a protected asset, and
+  save its schedule. The first transfer is a full ZFS stream; later transfers are incremental
+  and interrupted receives are resumable. Data transport uses a pinned SSH host key and a
+  forced-command account that cannot request a shell, forwarding, or arbitrary dataset paths.
+
+  For separate sites, route the appliance IPs across a site-to-site VPN and allow TCP 22 and
+  TCP 9443 between only those two addresses. No default route, DNS, or Internet is required.
 
 EXPECTED FAILED SERVICES (no IPMI hardware / no Datto cloud registration)
   openipmi, datto-https-check, datto-speedsync-cache-update, datto-system-speedsync-check,

@@ -11,6 +11,7 @@
 #                              local apt source; installs nothing)
 #   sudo ./setup.sh status     show progress / follow the log of a running setup
 #   sudo ./setup.sh verify     health check of a finished replica
+#   sudo ./setup.sh install-peer install/update only the peer-replication service
 #
 # Resumable: finished phases are recorded in /var/lib/spf-datto-setup; just run it again.
 set -uo pipefail
@@ -95,6 +96,7 @@ load_conf() {
   : "${NET_CONFIGURE:=yes}" "${NET_IP:=current}" "${NET_GATEWAY:=}" "${NET_DNS:=}" "${NET_IFACE:=}"
   : "${REQUIRE_KVM:=yes}" "${MIN_RAM_GB:=8}"
   : "${ZFS_CONFIGURE:=yes}" "${ZFS_DISK:=auto}" "${ZFS_MIN_GB:=20}" "${ZFS_POOL:=homePool}" "${ZFS_MOVE_HOME:=yes}"
+  : "${PEER_REPLICATION:=yes}" "${PEER_PORT:=9443}"
   : "${FIPS_OFF:=yes}" "${REMOVE_SNAPD:=yes}" "${REMOVE_CLOUD_INIT:=yes}" "${APT_FREEZE:=yes}" "${OFFLINE_MODE:=yes}" "${AUTO_REBOOT:=yes}"
   LOGIN_USER="${LOGIN_USER:-${SUDO_USER:-}}"
   [ -n "$LOGIN_USER" ] || LOGIN_USER="$(getent passwd 1000 | cut -d: -f1)"
@@ -105,6 +107,11 @@ validate_conf() {
   case "$REQUIRE_KVM" in yes|no) ;; *) die "REQUIRE_KVM must be yes or no" ;; esac
   [[ "$MIN_RAM_GB" =~ ^[1-9][0-9]*$ ]] || die "MIN_RAM_GB must be a positive integer"
   case "$ZFS_CONFIGURE" in yes|no|auto) ;; *) die "ZFS_CONFIGURE must be yes, no, or auto" ;; esac
+  case "$PEER_REPLICATION" in yes|no) ;; *) die "PEER_REPLICATION must be yes or no" ;; esac
+  [[ "$PEER_PORT" =~ ^[0-9]+$ ]] && [ "$PEER_PORT" -ge 1024 ] && [ "$PEER_PORT" -le 65535 ] || \
+    die "PEER_PORT must be an unprivileged TCP port from 1024 through 65535"
+  [ "$PEER_REPLICATION" != yes ] || [ "$ZFS_CONFIGURE" != no ] || \
+    die "PEER_REPLICATION=yes requires ZFS_CONFIGURE=yes or auto"
   if [ "$OFFLINE_MODE" = yes ]; then
     [ "$APT_FREEZE" = yes ] || die "OFFLINE_MODE=yes requires APT_FREEZE=yes"
     command -v systemd-run >/dev/null 2>&1 || command -v unshare >/dev/null 2>&1 || \
@@ -871,6 +878,69 @@ p75_protection_engine() {
   log "libguestfs/KVM disk-inspection engine passed"
 }
 
+p78_peer_replication() {
+  [ "$PEER_REPLICATION" = yes ] || { log "peer replication disabled in setup.conf"; return 0; }
+  [ -f "$INSTALL_DIR/peer/backops-peer" ] || { log "peer replication payload is missing"; return 1; }
+  zpool list -H "$ZFS_POOL" >/dev/null 2>&1 || {
+    warn "peer replication needs ZFS pool $ZFS_POOL; attach storage and re-run setup"
+    return 2
+  }
+
+  getent group remote-users >/dev/null || groupadd --system remote-users
+  if ! id backops-repl >/dev/null 2>&1; then
+    useradd --system --create-home --home-dir /var/lib/backops-peer --shell /bin/bash backops-repl || return 1
+  fi
+  usermod -aG remote-users backops-repl || return 1
+  passwd -l backops-repl >/dev/null 2>&1 || true
+
+  install -m 0755 "$INSTALL_DIR/peer/backops-peer" /usr/local/sbin/backops-peer
+  install -m 0644 "$INSTALL_DIR/peer/backops-peer.service" /etc/systemd/system/backops-peer.service
+  install -m 0644 "$INSTALL_DIR/peer/backops-peer-sync.service" /etc/systemd/system/backops-peer-sync.service
+  install -m 0644 "$INSTALL_DIR/peer/backops-peer-sync.timer" /etc/systemd/system/backops-peer-sync.timer
+  install -m 0644 "$INSTALL_DIR/peer/sshd-backops-peer.conf" /etc/ssh/sshd_config.d/91-backops-peer.conf
+  install -m 0440 "$INSTALL_DIR/peer/sudoers-backops-peer" /etc/sudoers.d/backops-peer
+
+  visudo -cf /etc/sudoers.d/backops-peer >/dev/null || return 1
+  local sshd_active sshd_backup
+  sshd_active=$(readlink -f /etc/ssh/sshd_config)
+  sshd_backup="$BACKUP_DIR/$(basename "$sshd_active").before-backops-peer"
+  if ! grep -qF 'Include /etc/ssh/sshd_config.d/*.conf' "$sshd_active"; then
+    mkdir -p "$BACKUP_DIR"
+    cp -a "$sshd_active" "$sshd_backup" || return 1
+    if grep -q '^Match ' "$sshd_active"; then
+      sed -i '0,/^Match /s|^Match |Include /etc/ssh/sshd_config.d/*.conf\nMatch |' "$sshd_active"
+    else
+      printf '\nInclude /etc/ssh/sshd_config.d/*.conf\n' >> "$sshd_active"
+    fi
+  fi
+  if ! sshd -t; then
+    [ -f "$sshd_backup" ] && cp -a "$sshd_backup" "$sshd_active"
+    log "peer SSH configuration failed validation and was rolled back"
+    return 1
+  fi
+  /usr/local/sbin/backops-peer init || return 1
+  python3 - <<PY || return 1
+import json
+from pathlib import Path
+p = Path('/etc/backops-peer/config.json')
+c = json.loads(p.read_text())
+c['port'] = int('$PEER_PORT')
+c['pool'] = '$ZFS_POOL'
+c['source_root'] = '$ZFS_POOL/home/agents'
+p.write_text(json.dumps(c, indent=2, sort_keys=True) + '\n')
+p.chmod(0o600)
+PY
+
+  if systemctl is-active --quiet firewalld && firewall-cmd --get-zones 2>/dev/null | grep -qw datto; then
+    firewall-cmd --permanent --zone=datto --add-port="${PEER_PORT}/tcp" >/dev/null || return 1
+    firewall-cmd --reload >/dev/null || return 1
+  fi
+  systemctl daemon-reload
+  systemctl restart ssh.service || return 1
+  systemctl enable --now backops-peer.service backops-peer-sync.timer >/dev/null || return 1
+  log "peer replication: https://$(hostname -I | awk '{print $1}'):$PEER_PORT/ (user backops; token: sudo backops-peer admin-token)"
+}
+
 net_revert() {
   rm -f /etc/NetworkManager/system-connections/br0.nmconnection \
         "/etc/NetworkManager/system-connections/$1.nmconnection"
@@ -1055,6 +1125,13 @@ verify() {
   if [ "$NET_CONFIGURE" = yes ]; then
     check "br0 managed by NetworkManager: $(ip -4 -o addr show dev br0 2>/dev/null | awk '{print $4}')" "nmcli -t -f DEVICE,STATE dev | grep -q '^br0:connected'"
   fi
+  if [ "$PEER_REPLICATION" = yes ]; then
+    local peer_code
+    peer_code=$(curl -sk -o /dev/null -w '%{http_code}' --max-time 10 "https://127.0.0.1:${PEER_PORT}/v1/info" 2>/dev/null)
+    check "peer replication service active"                 "systemctl is-active backops-peer.service"
+    check "peer scheduler enabled"                          "systemctl is-enabled backops-peer-sync.timer"
+    check "peer API https://127.0.0.1:${PEER_PORT}/ answers (HTTP $peer_code)" "[ '$peer_code' = 200 ]"
+  fi
   # Apache / Datto web UI
   local dup ip code
   dup=$(grep -rhoE '^\s*Listen\s+\S+' /etc/apache2/ports.conf /etc/apache2/sites-enabled/ /etc/apache2/conf-enabled/ 2>/dev/null \
@@ -1099,6 +1176,7 @@ run_all() {
   phase p60 "remove snapd + cloud-init, restore snapctl"      p60_cleanup
   phase p70 "ZFS $ZFS_POOL"                                   p70_zfs
   phase p75 "libguestfs/KVM protection engine"                 p75_protection_engine
+  phase p78 "offline appliance-to-appliance replication"       p78_peer_replication
   phase p80 "NetworkManager bridge br0"                       p80_network
   phase p85 "apt sources"                                     p85_apt
   log "== p90: post-boot verification timer (re-armed every run)"
@@ -1154,5 +1232,9 @@ case "$MODE" in
     [ "$(id -u)" -eq 0 ] || { echo "run with sudo"; exit 1; }
     install_offline_registration_finalizer
     echo "offline registration finalizer repaired" ;;
+  install-peer)
+    [ "$(id -u)" -eq 0 ] || { echo "run with sudo"; exit 1; }
+    load_conf; validate_conf; p78_peer_replication
+    echo "peer replication service installed" ;;
   *) sed -n '2,15p' "$SELF"; exit 1 ;;
 esac

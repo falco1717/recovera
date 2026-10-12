@@ -1,0 +1,893 @@
+#!/usr/bin/env python3
+"""BackOps appliance-to-appliance snapshot replication.
+
+Uses only Python's standard library and the OpenSSH/ZFS tools already present
+on an appliance. No cloud endpoint is contacted.
+"""
+from __future__ import annotations
+
+import argparse
+import base64
+import contextlib
+import fcntl
+import hashlib
+import hmac
+import http.client
+import http.server
+import json
+import os
+import re
+import secrets
+import shlex
+import socket
+import ssl
+import subprocess
+import sys
+import tempfile
+import time
+import uuid
+from pathlib import Path
+from typing import Any, BinaryIO
+
+VERSION = "0.1.0"
+ETC = Path(os.environ.get("BACKOPS_PEER_ETC", "/etc/backops-peer"))
+STATE_DIR = Path(os.environ.get("BACKOPS_PEER_STATE", "/var/lib/backops-peer"))
+CONFIG_PATH = ETC / "config.json"
+STATE_PATH = STATE_DIR / "state.json"
+PAIRING_PATH = STATE_DIR / "pairing.json"
+ADMIN_TOKEN_PATH = ETC / "admin.token"
+TLS_CERT_PATH = ETC / "tls.crt"
+TLS_KEY_PATH = ETC / "tls.key"
+SSH_KEY_PATH = ETC / "id_ed25519"
+KNOWN_HOSTS_PATH = ETC / "known_hosts"
+KEYS_DIR = Path(os.environ.get("BACKOPS_PEER_KEYS", "/datto/config/keys"))
+LOCK_PATH = Path(os.environ.get("BACKOPS_PEER_LOCK", "/run/backops-peer-sync.lock"))
+AUTHORIZED_KEYS_PATH = Path(os.environ.get(
+    "BACKOPS_PEER_AUTHORIZED_KEYS", "/var/lib/backops-peer/.ssh/authorized_keys"
+))
+
+ASSET_RE = re.compile(r"^[0-9a-fA-F]{32}$")
+SNAPSHOT_RE = re.compile(r"^[0-9]{1,20}$")
+ID_RE = re.compile(r"^[0-9a-fA-F-]{8,64}$")
+HOST_RE = re.compile(r"^[A-Za-z0-9._:-]+$")
+METADATA_SUFFIXES = (
+    "agentInfo", "dateAdded", "diskDrives", "include",
+    "integrityCheckEnabled", "osType", "recoveryPointHistory",
+    "recoveryPoints", "recoveryPointsMeta", "screenshotVerification",
+)
+MAX_METADATA_BYTES = 512 * 1024
+
+
+class PeerError(RuntimeError):
+    pass
+
+
+def run(argv: list[str], *, check: bool = True, input_data: bytes | None = None,
+        timeout: int | None = None) -> subprocess.CompletedProcess[bytes]:
+    try:
+        return subprocess.run(argv, input=input_data, stdout=subprocess.PIPE,
+                              stderr=subprocess.PIPE, check=check, timeout=timeout)
+    except FileNotFoundError as exc:
+        raise PeerError(f"required command is missing: {argv[0]}") from exc
+    except subprocess.CalledProcessError as exc:
+        detail = exc.stderr.decode(errors="replace").strip()
+        raise PeerError(f"{' '.join(argv)} failed: {detail or exc.returncode}") from exc
+
+
+def atomic_json(path: Path, value: Any, mode: int = 0o600) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=f".{path.name}.", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(value, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(tmp, mode)
+        os.replace(tmp, path)
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(tmp)
+
+
+def load_json(path: Path, default: Any) -> Any:
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            return json.load(handle)
+    except FileNotFoundError:
+        return default
+    except json.JSONDecodeError as exc:
+        raise PeerError(f"invalid JSON in {path}: {exc}") from exc
+
+
+def require_root() -> None:
+    if os.geteuid() != 0:
+        raise PeerError("run this command with sudo")
+
+
+def default_config() -> dict[str, Any]:
+    appliance_id = str(uuid.uuid4())
+    numeric_id = 1_000_000_000 + (int(uuid.UUID(appliance_id)) % 8_000_000_000)
+    return {
+        "schema": 1, "version": VERSION, "appliance_id": appliance_id,
+        "numeric_id": numeric_id, "name": socket.gethostname(),
+        "listen": "0.0.0.0", "port": 9443, "ssh_port": 22,
+        "pool": "homePool", "source_root": "homePool/home/agents",
+        "peers": {}, "sources": {}, "assets": {},
+    }
+
+
+def config() -> dict[str, Any]:
+    cfg = load_json(CONFIG_PATH, None)
+    if not cfg:
+        raise PeerError("not initialized; run: sudo backops-peer init")
+    return cfg
+
+
+def state() -> dict[str, Any]:
+    return load_json(STATE_PATH, {"assets": {}, "events": []})
+
+
+def save_config(cfg: dict[str, Any]) -> None:
+    atomic_json(CONFIG_PATH, cfg)
+
+
+def save_state(value: dict[str, Any]) -> None:
+    value["events"] = value.get("events", [])[-200:]
+    atomic_json(STATE_PATH, value)
+
+
+def event(kind: str, message: str, **fields: Any) -> None:
+    value = state()
+    value.setdefault("events", []).append(
+        {"time": int(time.time()), "kind": kind, "message": message, **fields}
+    )
+    save_state(value)
+
+
+def fingerprint_der(cert_der: bytes) -> str:
+    digest = hashlib.sha256(cert_der).hexdigest().upper()
+    return "SHA256:" + ":".join(digest[i:i + 2] for i in range(0, len(digest), 2))
+
+
+def local_tls_fingerprint() -> str:
+    pem = TLS_CERT_PATH.read_text(encoding="ascii")
+    return fingerprint_der(ssl.PEM_cert_to_DER_cert(pem))
+
+
+def ssh_public_key() -> str:
+    return SSH_KEY_PATH.with_suffix(".pub").read_text(encoding="ascii").strip()
+
+
+def ssh_host_keys() -> list[str]:
+    keys: list[str] = []
+    for path in sorted(Path("/etc/ssh").glob("ssh_host_*_key.pub")):
+        parts = path.read_text(encoding="ascii").strip().split()
+        if len(parts) >= 2:
+            keys.append(f"{parts[0]} {parts[1]}")
+    return keys
+
+
+def init() -> None:
+    require_root()
+    ETC.mkdir(mode=0o700, parents=True, exist_ok=True)
+    STATE_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if not CONFIG_PATH.exists():
+        save_config(default_config())
+    if not STATE_PATH.exists():
+        save_state({"assets": {}, "events": []})
+    if not ADMIN_TOKEN_PATH.exists():
+        ADMIN_TOKEN_PATH.write_text(secrets.token_urlsafe(32) + "\n", encoding="ascii")
+        os.chmod(ADMIN_TOKEN_PATH, 0o600)
+    if not SSH_KEY_PATH.exists():
+        run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C",
+             f"backops-peer@{socket.gethostname()}", "-f", str(SSH_KEY_PATH)])
+    if not TLS_CERT_PATH.exists() or not TLS_KEY_PATH.exists():
+        run(["openssl", "req", "-x509", "-newkey", "rsa:3072", "-sha256",
+             "-nodes", "-days", "3650", "-subj",
+             f"/CN={socket.gethostname()}/O=BackOps Peer Replication",
+             "-keyout", str(TLS_KEY_PATH), "-out", str(TLS_CERT_PATH)])
+        os.chmod(TLS_KEY_PATH, 0o600)
+        os.chmod(TLS_CERT_PATH, 0o644)
+    KNOWN_HOSTS_PATH.touch(mode=0o600, exist_ok=True)
+    print(f"BackOps peer replication initialized ({config()['appliance_id']})")
+    print(f"TLS fingerprint: {local_tls_fingerprint()}")
+
+
+def validate_asset(asset: str) -> str:
+    if not ASSET_RE.fullmatch(asset):
+        raise PeerError("asset key must be exactly 32 hexadecimal characters")
+    return asset.lower()
+
+
+def validate_snapshot(snapshot: str) -> str:
+    if not SNAPSHOT_RE.fullmatch(snapshot):
+        raise PeerError("snapshot name must be a numeric recovery-point epoch")
+    return snapshot
+
+
+def dataset_for(cfg: dict[str, Any], asset: str) -> str:
+    return f"{cfg['source_root'].rstrip('/')}/{validate_asset(asset)}"
+
+
+def zfs_exists(name: str) -> bool:
+    return run(["zfs", "list", "-H", "-o", "name", name], check=False).returncode == 0
+
+
+def zfs_snapshots(dataset: str) -> list[str]:
+    result = run(["zfs", "list", "-H", "-t", "snapshot", "-o", "name",
+                  "-s", "creation", "-r", dataset], check=False)
+    if result.returncode != 0:
+        return []
+    values, prefix = [], dataset + "@"
+    for line in result.stdout.decode().splitlines():
+        if line.startswith(prefix) and SNAPSHOT_RE.fullmatch(line[len(prefix):]):
+            values.append(line[len(prefix):])
+    return values
+
+
+def load_origin(asset: str) -> dict[str, Any]:
+    return load_json(KEYS_DIR / f"{asset}.originDevice", {})
+
+
+def assets_local(cfg: dict[str, Any]) -> list[dict[str, Any]]:
+    root = cfg["source_root"].rstrip("/")
+    result = run(["zfs", "list", "-H", "-t", "filesystem", "-o", "name", "-r", root], check=False)
+    found: list[dict[str, Any]] = []
+    if result.returncode != 0:
+        return found
+    for line in result.stdout.decode().splitlines()[1:]:
+        key = line.rsplit("/", 1)[-1]
+        if ASSET_RE.fullmatch(key):
+            origin = load_origin(key)
+            found.append({"key": key.lower(), "dataset": line,
+                          "snapshots": zfs_snapshots(line),
+                          "replicated": bool(origin.get("isReplicated")), "origin": origin})
+    return found
+
+
+def collect_metadata(asset: str, cfg: dict[str, Any]) -> dict[str, Any]:
+    files: dict[str, str] = {}
+    total = 0
+    for suffix in METADATA_SUFFIXES:
+        path = KEYS_DIR / f"{asset}.{suffix}"
+        if not path.is_file():
+            continue
+        data = path.read_bytes()
+        total += len(data)
+        if total > MAX_METADATA_BYTES:
+            raise PeerError(f"metadata for {asset} exceeds {MAX_METADATA_BYTES} bytes")
+        files[suffix] = base64.b64encode(data).decode("ascii")
+    return {"schema": 1, "asset": asset, "source_id": cfg["appliance_id"],
+            "source_numeric_id": cfg["numeric_id"], "source_name": cfg["name"],
+            "source_public_key": ssh_public_key(), "files": files}
+
+
+def install_metadata(asset: str, metadata: dict[str, Any]) -> None:
+    if metadata.get("asset") != asset:
+        raise PeerError("metadata asset does not match the receive request")
+    files = metadata.get("files")
+    if not isinstance(files, dict):
+        raise PeerError("metadata files are missing")
+    KEYS_DIR.mkdir(parents=True, exist_ok=True)
+    for suffix, encoded in files.items():
+        if suffix not in METADATA_SUFFIXES or not isinstance(encoded, str):
+            raise PeerError(f"unapproved metadata key: {suffix}")
+        data = base64.b64decode(encoded, validate=True)
+        if len(data) > MAX_METADATA_BYTES:
+            raise PeerError("individual metadata file is too large")
+        target = KEYS_DIR / f"{asset}.{suffix}"
+        fd, tmp = tempfile.mkstemp(prefix=f".{target.name}.", dir=str(KEYS_DIR))
+        try:
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(data)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.chmod(tmp, 0o640)
+            os.replace(tmp, target)
+        finally:
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(tmp)
+    origin = {"deviceId": int(metadata["source_numeric_id"]), "resellerId": None,
+              "isReplicated": True, "isOrphaned": False,
+              "sourceApplianceId": metadata["source_id"],
+              "sourceApplianceName": metadata["source_name"]}
+    atomic_json(KEYS_DIR / f"{asset}.originDevice", origin, 0o640)
+
+
+def pairing_code(minutes: int) -> str:
+    require_root()
+    if minutes < 1 or minutes > 60:
+        raise PeerError("pairing-code lifetime must be between 1 and 60 minutes")
+    raw = base64.b32encode(secrets.token_bytes(10)).decode("ascii").rstrip("=")
+    code = "-".join(raw[i:i + 4] for i in range(0, len(raw), 4))
+    salt = secrets.token_bytes(16)
+    digest = hashlib.scrypt(code.encode(), salt=salt, n=2**14, r=8, p=1)
+    atomic_json(PAIRING_PATH, {"salt": base64.b64encode(salt).decode(),
+                               "digest": base64.b64encode(digest).decode(),
+                               "expires": int(time.time()) + minutes * 60})
+    return code
+
+
+def consume_pairing_code(code: str) -> None:
+    record = load_json(PAIRING_PATH, None)
+    if not record or int(record.get("expires", 0)) < time.time():
+        raise PeerError("pairing code is missing or expired")
+    salt, expected = base64.b64decode(record["salt"]), base64.b64decode(record["digest"])
+    actual = hashlib.scrypt(code.upper().encode(), salt=salt, n=2**14, r=8, p=1)
+    if not hmac.compare_digest(actual, expected):
+        raise PeerError("pairing code is invalid")
+    PAIRING_PATH.unlink(missing_ok=True)
+
+
+def ssl_json(host: str, port: int, path: str, payload: dict[str, Any] | None = None,
+             expected_fingerprint: str | None = None) -> tuple[dict[str, Any], str]:
+    if not HOST_RE.fullmatch(host):
+        raise PeerError("peer host contains invalid characters")
+    if not 1 <= port <= 65535:
+        raise PeerError("peer port must be between 1 and 65535")
+    context = ssl.create_default_context()
+    context.check_hostname = False
+    context.verify_mode = ssl.CERT_NONE
+    data = None if payload is None else json.dumps(payload).encode()
+    connection = http.client.HTTPSConnection(host, port, timeout=15, context=context)
+    try:
+        connection.connect()
+        if connection.sock is None:
+            raise PeerError("peer closed the TLS connection before identification")
+        cert = connection.sock.getpeercert(binary_form=True)
+        fingerprint = fingerprint_der(cert)
+        if expected_fingerprint and fingerprint != expected_fingerprint.upper():
+            raise PeerError(
+                f"peer TLS fingerprint changed: expected {expected_fingerprint}, got {fingerprint}"
+            )
+        connection.request("GET" if data is None else "POST", path, body=data,
+                           headers={"Content-Type": "application/json", "Accept": "application/json"})
+        response = connection.getresponse()
+        raw = response.read()
+        body = json.loads(raw.decode())
+        if not isinstance(body, dict):
+            raise PeerError("peer response is not a JSON object")
+        if response.status >= 400:
+            raise PeerError(str(body.get("error", f"HTTP {response.status}")))
+    except (TimeoutError, OSError, http.client.HTTPException, json.JSONDecodeError) as exc:
+        raise PeerError(f"could not contact peer {host}:{port}: {exc}") from exc
+    finally:
+        connection.close()
+    if body.get("error"):
+        raise PeerError(str(body["error"]))
+    return body, fingerprint
+
+
+def public_info() -> dict[str, Any]:
+    cfg = config()
+    result = run(["zpool", "list", "-Hp", "-o", "size,alloc,free,health", cfg["pool"]], check=False)
+    storage: dict[str, Any] = {"available": False}
+    if result.returncode == 0:
+        size, allocated, free, health = result.stdout.decode().strip().split("\t")
+        storage = {"available": True, "size": int(size), "allocated": int(allocated),
+                   "free": int(free), "health": health}
+    return {"service": "backops-peer", "version": VERSION,
+            "appliance_id": cfg["appliance_id"], "numeric_id": cfg["numeric_id"],
+            "name": cfg["name"], "ssh_port": cfg["ssh_port"],
+            "tls_fingerprint": local_tls_fingerprint(), "ssh_host_keys": ssh_host_keys(),
+            "storage": storage}
+
+
+def authorized_keys_path() -> Path:
+    return AUTHORIZED_KEYS_PATH
+
+
+def authorize_source(source_id: str, name: str, public_key: str, address: str) -> None:
+    if not ID_RE.fullmatch(source_id):
+        raise PeerError("source appliance ID is invalid")
+    parts = public_key.strip().split()
+    if len(parts) < 2 or parts[0] != "ssh-ed25519" or not re.fullmatch(r"[A-Za-z0-9+/=]+", parts[1]):
+        raise PeerError("source replication key is not a valid Ed25519 public key")
+    path = authorized_keys_path()
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    existing = path.read_text(encoding="ascii").splitlines() if path.exists() else []
+    marker = f"backops-source={source_id}"
+    existing = [line for line in existing if marker not in line]
+    forced = f"/usr/bin/sudo -n /usr/local/sbin/backops-peer ssh-entry {source_id}"
+    existing.append(f'restrict,command="{forced}" {parts[0]} {parts[1]} {marker}')
+    path.write_text("\n".join(existing) + "\n", encoding="ascii")
+    os.chmod(path, 0o600)
+    with contextlib.suppress(KeyError):
+        import pwd
+        account = pwd.getpwnam("backops-repl")
+        os.chown(path.parent, account.pw_uid, account.pw_gid)
+        os.chown(path, account.pw_uid, account.pw_gid)
+    cfg = config()
+    cfg.setdefault("sources", {})[source_id] = {
+        "name": name[:128], "address": address, "paired_at": int(time.time()),
+        "public_key_fingerprint": hashlib.sha256(parts[1].encode()).hexdigest()}
+    save_config(cfg)
+    event("paired-source", f"Paired source {name}", source_id=source_id, address=address)
+
+
+def pair_accept(payload: dict[str, Any], address: str) -> dict[str, Any]:
+    required = ("code", "source_id", "source_name", "source_public_key")
+    if any(not isinstance(payload.get(key), str) for key in required):
+        raise PeerError("pairing request is incomplete")
+    if not ID_RE.fullmatch(payload["source_id"]):
+        raise PeerError("source appliance ID is invalid")
+    if payload["source_id"] == config()["appliance_id"]:
+        raise PeerError("an appliance cannot replicate to itself")
+    consume_pairing_code(payload["code"])
+    authorize_source(payload["source_id"], payload["source_name"], payload["source_public_key"], address)
+    return public_info()
+
+
+def known_host_lines(host: str, port: int, keys: list[str]) -> list[str]:
+    prefix = host if port == 22 else f"[{host}]:{port}"
+    lines = []
+    for key in keys:
+        parts = key.split()
+        if ("\n" in key or "\r" in key or len(parts) < 2 or not re.fullmatch(
+                r"(?:ssh-ed25519|ssh-rsa|rsa-sha2-[0-9]+|ecdsa-sha2-nistp[0-9]+)", parts[0])
+                or not re.fullmatch(r"[A-Za-z0-9+/=]+", parts[1])):
+            raise PeerError("target returned an invalid SSH host key")
+        lines.append(f"{prefix} {parts[0]} {parts[1]}")
+    return lines
+
+
+def peer_add(host: str, port: int, code: str, fingerprint: str,
+             discovered: dict[str, Any] | None = None) -> dict[str, Any]:
+    cfg = config()
+    info, actual = ssl_json(host, port, "/v1/info", expected_fingerprint=fingerprint)
+    if discovered and info.get("appliance_id") != discovered.get("appliance_id"):
+        raise PeerError("peer identity changed between discovery and pairing")
+    response, _ = ssl_json(host, port, "/v1/pair", {
+        "code": code.upper(), "source_id": cfg["appliance_id"],
+        "source_name": cfg["name"], "source_public_key": ssh_public_key(),
+    }, expected_fingerprint=actual)
+    if response.get("appliance_id") != info.get("appliance_id"):
+        raise PeerError("pairing response came from a different appliance")
+    peer_id = str(response["appliance_id"])
+    if not ID_RE.fullmatch(peer_id):
+        raise PeerError("target appliance ID is invalid")
+    if peer_id == cfg["appliance_id"]:
+        raise PeerError("an appliance cannot replicate to itself")
+    keys = response.get("ssh_host_keys") or []
+    if not keys:
+        raise PeerError("target did not provide SSH host keys")
+    ssh_port = int(response.get("ssh_port", 22))
+    if not 1 <= ssh_port <= 65535:
+        raise PeerError("target SSH port is invalid")
+    old = KNOWN_HOSTS_PATH.read_text(encoding="ascii").splitlines() if KNOWN_HOSTS_PATH.exists() else []
+    prefixes = {host, f"[{host}]:{ssh_port}"}
+    old = [line for line in old if not any(line.startswith(p + " ") for p in prefixes)]
+    old.extend(known_host_lines(host, ssh_port, keys))
+    KNOWN_HOSTS_PATH.write_text("\n".join(old) + "\n", encoding="ascii")
+    os.chmod(KNOWN_HOSTS_PATH, 0o600)
+    cfg.setdefault("peers", {})[peer_id] = {
+        "name": response.get("name", host), "host": host, "port": port,
+        "ssh_port": ssh_port, "tls_fingerprint": actual,
+        "paired_at": int(time.time()), "enabled": True}
+    save_config(cfg)
+    event("paired-target", f"Paired target {response.get('name', host)}", peer_id=peer_id)
+    return cfg["peers"][peer_id] | {"id": peer_id}
+
+
+def ssh_base(peer: dict[str, Any]) -> list[str]:
+    return ["ssh", "-T", "-i", str(SSH_KEY_PATH), "-p", str(peer["ssh_port"]),
+            "-o", "BatchMode=yes", "-o", "IdentitiesOnly=yes",
+            "-o", "StrictHostKeyChecking=yes", "-o", f"UserKnownHostsFile={KNOWN_HOSTS_PATH}",
+            "-o", "ConnectTimeout=15", f"backops-repl@{peer['host']}"]
+
+
+def remote_json(peer: dict[str, Any], command: list[str]) -> dict[str, Any]:
+    result = run(ssh_base(peer) + [shlex.join(command)], timeout=30)
+    try:
+        return json.loads(result.stdout.decode())
+    except json.JSONDecodeError as exc:
+        raise PeerError(f"target returned an invalid response: {result.stdout.decode(errors='replace')}") from exc
+
+
+def encode_metadata(metadata: dict[str, Any]) -> str:
+    raw = json.dumps(metadata, separators=(",", ":")).encode()
+    if len(raw) > MAX_METADATA_BYTES * 2:
+        raise PeerError("encoded metadata is too large")
+    return base64.urlsafe_b64encode(raw).decode()
+
+
+def transfer_stream(send_command: list[str], peer: dict[str, Any], remote_command: list[str]) -> None:
+    sender = subprocess.Popen(send_command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    assert sender.stdout is not None
+    receiver = subprocess.Popen(ssh_base(peer) + [shlex.join(remote_command)], stdin=sender.stdout,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    sender.stdout.close()
+    recv_out, recv_err = receiver.communicate()
+    send_err = sender.stderr.read() if sender.stderr else b""
+    send_rc = sender.wait()
+    if send_rc != 0 or receiver.returncode != 0:
+        details = (send_err + b"\n" + recv_err + b"\n" + recv_out).decode(errors="replace").strip()
+        raise PeerError(f"snapshot transfer failed: {details}")
+    try:
+        answer = json.loads(recv_out.decode())
+    except json.JSONDecodeError as exc:
+        raise PeerError(f"target did not confirm the transfer: {recv_out.decode(errors='replace')}") from exc
+    if not answer.get("ok"):
+        raise PeerError(str(answer.get("error", "target rejected the transfer")))
+
+
+def replicate(asset: str, peer_id: str, snapshot: str | None = None) -> dict[str, Any]:
+    require_root()
+    cfg = config()
+    asset = validate_asset(asset)
+    peer = cfg.get("peers", {}).get(peer_id)
+    if not peer or not peer.get("enabled"):
+        raise PeerError(f"peer is missing or disabled: {peer_id}")
+    dataset = dataset_for(cfg, asset)
+    if not zfs_exists(dataset):
+        raise PeerError(f"source dataset does not exist: {dataset}")
+    if load_origin(asset).get("isReplicated"):
+        raise PeerError("a received replica cannot be used as a replication source")
+    local = zfs_snapshots(dataset)
+    if not local:
+        raise PeerError(f"asset {asset} has no completed snapshots")
+    snapshot = validate_snapshot(snapshot) if snapshot else local[-1]
+    if snapshot not in local:
+        raise PeerError(f"snapshot {snapshot} does not exist for {asset}")
+    remote = remote_json(peer, ["asset-info", asset])
+    remote_snaps = [str(value) for value in remote.get("snapshots", [])]
+    if snapshot in remote_snaps:
+        return {"ok": True, "asset": asset, "snapshot": snapshot, "status": "already-present"}
+    metadata = encode_metadata(collect_metadata(asset, cfg))
+    resume_token = remote.get("resume_token")
+    if resume_token:
+        transfer_stream(["zfs", "send", "-t", str(resume_token)], peer,
+                        ["receive-resume", asset, snapshot, metadata])
+        mode = "resumed"
+    else:
+        common = [value for value in local if value in remote_snaps]
+        if remote_snaps and not common:
+            raise PeerError("target has no common base snapshot; a controlled reseed is required")
+        if common:
+            base = common[-1]
+            transfer_stream(["zfs", "send", "-I", f"{dataset}@{base}", f"{dataset}@{snapshot}"],
+                            peer, ["receive", asset, snapshot, base, metadata])
+            mode = f"incremental-from-{base}"
+        else:
+            transfer_stream(["zfs", "send", f"{dataset}@{snapshot}"], peer,
+                            ["receive", asset, snapshot, "-", metadata])
+            mode = "full"
+    value = state()
+    key = f"{peer_id}:{asset}"
+    value.setdefault("assets", {})[key] = {"last_success": int(time.time()),
+        "last_snapshot": snapshot, "mode": mode, "error": None}
+    save_state(value)
+    event("replication-success", f"Replicated {asset}@{snapshot}", asset=asset, peer_id=peer_id, mode=mode)
+    return {"ok": True, "asset": asset, "snapshot": snapshot, "status": mode}
+
+
+def receive_dataset(source_id: str, asset: str, snapshot: str, base: str,
+                    encoded_metadata: str, resume: bool, stream: BinaryIO) -> dict[str, Any]:
+    require_root()
+    cfg = config()
+    if source_id not in cfg.get("sources", {}):
+        raise PeerError("source is not paired")
+    asset, snapshot = validate_asset(asset), validate_snapshot(snapshot)
+    if base != "-":
+        validate_snapshot(base)
+    try:
+        metadata = json.loads(base64.urlsafe_b64decode(encoded_metadata.encode()))
+    except Exception as exc:
+        raise PeerError("replication metadata is invalid") from exc
+    if metadata.get("source_id") != source_id:
+        raise PeerError("metadata source does not match the paired SSH identity")
+    if not isinstance(metadata.get("source_numeric_id"), int) or not 1 <= metadata["source_numeric_id"] <= 9_999_999_999:
+        raise PeerError("metadata source numeric ID is invalid")
+    if not isinstance(metadata.get("source_name"), str) or len(metadata["source_name"]) > 128:
+        raise PeerError("metadata source name is invalid")
+    dataset = dataset_for(cfg, asset)
+    origin = load_origin(asset)
+    exists = zfs_exists(dataset)
+    received_record = state().get("received", {}).get(asset, {})
+    trusted_source = received_record.get("source_id") or origin.get("sourceApplianceId")
+    if exists and trusted_source != source_id:
+        raise PeerError("asset key already belongs to another local or replicated asset")
+    existing = zfs_snapshots(dataset)
+    if not resume:
+        if base == "-" and existing:
+            raise PeerError("refusing a full stream over an existing backup chain")
+        if base != "-" and base not in existing:
+            raise PeerError(f"incremental base {base} is not present on the target")
+    value = state()
+    value.setdefault("received", {})[asset] = {
+        "source_id": source_id, "snapshot": snapshot,
+        "status": "receiving", "updated": int(time.time()),
+    }
+    save_state(value)
+    proc = subprocess.run(["zfs", "receive", "-u", "-s", dataset], stdin=stream,
+                          stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if proc.returncode != 0:
+        raise PeerError(f"zfs receive failed: {proc.stderr.decode(errors='replace').strip()}")
+    run(["zfs", "set", "canmount=on", dataset])
+    run(["zfs", "set", f"mountpoint=/home/agents/{asset}", dataset])
+    run(["zfs", "set", "readonly=on", dataset])
+    run(["zfs", "mount", dataset], check=False)
+    install_metadata(asset, metadata)
+    universal = f"{int(metadata['source_numeric_id'])}+{asset}+agent"
+    hook_errors = []
+    received = [point for point in zfs_snapshots(dataset) if point not in existing]
+    for point in received or [snapshot]:
+        hook = run(["snapctl", "asset:replication:received", universal, point, point], check=False)
+        if hook.returncode != 0:
+            hook_errors.append(hook.stderr.decode(errors="replace").strip())
+    # snapctl may rewrite originDevice using its legacy schema. Restore the
+    # source identity used by collision and replication-loop protections.
+    install_metadata(asset, metadata)
+    value = state()
+    value.setdefault("received", {})[asset] = {
+        "source_id": source_id, "snapshot": snapshot,
+        "status": "ready", "updated": int(time.time()),
+    }
+    save_state(value)
+    hook_error = "; ".join(error for error in hook_errors if error) or None
+    event("receive-success", f"Received {asset}@{snapshot}", source_id=source_id,
+          native_hook_error=hook_error)
+    return {"ok": True, "asset": asset, "snapshot": snapshot,
+            "native_hook": "ok" if hook_error is None else "deferred"}
+
+
+def asset_info_received(source_id: str, asset: str) -> dict[str, Any]:
+    cfg = config()
+    if source_id not in cfg.get("sources", {}):
+        raise PeerError("source is not paired")
+    dataset = dataset_for(cfg, validate_asset(asset))
+    token = ""
+    if zfs_exists(dataset):
+        result = run(["zfs", "get", "-H", "-o", "value", "receive_resume_token", dataset], check=False)
+        if result.returncode == 0 and result.stdout.decode().strip() != "-":
+            token = result.stdout.decode().strip()
+    return {"ok": True, "exists": zfs_exists(dataset), "snapshots": zfs_snapshots(dataset),
+            "resume_token": token or None}
+
+
+def ssh_entry(source_id: str) -> None:
+    require_root()
+    if not ID_RE.fullmatch(source_id):
+        raise PeerError("invalid paired source identity")
+    argv = shlex.split(os.environ.get("SSH_ORIGINAL_COMMAND", ""))
+    if not argv:
+        raise PeerError("a replication command is required")
+    command = argv.pop(0)
+    if command == "asset-info" and len(argv) == 1:
+        answer = asset_info_received(source_id, argv[0])
+    elif command == "receive" and len(argv) == 4:
+        answer = receive_dataset(source_id, argv[0], argv[1], argv[2], argv[3], False, sys.stdin.buffer)
+    elif command == "receive-resume" and len(argv) == 3:
+        answer = receive_dataset(source_id, argv[0], argv[1], "-", argv[2], True, sys.stdin.buffer)
+    else:
+        raise PeerError("unsupported replication command")
+    print(json.dumps(answer, separators=(",", ":")))
+
+
+def configured_sync() -> list[dict[str, Any]]:
+    require_root()
+    cfg, results, now, current = config(), [], int(time.time()), state()
+    for asset, rule in cfg.get("assets", {}).items():
+        if not rule.get("enabled", True):
+            continue
+        peer_id = str(rule["peer_id"])
+        key = f"{peer_id}:{asset}"
+        previous = current.get("assets", {}).get(key, {})
+        interval = max(300, int(rule.get("interval_minutes", 60)) * 60)
+        if now - int(previous.get("last_success", 0)) < interval:
+            continue
+        try:
+            results.append(replicate(asset, peer_id))
+        except Exception as exc:
+            value = state()
+            value.setdefault("assets", {}).setdefault(key, {})["error"] = str(exc)
+            value["assets"][key]["last_attempt"] = now
+            save_state(value)
+            event("replication-error", str(exc), asset=asset, peer_id=peer_id)
+            results.append({"ok": False, "asset": asset, "peer_id": peer_id, "error": str(exc)})
+    return results
+
+
+def configure_asset(asset: str, peer_id: str, interval: int, enabled: bool = True) -> dict[str, Any]:
+    cfg, asset = config(), validate_asset(asset)
+    if peer_id not in cfg.get("peers", {}):
+        raise PeerError("unknown target peer")
+    if not 5 <= interval <= 10080:
+        raise PeerError("replication interval must be between 5 and 10080 minutes")
+    cfg.setdefault("assets", {})[asset] = {"peer_id": peer_id,
+        "interval_minutes": interval, "enabled": enabled}
+    save_config(cfg)
+    return cfg["assets"][asset] | {"asset": asset}
+
+
+def peer_remove(peer_id: str) -> None:
+    require_root()
+    cfg = config()
+    if peer_id not in cfg.get("peers", {}):
+        raise PeerError("unknown target peer")
+    used = [asset for asset, rule in cfg.get("assets", {}).items()
+            if rule.get("peer_id") == peer_id]
+    if used:
+        raise PeerError("target is still assigned to: " + ", ".join(used))
+    name = cfg["peers"][peer_id].get("name", peer_id)
+    del cfg["peers"][peer_id]
+    save_config(cfg)
+    event("target-removed", f"Removed target {name}", peer_id=peer_id)
+
+
+def source_remove(source_id: str) -> None:
+    require_root()
+    if not ID_RE.fullmatch(source_id):
+        raise PeerError("source appliance ID is invalid")
+    cfg = config()
+    if source_id not in cfg.get("sources", {}):
+        raise PeerError("unknown source peer")
+    name = cfg["sources"][source_id].get("name", source_id)
+    del cfg["sources"][source_id]
+    save_config(cfg)
+    path = authorized_keys_path()
+    if path.exists():
+        marker = f"backops-source={source_id}"
+        lines = [line for line in path.read_text(encoding="ascii").splitlines()
+                 if marker not in line]
+        path.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="ascii")
+        os.chmod(path, 0o600)
+    event("source-removed", f"Removed source {name}", source_id=source_id)
+
+
+def received_forget(asset: str) -> None:
+    """Remove provenance only after an administrator has removed the dataset."""
+    require_root()
+    cfg, asset = config(), validate_asset(asset)
+    if zfs_exists(dataset_for(cfg, asset)):
+        raise PeerError("refusing to forget provenance while the received dataset exists")
+    value = state()
+    value.setdefault("received", {}).pop(asset, None)
+    save_state(value)
+
+
+def status_document() -> dict[str, Any]:
+    cfg = config()
+    return {"service": "backops-peer", "version": VERSION,
+            "appliance": {"id": cfg["appliance_id"], "name": cfg["name"]},
+            "peers": cfg.get("peers", {}), "sources": cfg.get("sources", {}),
+            "rules": cfg.get("assets", {}), "local_assets": assets_local(cfg),
+            "state": state(), "tls_fingerprint": local_tls_fingerprint()}
+
+
+HTML = """<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>BackOps Peer Replication</title><style>
+body{font-family:system-ui,sans-serif;background:#0d3d4e;color:#102b36;margin:0;padding:2rem}main{max-width:1050px;margin:auto;background:#fff;border-radius:6px;padding:2rem;box-shadow:0 8px 35px #062632aa}h1{margin-top:0}h2{border-bottom:1px solid #c9d8de;padding-bottom:.4rem}label{display:block;margin:.55rem 0}input,select,button{font:inherit;padding:.55rem;border:1px solid #9db4be;border-radius:4px}input,select{min-width:18rem}button{background:#159bd3;color:white;border:0;cursor:pointer}button.secondary{background:#5e7480}table{border-collapse:collapse;width:100%}th,td{text-align:left;padding:.55rem;border-bottom:1px solid #dde6ea}pre{background:#eff5f7;padding:1rem;overflow:auto}.error{color:#b51616}.ok{color:#08733b}.row{display:flex;gap:1rem;flex-wrap:wrap}</style></head><body><main><h1>BackOps Peer Replication</h1><p>Offline appliance-to-appliance backup replication over pinned SSH.</p><div id="message"></div><h2>This appliance</h2><pre id="local">Loading…</pre><h2>Authorize this appliance as a target</h2><button onclick="pairCode()">Generate one-time pairing code</button><pre id="paircode">The source will need this code and the TLS fingerprint shown above.</pre><h2>Add a target appliance</h2><div class="row"><label>IP or hostname<br><input id="host"></label><label>HTTPS port<br><input id="port" type="number" value="9443"></label></div><button onclick="discover()">Discover and verify fingerprint</button><pre id="discover"></pre><label>One-time code<br><input id="code"></label><button onclick="addPeer()">Pair target</button><h2>Replication policy</h2><div class="row"><label>Protected asset<br><select id="asset"></select></label><label>Target<br><select id="peer"></select></label><label>Interval (minutes)<br><input id="interval" type="number" value="60" min="5"></label></div><button onclick="saveRule()">Save policy</button> <button class="secondary" onclick="syncNow()">Sync configured assets now</button><h2>Status</h2><div id="status"></div><h2>Recent events</h2><pre id="events"></pre><script>
+let state=null,discovered=null;async function api(path,method='GET',body=null){let r=await fetch(path,{method,headers:{'Content-Type':'application/json'},body:body?JSON.stringify(body):null});let j=await r.json();if(!r.ok)throw Error(j.error||r.statusText);return j}function msg(text,ok=true){document.getElementById('message').innerHTML=`<p class="${ok?'ok':'error'}">${text}</p>`}async function load(){try{state=await api('/v1/admin/status');local.textContent=JSON.stringify({appliance:state.appliance,tls_fingerprint:state.tls_fingerprint},null,2);asset.innerHTML=state.local_assets.filter(x=>!x.replicated).map(x=>`<option value="${x.key}">${x.key} (${x.snapshots.length} points)</option>`).join('');peer.innerHTML=Object.entries(state.peers).map(([id,x])=>`<option value="${id}">${x.name} — ${x.host}</option>`).join('');status.innerHTML='<table><tr><th>Asset</th><th>Target</th><th>Last point</th><th>Result</th></tr>'+Object.entries(state.rules).map(([a,r])=>{let s=state.state.assets[`${r.peer_id}:${a}`]||{};return `<tr><td>${a}</td><td>${state.peers[r.peer_id]?.name||r.peer_id}</td><td>${s.last_snapshot||'—'}</td><td>${s.error||s.mode||'waiting'}</td></tr>`}).join('')+'</table>';events.textContent=JSON.stringify((state.state.events||[]).slice(-20).reverse(),null,2)}catch(e){msg(e.message,false)}}async function pairCode(){try{let x=await api('/v1/admin/pairing-code','POST',{});paircode.textContent=`Code: ${x.code}\nExpires: ${new Date(x.expires*1000).toLocaleString()}\nTLS fingerprint: ${state.tls_fingerprint}`}catch(e){msg(e.message,false)}}async function discover(){try{discovered=await api('/v1/admin/discover','POST',{host:host.value,port:Number(port.value)});document.getElementById('discover').textContent=JSON.stringify(discovered,null,2);msg('Compare this fingerprint with the target appliance before pairing.')}catch(e){msg(e.message,false)}}async function addPeer(){try{if(!discovered)throw Error('Discover the appliance first');await api('/v1/admin/peer','POST',{host:host.value,port:Number(port.value),code:code.value,fingerprint:discovered.observed_fingerprint,appliance_id:discovered.appliance_id});msg('Target paired.');await load()}catch(e){msg(e.message,false)}}async function saveRule(){try{await api('/v1/admin/rule','POST',{asset:asset.value,peer_id:peer.value,interval_minutes:Number(interval.value)});msg('Replication policy saved.');await load()}catch(e){msg(e.message,false)}}async function syncNow(){try{msg('Replication started…');let x=await api('/v1/admin/sync','POST',{});msg('Replication run complete: '+JSON.stringify(x));await load()}catch(e){msg(e.message,false)}}load();setInterval(load,30000);</script></main></body></html>"""
+
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    server_version = "BackOpsPeer/" + VERSION
+    def log_message(self, fmt: str, *args: Any) -> None:
+        sys.stderr.write("peer-http: " + fmt % args + "\n")
+    def reply(self, status: int, value: Any, content_type: str = "application/json") -> None:
+        raw = value.encode() if isinstance(value, str) else json.dumps(value).encode()
+        self.send_response(status)
+        for key, val in (("Content-Type", content_type), ("Content-Length", str(len(raw))),
+                         ("Cache-Control", "no-store"), ("X-Content-Type-Options", "nosniff"),
+                         ("Content-Security-Policy", "default-src 'self'; style-src 'unsafe-inline'; script-src 'unsafe-inline'")):
+            self.send_header(key, val)
+        self.end_headers(); self.wfile.write(raw)
+    def json_body(self) -> dict[str, Any]:
+        if self.headers.get_content_type() != "application/json":
+            raise PeerError("Content-Type must be application/json")
+        size = int(self.headers.get("Content-Length", "0"))
+        if size < 0 or size > 1024 * 1024:
+            raise PeerError("request body is too large")
+        value = json.loads(self.rfile.read(size))
+        if not isinstance(value, dict):
+            raise PeerError("request must be a JSON object")
+        return value
+    def admin(self) -> bool:
+        expected, header = ADMIN_TOKEN_PATH.read_text(encoding="ascii").strip(), self.headers.get("Authorization", "")
+        try:
+            kind, encoded = header.split(" ", 1); user, password = base64.b64decode(encoded).decode().split(":", 1)
+        except Exception:
+            kind = user = password = ""
+        if kind.lower() == "basic" and user == "backops" and hmac.compare_digest(password, expected):
+            return True
+        self.send_response(401); self.send_header("WWW-Authenticate", 'Basic realm="BackOps Peer Replication"'); self.send_header("Content-Length", "0"); self.end_headers(); return False
+    def do_GET(self) -> None:
+        try:
+            if self.path == "/v1/info": self.reply(200, public_info())
+            elif self.path == "/" and self.admin(): self.reply(200, HTML, "text/html; charset=utf-8")
+            elif self.path == "/v1/admin/status" and self.admin(): self.reply(200, status_document())
+            elif self.path not in ("/", "/v1/admin/status"): self.reply(404, {"error": "not found"})
+        except Exception as exc: self.reply(400, {"error": str(exc)})
+    def do_POST(self) -> None:
+        try:
+            if self.path == "/v1/pair": self.reply(200, pair_accept(self.json_body(), self.client_address[0])); return
+            if not self.admin(): return
+            body = self.json_body()
+            if self.path == "/v1/admin/pairing-code":
+                code = pairing_code(15); self.reply(200, {"code": code, "expires": int(time.time()) + 900})
+            elif self.path == "/v1/admin/discover":
+                info, observed = ssl_json(str(body["host"]), int(body.get("port", 9443)), "/v1/info"); self.reply(200, info | {"observed_fingerprint": observed})
+            elif self.path == "/v1/admin/peer":
+                self.reply(200, peer_add(str(body["host"]), int(body.get("port", 9443)), str(body["code"]), str(body["fingerprint"]), {"appliance_id": str(body["appliance_id"])}))
+            elif self.path == "/v1/admin/rule":
+                self.reply(200, configure_asset(str(body["asset"]), str(body["peer_id"]), int(body.get("interval_minutes", 60))))
+            elif self.path == "/v1/admin/sync":
+                with sync_lock():
+                    self.reply(200, {"results": configured_sync()})
+            else: self.reply(404, {"error": "not found"})
+        except Exception as exc: self.reply(400, {"error": str(exc)})
+
+
+def serve() -> None:
+    require_root(); cfg = config()
+    server = http.server.ThreadingHTTPServer((cfg["listen"], int(cfg["port"])), Handler)
+    server.daemon_threads = True
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER); context.minimum_version = ssl.TLSVersion.TLSv1_2
+    context.load_cert_chain(str(TLS_CERT_PATH), str(TLS_KEY_PATH))
+    server.socket = context.wrap_socket(server.socket, server_side=True)
+    print(f"BackOps peer service listening on https://{cfg['listen']}:{cfg['port']}", flush=True)
+    server.serve_forever()
+
+
+@contextlib.contextmanager
+def sync_lock() -> Any:
+    LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with LOCK_PATH.open("w") as handle:
+        try: fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc: raise PeerError("another replication run is already active") from exc
+        yield
+
+
+def parser() -> argparse.ArgumentParser:
+    result = argparse.ArgumentParser(description="Offline BackOps appliance replication")
+    result.add_argument("--version", action="version", version=VERSION)
+    sub = result.add_subparsers(dest="command", required=True)
+    sub.add_parser("init"); sub.add_parser("serve"); sub.add_parser("status"); sub.add_parser("admin-token")
+    code = sub.add_parser("pairing-code"); code.add_argument("--minutes", type=int, default=15)
+    discover = sub.add_parser("discover"); discover.add_argument("host"); discover.add_argument("--port", type=int, default=9443)
+    add = sub.add_parser("peer-add"); add.add_argument("host"); add.add_argument("--port", type=int, default=9443); add.add_argument("--code", required=True); add.add_argument("--fingerprint"); add.add_argument("--yes", action="store_true")
+    remove_peer = sub.add_parser("peer-remove"); remove_peer.add_argument("peer_id")
+    remove_source = sub.add_parser("source-remove"); remove_source.add_argument("source_id")
+    forget = sub.add_parser("received-forget"); forget.add_argument("asset")
+    rule = sub.add_parser("asset-configure"); rule.add_argument("asset"); rule.add_argument("--peer", required=True); rule.add_argument("--interval", type=int, default=60)
+    rep = sub.add_parser("replicate"); rep.add_argument("asset"); rep.add_argument("--peer", required=True); rep.add_argument("--snapshot")
+    sync = sub.add_parser("sync"); sync.add_argument("--all", action="store_true", required=True)
+    entry = sub.add_parser("ssh-entry"); entry.add_argument("source_id")
+    return result
+
+
+def main() -> int:
+    args = parser().parse_args()
+    try:
+        if args.command == "init": init()
+        elif args.command == "serve": serve()
+        elif args.command == "status": print(json.dumps(status_document(), indent=2))
+        elif args.command == "admin-token": require_root(); print(ADMIN_TOKEN_PATH.read_text(encoding="ascii").strip())
+        elif args.command == "pairing-code": print(pairing_code(args.minutes)); print(f"TLS fingerprint: {local_tls_fingerprint()}")
+        elif args.command == "discover":
+            info, observed = ssl_json(args.host, args.port, "/v1/info"); print(json.dumps(info | {"observed_fingerprint": observed}, indent=2))
+        elif args.command == "peer-add":
+            info, observed = ssl_json(args.host, args.port, "/v1/info"); fingerprint = args.fingerprint or observed
+            if not args.fingerprint and not args.yes:
+                print(f"Target: {info.get('name')} ({info.get('appliance_id')})\nTLS fingerprint: {observed}")
+                if input("Does this match the fingerprint shown on the target? [y/N] ").lower() != "y": raise PeerError("pairing cancelled")
+            print(json.dumps(peer_add(args.host, args.port, args.code, fingerprint, info), indent=2))
+        elif args.command == "asset-configure": print(json.dumps(configure_asset(args.asset, args.peer, args.interval), indent=2))
+        elif args.command == "peer-remove": peer_remove(args.peer_id); print("target removed")
+        elif args.command == "source-remove": source_remove(args.source_id); print("source removed")
+        elif args.command == "received-forget": received_forget(args.asset); print("received provenance removed")
+        elif args.command == "replicate":
+            with sync_lock(): print(json.dumps(replicate(args.asset, args.peer, args.snapshot), indent=2))
+        elif args.command == "sync":
+            with sync_lock(): print(json.dumps({"results": configured_sync()}, indent=2))
+        elif args.command == "ssh-entry": ssh_entry(args.source_id)
+        return 0
+    except Exception as exc:
+        if args.command == "ssh-entry": print(json.dumps({"ok": False, "error": str(exc)}, separators=(",", ":")))
+        else: print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

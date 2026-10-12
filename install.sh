@@ -128,6 +128,8 @@ install -m 0644 "$ROOT/setup/setup.conf" "$payload/setup.conf"
 install -m 0644 "$ROOT/setup/README.txt" "$payload/README.txt"
 rm -rf "$payload/wheels"
 cp -a "$ROOT/setup/wheels" "$payload/wheels"
+rm -rf "$payload/peer"
+cp -a "$ROOT/setup/peer" "$payload/peer"
 
 echo "starting spf-datto setup on $(hostname) ..."
 "$payload/setup.sh" "$MODE"

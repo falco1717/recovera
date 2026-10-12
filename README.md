@@ -45,6 +45,31 @@ sign in with the local administrator. Initial setup and local login do not need
 Internet. Datto enrollment, licensing, updates, and cloud services are not
 emulated.
 
+## Offline appliance replication
+
+The installer also provides SIRIS-Private-style replication between BackOps
+appliances. It uses a one-time pairing code and a manually verified TLS
+fingerprint, then pins the target's SSH host key. Full ZFS streams are sent for
+new assets; subsequent recovery points use incremental, resumable ZFS streams.
+The target receives protected-system metadata and invokes the appliance's local
+replication-received hook so recovery points remain locally discoverable.
+
+Retrieve the management-page password on either appliance:
+
+```bash
+sudo backops-peer admin-token
+```
+
+Open `https://<appliance-IP>:9443/` and sign in as `backops`. On the target,
+generate a one-time code. On the source, enter the target IP, verify its TLS
+fingerprint, enter that code, and choose the protected asset and replication
+interval. The CLI workflow is documented in
+[`docs/peer-replication.md`](docs/peer-replication.md).
+
+Only TCP 9443 (pairing/status) and TCP 22 (encrypted backup streams) are used.
+For different sites, expose them only across a site-to-site VPN and restrict
+them to the two appliance addresses. Internet connectivity is not required.
+
 ## Fully air-gapped install
 
 Copy this repository and `spf-datto-setup.tar` to the VM, then run:

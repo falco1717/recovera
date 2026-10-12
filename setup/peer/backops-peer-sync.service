@@ -1,0 +1,8 @@
+[Unit]
+Description=Run scheduled BackOps appliance replication
+After=network-online.target backops-peer.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/backops-peer sync --all
+UMask=0077
