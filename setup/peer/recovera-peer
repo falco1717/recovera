@@ -947,7 +947,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         try:
             if self.path == "/v1/info": self.reply(200, public_info())
             elif self.path == "/assets/recovera-logo.png": self.reply(200, LOGO_PATH.read_bytes(), "image/png")
-            elif self.path == "/" and self.admin(): self.reply(200, HTML, "text/html; charset=utf-8")
+            elif self.path == "/":
+                self.reply(404, {"error": "Use /configure/offsite-target on the Recovera WebUI"})
             elif self.path == "/v1/admin/status" and self.admin(): self.reply(200, status_document())
             elif self.path == "/v1/admin/offsite" and self.admin():
                 self.reply(200, {"schedules": offsite()["schedules"], "averages": weekly_averages()})

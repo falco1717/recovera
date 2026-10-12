@@ -1017,7 +1017,7 @@ PY
   systemctl restart ssh.service || return 1
   systemctl enable recovera-peer.service recovera-peer-sync.timer >/dev/null || return 1
   systemctl restart recovera-peer.service recovera-peer-sync.timer || return 1
-  log "Recovera replication: https://$(hostname -I | awk '{print $1}'):$PEER_PORT/ (use a registered local administrator)"
+  log "Recovera replication backend active on TCP $PEER_PORT; manage it at https://$(hostname -I | awk '{print $1}')/configure/offsite-target"
 }
 
 net_revert() {
