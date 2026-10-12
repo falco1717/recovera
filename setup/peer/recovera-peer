@@ -16,6 +16,7 @@ import http.client
 import http.server
 import json
 import os
+import grp
 import re
 import secrets
 import shlex
@@ -41,6 +42,9 @@ SSH_KEY_PATH = ETC / "id_ed25519"
 KNOWN_HOSTS_PATH = ETC / "known_hosts"
 KEYS_DIR = Path(os.environ.get("RECOVERA_PEER_KEYS", "/datto/config/keys"))
 LOCK_PATH = Path(os.environ.get("RECOVERA_PEER_LOCK", "/run/recovera-peer-sync.lock"))
+OFFSITE_PATH = Path(os.environ.get("RECOVERA_PEER_OFFSITE", "/etc/recovera-peer/offsite.json"))
+WEB_TOKEN_PATH = Path(os.environ.get("RECOVERA_PEER_WEB_TOKEN", "/etc/recovera-peer/web.token"))
+TX_SPEED_PATH = Path(os.environ.get("RECOVERA_TX_SPEED", "/datto/config/local/txSpeed"))
 AUTHORIZED_KEYS_PATH = Path(os.environ.get(
     "RECOVERA_PEER_AUTHORIZED_KEYS", "/var/lib/recovera-peer/.ssh/authorized_keys"
 ))
@@ -142,6 +146,95 @@ def save_state(value: dict[str, Any]) -> None:
     atomic_json(STATE_PATH, value)
 
 
+def default_offsite() -> dict[str, Any]:
+    speed = 0
+    with contextlib.suppress(ValueError, OSError):
+        speed = max(0, int(float(TX_SPEED_PATH.read_text().strip()) * 125))
+    return {"schema": 1, "speed_kbps": speed, "max_syncs": 1,
+            "next_schedule_id": 1, "schedules": []}
+
+
+def offsite() -> dict[str, Any]:
+    value = load_json(OFFSITE_PATH, default_offsite())
+    value.setdefault("speed_kbps", 0)
+    value.setdefault("max_syncs", 1)
+    value.setdefault("next_schedule_id", 1)
+    value.setdefault("schedules", [])
+    return value
+
+
+def save_offsite(value: dict[str, Any]) -> None:
+    atomic_json(OFFSITE_PATH, value)
+
+
+def schedule_speed(now: float | None = None) -> int:
+    settings = offsite()
+    current = time.localtime(now).tm_wday * 86400 + time.localtime(now).tm_hour * 3600 \
+        + time.localtime(now).tm_min * 60 + time.localtime(now).tm_sec
+    speed = int(settings.get("speed_kbps", 0))
+    for item in settings.get("schedules", []):
+        start, end = int(item["start"]), int(item["end"])
+        active = start <= current < end if start < end else current >= start or current < end
+        if active:
+            speed = int(item["speed"])
+    return speed
+
+
+def weekly_averages() -> dict[str, Any]:
+    settings = offsite()
+    default_speed = int(settings.get("speed_kbps", 0))
+    days: list[int] = []
+    for day in range(7):
+        total = 0
+        for minute in range(1440):
+            second = day * 86400 + minute * 60
+            speed = default_speed
+            for item in settings.get("schedules", []):
+                start, end = int(item["start"]), int(item["end"])
+                active = start <= second < end if start < end else second >= start or second < end
+                if active:
+                    speed = int(item["speed"])
+            if speed > 0:
+                total += speed * 60
+        days.append(total)
+    return {"days": days, "avgWeek": sum(days) // 7, "totalWeek": sum(days)}
+
+
+def schedule_add(start: int, end: int, speed: int) -> dict[str, Any]:
+    if not 0 <= start < 604800 or not 0 <= end < 604800 or start == end:
+        raise PeerError("schedule times must be different seconds within a week")
+    if speed < -1 or speed > 125_000_000:
+        raise PeerError("schedule speed is outside the supported range")
+    settings = offsite()
+    item = {"schedID": int(settings["next_schedule_id"]), "start": start,
+            "end": end, "speed": speed}
+    settings["next_schedule_id"] = item["schedID"] + 1
+    settings["schedules"].append(item)
+    save_offsite(settings)
+    return item
+
+
+def schedule_delete(schedule_id: int) -> None:
+    settings = offsite()
+    original = len(settings["schedules"])
+    settings["schedules"] = [item for item in settings["schedules"]
+                             if int(item["schedID"]) != schedule_id]
+    if len(settings["schedules"]) == original:
+        raise PeerError("schedule does not exist")
+    save_offsite(settings)
+
+
+def set_speed(speed_kbps: int) -> int:
+    if not 0 <= speed_kbps <= 125_000_000:
+        raise PeerError("upload speed is outside the supported range")
+    settings = offsite()
+    settings["speed_kbps"] = speed_kbps
+    save_offsite(settings)
+    TX_SPEED_PATH.parent.mkdir(parents=True, exist_ok=True)
+    TX_SPEED_PATH.write_text(f"{speed_kbps / 125:g}\n", encoding="ascii")
+    return speed_kbps
+
+
 def event(kind: str, message: str, **fields: Any) -> None:
     value = state()
     value.setdefault("events", []).append(
@@ -192,6 +285,13 @@ def init() -> None:
         os.chmod(TLS_KEY_PATH, 0o600)
         os.chmod(TLS_CERT_PATH, 0o644)
     KNOWN_HOSTS_PATH.touch(mode=0o600, exist_ok=True)
+    if not OFFSITE_PATH.exists():
+        atomic_json(OFFSITE_PATH, default_offsite())
+    if not WEB_TOKEN_PATH.exists():
+        WEB_TOKEN_PATH.write_text(secrets.token_urlsafe(48) + "\n", encoding="ascii")
+    os.chmod(WEB_TOKEN_PATH, 0o640)
+    with contextlib.suppress(KeyError, PermissionError):
+        os.chown(WEB_TOKEN_PATH, 0, grp.getgrnam("www-data").gr_gid)
     print(f"Recovera peer replication initialized ({config()['appliance_id']})")
     print(f"TLS fingerprint: {local_tls_fingerprint()}")
 
@@ -495,17 +595,32 @@ def encode_metadata(metadata: dict[str, Any]) -> str:
     return base64.urlsafe_b64encode(raw).decode()
 
 
-def transfer_stream(send_command: list[str], peer: dict[str, Any], remote_command: list[str]) -> None:
+def transfer_stream(send_command: list[str], peer: dict[str, Any], remote_command: list[str],
+                    speed_kbps: int = 0) -> None:
     sender = subprocess.Popen(send_command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     assert sender.stdout is not None
-    receiver = subprocess.Popen(ssh_base(peer) + [shlex.join(remote_command)], stdin=sender.stdout,
+    stream = sender.stdout
+    limiter = None
+    if speed_kbps > 0:
+        limiter = subprocess.Popen(["pv", "-q", "-L", str(speed_kbps * 1024)],
+                                   stdin=sender.stdout, stdout=subprocess.PIPE,
+                                   stderr=subprocess.PIPE)
+        sender.stdout.close()
+        assert limiter.stdout is not None
+        stream = limiter.stdout
+    receiver = subprocess.Popen(ssh_base(peer) + [shlex.join(remote_command)], stdin=stream,
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    sender.stdout.close()
+    stream.close()
     recv_out, recv_err = receiver.communicate()
+    limit_err = b""
+    limit_rc = 0
+    if limiter:
+        limit_err = limiter.stderr.read() if limiter.stderr else b""
+        limit_rc = limiter.wait()
     send_err = sender.stderr.read() if sender.stderr else b""
     send_rc = sender.wait()
-    if send_rc != 0 or receiver.returncode != 0:
-        details = (send_err + b"\n" + recv_err + b"\n" + recv_out).decode(errors="replace").strip()
+    if send_rc != 0 or limit_rc != 0 or receiver.returncode != 0:
+        details = (send_err + b"\n" + limit_err + b"\n" + recv_err + b"\n" + recv_out).decode(errors="replace").strip()
         raise PeerError(f"snapshot transfer failed: {details}")
     try:
         answer = json.loads(recv_out.decode())
@@ -515,7 +630,8 @@ def transfer_stream(send_command: list[str], peer: dict[str, Any], remote_comman
         raise PeerError(str(answer.get("error", "target rejected the transfer")))
 
 
-def replicate(asset: str, peer_id: str, snapshot: str | None = None) -> dict[str, Any]:
+def replicate(asset: str, peer_id: str, snapshot: str | None = None,
+              speed_kbps: int = 0) -> dict[str, Any]:
     require_root()
     cfg = config()
     asset = validate_asset(asset)
@@ -541,7 +657,7 @@ def replicate(asset: str, peer_id: str, snapshot: str | None = None) -> dict[str
     resume_token = remote.get("resume_token")
     if resume_token:
         transfer_stream(["zfs", "send", "-t", str(resume_token)], peer,
-                        ["receive-resume", asset, snapshot, metadata])
+                        ["receive-resume", asset, snapshot, metadata], speed_kbps)
         mode = "resumed"
     else:
         common = [value for value in local if value in remote_snaps]
@@ -550,11 +666,11 @@ def replicate(asset: str, peer_id: str, snapshot: str | None = None) -> dict[str
         if common:
             base = common[-1]
             transfer_stream(["zfs", "send", "-I", f"{dataset}@{base}", f"{dataset}@{snapshot}"],
-                            peer, ["receive", asset, snapshot, base, metadata])
+                            peer, ["receive", asset, snapshot, base, metadata], speed_kbps)
             mode = f"incremental-from-{base}"
         else:
             transfer_stream(["zfs", "send", f"{dataset}@{snapshot}"], peer,
-                            ["receive", asset, snapshot, "-", metadata])
+                            ["receive", asset, snapshot, "-", metadata], speed_kbps)
             mode = "full"
     value = state()
     key = f"{peer_id}:{asset}"
@@ -671,6 +787,10 @@ def ssh_entry(source_id: str) -> None:
 def configured_sync() -> list[dict[str, Any]]:
     require_root()
     cfg, results, now, current = config(), [], int(time.time()), state()
+    speed = schedule_speed(now)
+    if speed < 0:
+        event("replication-paused", "Off-site replication is paused by the active schedule")
+        return [{"ok": True, "status": "paused-by-schedule"}]
     for asset, rule in cfg.get("assets", {}).items():
         if not rule.get("enabled", True):
             continue
@@ -681,7 +801,7 @@ def configured_sync() -> list[dict[str, Any]]:
         if now - int(previous.get("last_success", 0)) < interval:
             continue
         try:
-            results.append(replicate(asset, peer_id))
+            results.append(replicate(asset, peer_id, speed_kbps=speed))
         except Exception as exc:
             value = state()
             value.setdefault("assets", {}).setdefault(key, {})["error"] = str(exc)
@@ -756,7 +876,8 @@ def status_document() -> dict[str, Any]:
             "appliance": {"id": cfg["appliance_id"], "name": cfg["name"]},
             "peers": cfg.get("peers", {}), "sources": cfg.get("sources", {}),
             "rules": cfg.get("assets", {}), "local_assets": assets_local(cfg),
-            "state": state(), "tls_fingerprint": local_tls_fingerprint()}
+            "state": state(), "offsite": offsite(),
+            "tls_fingerprint": local_tls_fingerprint()}
 
 
 def authenticate_local_admin(username: str, password: str) -> bool:
@@ -808,6 +929,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
             raise PeerError("request must be a JSON object")
         return value
     def admin(self) -> bool:
+        supplied = self.headers.get("X-Recovera-Internal", "")
+        if self.client_address[0] in ("127.0.0.1", "::1") and WEB_TOKEN_PATH.is_file():
+            expected = WEB_TOKEN_PATH.read_text(encoding="ascii").strip()
+            if expected and hmac.compare_digest(supplied, expected):
+                return True
         header = self.headers.get("Authorization", "")
         try:
             kind, encoded = header.split(" ", 1)
@@ -823,6 +949,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             elif self.path == "/assets/recovera-logo.png": self.reply(200, LOGO_PATH.read_bytes(), "image/png")
             elif self.path == "/" and self.admin(): self.reply(200, HTML, "text/html; charset=utf-8")
             elif self.path == "/v1/admin/status" and self.admin(): self.reply(200, status_document())
+            elif self.path == "/v1/admin/offsite" and self.admin():
+                self.reply(200, {"schedules": offsite()["schedules"], "averages": weekly_averages()})
             elif self.path not in ("/", "/v1/admin/status"): self.reply(404, {"error": "not found"})
         except Exception as exc: self.reply(400, {"error": str(exc)})
     def do_POST(self) -> None:
@@ -841,6 +969,21 @@ class Handler(http.server.BaseHTTPRequestHandler):
             elif self.path == "/v1/admin/sync":
                 with sync_lock():
                     self.reply(200, {"results": configured_sync()})
+            elif self.path == "/v1/admin/offsite/schedule-add":
+                self.reply(200, schedule_add(int(body["secondsWeekStart"]),
+                                             int(body["secondsWeekEnd"]), int(body["speed"])))
+            elif self.path == "/v1/admin/offsite/schedule-delete":
+                schedule_delete(int(body["scheduleId"])); self.reply(200, {"ok": True})
+            elif self.path == "/v1/admin/offsite/speed-set":
+                self.reply(200, set_speed(int(body["speed"])))
+            elif self.path == "/v1/admin/offsite/speed-test":
+                self.reply(200, int(offsite()["speed_kbps"]))
+            elif self.path == "/v1/admin/offsite/concurrency-set":
+                count = int(body["maxSyncs"])
+                if not 1 <= count <= 64: raise PeerError("concurrent sync count must be between 1 and 64")
+                settings = offsite(); settings["max_syncs"] = count; save_offsite(settings)
+                run(["speedsync", "setMaxSyncs", str(count)], check=False, timeout=10)
+                self.reply(200, {"ok": True, "maxSyncs": count})
             else: self.reply(404, {"error": "not found"})
         except Exception as exc: self.reply(400, {"error": str(exc)})
 

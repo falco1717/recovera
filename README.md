@@ -54,11 +54,11 @@ new assets; subsequent recovery points use incremental, resumable ZFS streams.
 The target receives protected-system metadata and invokes the appliance's local
 replication-received hook so recovery points remain locally discoverable.
 
-Open `https://<appliance-IP>:9443/` and sign in with the same local administrator
-username and password created during device registration. On the target,
-generate a one-time code. On the source, enter the target IP, verify its TLS
-fingerprint, enter that code, and choose the protected asset and replication
-interval. The CLI workflow is documented in
+Sign in to the normal Recovera WebUI and open **Configure → Off-site Target**.
+On the target, generate a one-time code. On the source, enter the target IP,
+verify its TLS fingerprint, enter that code, and choose the protected asset and
+replication interval. **Configure → Off-site Synchronization** controls the
+weekly replication windows and upload-speed limit. The CLI workflow is documented in
 [`docs/peer-replication.md`](docs/peer-replication.md).
 
 Only TCP 9443 (pairing/status) and TCP 22 (encrypted backup streams) are used.

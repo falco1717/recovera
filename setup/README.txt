@@ -99,12 +99,13 @@ WEB UI
   licensing remain outside this offline replica workflow.
 
 PEER REPLICATION
-  Open https://<VM IP>:9443/ and sign in with the same local administrator username and
-  password created during device registration. No separate replication password is stored.
+  Sign in to the normal Recovera WebUI and open Configure -> Off-site Target. The page uses
+  the registered administrator session; no separate replication password is stored.
 
   On the target, generate a one-time pairing code. On the source, discover the target by
   IP, compare the displayed TLS fingerprint, enter the code, select a protected asset, and
-  save its schedule. The first transfer is a full ZFS stream; later transfers are incremental
+  save its policy. Configure -> Off-site Synchronization sets weekly replication windows and
+  upload-speed limits. The first transfer is a full ZFS stream; later transfers are incremental
   and interrupted receives are resumable. Data transport uses a pinned SSH host key and a
   forced-command account that cannot request a shell, forwarding, or arbitrary dataset paths.
 

@@ -4,6 +4,7 @@ import json
 import os
 import tempfile
 import unittest
+from types import SimpleNamespace
 from pathlib import Path
 from unittest import mock
 
@@ -16,6 +17,9 @@ def load_module(root: Path):
     os.environ["RECOVERA_PEER_STATE"] = str(root / "state")
     os.environ["RECOVERA_PEER_KEYS"] = str(root / "keys")
     os.environ["RECOVERA_PEER_LOCK"] = str(root / "lock")
+    os.environ["RECOVERA_PEER_OFFSITE"] = str(root / "offsite.json")
+    os.environ["RECOVERA_PEER_WEB_TOKEN"] = str(root / "web.token")
+    os.environ["RECOVERA_TX_SPEED"] = str(root / "txSpeed")
     os.environ["RECOVERA_PEER_AUTHORIZED_KEYS"] = str(root / "authorized_keys")
     loader = importlib.machinery.SourceFileLoader("recovera_peer_test", str(SCRIPT))
     spec = importlib.util.spec_from_loader(loader.name, loader)
@@ -32,9 +36,29 @@ class RecoveraPeerTests(unittest.TestCase):
         self.peer.require_root = lambda: None
         self.peer.save_config(self.peer.default_config())
         self.peer.save_state({"assets": {}, "events": []})
+        self.peer.save_offsite(self.peer.default_offsite())
 
     def tearDown(self):
         self.temp.cleanup()
+
+    def test_offsite_schedule_add_apply_and_delete(self):
+        item = self.peer.schedule_add(3600, 7200, -1)
+        self.assertEqual(item["schedID"], 1)
+        with mock.patch.object(self.peer.time, "localtime", return_value=SimpleNamespace(
+                tm_wday=0, tm_hour=1, tm_min=30, tm_sec=0)):
+            self.assertEqual(self.peer.schedule_speed(), -1)
+        self.peer.schedule_delete(item["schedID"])
+        self.assertEqual(self.peer.offsite()["schedules"], [])
+
+    def test_offsite_speed_updates_peer_and_legacy_config(self):
+        self.assertEqual(self.peer.set_speed(1250), 1250)
+        self.assertEqual(self.peer.offsite()["speed_kbps"], 1250)
+        self.assertEqual(self.peer.TX_SPEED_PATH.read_text().strip(), "10")
+
+    def test_offsite_schedule_rejects_invalid_ranges(self):
+        for start, end, speed in ((1, 1, 100), (-1, 2, 100), (1, 604800, 100), (1, 2, -2)):
+            with self.assertRaises(self.peer.PeerError):
+                self.peer.schedule_add(start, end, speed)
 
     def test_asset_and_snapshot_validation_reject_path_injection(self):
         good = "a" * 32

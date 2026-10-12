@@ -15,8 +15,7 @@ vendor cloud service.
 
 ## Pair from the web page
 
-1. Open `https://<IP>:9443/` and sign in with the same local administrator
-   username and password created during that appliance's device registration.
+1. Sign in to the normal Recovera WebUI and open **Configure → Off-site Target**.
 2. On the target, select **Generate one-time pairing code**. Record the code and
    TLS fingerprint. The code expires after 15 minutes and can be used once.
 3. On the source, enter the target IP and select **Discover and verify
@@ -27,6 +26,10 @@ vendor cloud service.
 
 The scheduled service checks policies every five minutes. The policy interval
 determines whether a particular asset is due.
+
+Use **Configure → Off-site Synchronization** to set the default upload-speed
+limit and weekly speed or pause windows. Those limits are applied to the actual
+ZFS transfer stream and do not require Internet connectivity.
 
 ## CLI equivalent
 
@@ -73,8 +76,10 @@ replication policy still references it.
 
 ## Security model
 
-- The management page validates the registered appliance administrator directly;
-  it does not store a second password or authentication token.
+- The management page uses the normal registered administrator session and
+  permissions; it does not store a second administrator password.
+- A root-generated, loopback-only token authenticates the WebUI proxy to the
+  local peer service. It is not sent to the browser or accepted remotely.
 - Pairing codes are stored as scrypt hashes, expire, and are single-use.
 - The source verifies the target TLS fingerprint during pairing and pins the
   target's SSH host key for every backup stream.

@@ -915,7 +915,7 @@ PY
 p77_recovera_branding() {
   [ -f "$INSTALL_DIR/branding/apply-branding.py" ] || { log "Recovera branding script is missing"; return 1; }
   [ -f "$INSTALL_DIR/branding/recovera-logo.png" ] || { log "Recovera logo is missing"; return 1; }
-  [ -f "$INSTALL_DIR/branding/recovera-offsite.php" ] || { log "Recovera off-site redirect is missing"; return 1; }
+  [ -f "$INSTALL_DIR/branding/RecoveraTargetController.php" ] || { log "Recovera off-site target controller is missing"; return 1; }
   ensure_recovera_device_id || return 1
   python3 "$INSTALL_DIR/branding/apply-branding.py" \
     "$INSTALL_DIR/branding/recovera-logo.png" || return 1
@@ -1015,7 +1015,8 @@ PY
   fi
   systemctl daemon-reload
   systemctl restart ssh.service || return 1
-  systemctl enable --now recovera-peer.service recovera-peer-sync.timer >/dev/null || return 1
+  systemctl enable recovera-peer.service recovera-peer-sync.timer >/dev/null || return 1
+  systemctl restart recovera-peer.service recovera-peer-sync.timer || return 1
   log "Recovera replication: https://$(hostname -I | awk '{print $1}'):$PEER_PORT/ (use a registered local administrator)"
 }
 
