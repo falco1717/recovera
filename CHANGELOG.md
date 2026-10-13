@@ -9,6 +9,8 @@
 - Added hardened OVA preparation and first-boot initialization that remove
   builder credentials and regenerate every clone-specific machine, SSH, TLS,
   ZFS, device, replication, and administrative identity.
+- Replaced the vendor ASCII artwork on the local VM console and SSH login
+  banner with consistent Recovera branding.
 - Documented OVA import, validation, publication, and recovery procedures.
 
 ## v0.5.1 - 2026-10-13

@@ -4,6 +4,7 @@ from pathlib import Path
 
 
 SCRIPT = Path(__file__).parents[1] / "setup" / "branding" / "apply-branding.py"
+ROOT = Path(__file__).parents[1]
 
 
 def load_module():
@@ -14,6 +15,17 @@ def load_module():
 
 
 class RecoveraBrandingTests(unittest.TestCase):
+    def test_console_and_login_branding_are_recovera_owned(self):
+        logo = (ROOT / "setup" / "branding" / "recovera-ascii.logo").read_text()
+        motd = (ROOT / "setup" / "branding" / "recovera-motd").read_text()
+        installer = (ROOT / "setup" / "setup.sh").read_text()
+
+        self.assertNotIn("Datto", logo)
+        self.assertIn("R E C O V E R A", motd)
+        self.assertIn("/usr/lib/datto/statusshell/logo/0.logo", installer)
+        self.assertIn("chmod a-x /etc/update-motd.d/25-datto", installer)
+        self.assertIn("/etc/update-motd.d/25-recovera", installer)
+
     def test_recovery_points_bridge_is_injected_once_after_native_view(self):
         branding = load_module()
         source = """{% block scripts %}

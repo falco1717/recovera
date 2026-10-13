@@ -968,6 +968,8 @@ PY
 p77_recovera_branding() {
   [ -f "$INSTALL_DIR/branding/apply-branding.py" ] || { log "Recovera branding script is missing"; return 1; }
   [ -f "$INSTALL_DIR/branding/recovera-logo.png" ] || { log "Recovera logo is missing"; return 1; }
+  [ -f "$INSTALL_DIR/branding/recovera-ascii.logo" ] || { log "Recovera console logo is missing"; return 1; }
+  [ -f "$INSTALL_DIR/branding/recovera-motd" ] || { log "Recovera login banner is missing"; return 1; }
   [ -f "$INSTALL_DIR/branding/RecoveraTargetController.php" ] || { log "Recovera off-site target controller is missing"; return 1; }
   [ -f "$INSTALL_DIR/branding/recovera-access.html.twig" ] || { log "Recovera appliance-access page is missing"; return 1; }
   [ -f "$INSTALL_DIR/branding/RecoveraAccess.js" ] || { log "Recovera appliance-access script is missing"; return 1; }
@@ -980,8 +982,21 @@ p77_recovera_branding() {
   python3 "$INSTALL_DIR/branding/apply-branding.py" \
     "$INSTALL_DIR/branding/recovera-logo.png" || return 1
   python3 "$INSTALL_DIR/branding/apply-peer-ui.py" || return 1
+  install -d -m 0755 /usr/local/share/recovera || return 1
+  install -m 0644 "$INSTALL_DIR/branding/recovera-ascii.logo" \
+    /usr/local/share/recovera/recovera-ascii.logo || return 1
+  if [ -d /usr/lib/datto/statusshell/logo ]; then
+    rm -f /usr/lib/datto/statusshell/logo/*.logo || return 1
+    install -m 0644 "$INSTALL_DIR/branding/recovera-ascii.logo" \
+      /usr/lib/datto/statusshell/logo/0.logo || return 1
+  fi
+  if [ -e /etc/update-motd.d/25-datto ]; then
+    chmod a-x /etc/update-motd.d/25-datto || return 1
+  fi
+  install -m 0755 "$INSTALL_DIR/branding/recovera-motd" \
+    /etc/update-motd.d/25-recovera || return 1
   systemctl restart php8.1-fpm >/dev/null 2>&1 || return 1
-  log "Recovera branding installed"
+  log "Recovera WebUI, console, and login branding installed"
 }
 
 p78_peer_replication() {

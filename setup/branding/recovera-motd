@@ -1,0 +1,14 @@
+#!/bin/sh
+
+logo=/usr/local/share/recovera/recovera-ascii.logo
+image_version=$(cat /datto/config/imageVer 2>/dev/null || printf 'unknown')
+application_version=$(cat /datto/config/os2Version 2>/dev/null || printf 'unknown')
+
+printf '\n'
+if [ -r "$logo" ]; then
+    cat "$logo"
+fi
+printf '\n                 R E C O V E R A   A P P L I A N C E\n'
+printf '                       Welcome, administrator.\n\n'
+printf '                    Version: %s / %s\n\n' \
+    "$application_version" "$image_version"
