@@ -61,6 +61,19 @@ try {
     if (!str_ends_with($statusApi, "\n200") || !str_contains($statusApi, '"service":"recovera-peer"')) {
         throw new RuntimeException('Off-site Target API did not return Recovera status');
     }
+    $queueApi = curlRequest(['-b', $cookie, '-H', 'X-Requested-With: XMLHttpRequest',
+        '-w', '\n%{http_code}', 'https://127.0.0.1/api/recovera/offsite-target/queue-status']);
+    if (!str_ends_with($queueApi, "\n200") || !str_contains($queueApi, '"items"')) {
+        throw new RuntimeException('Recovery-point queue status API did not render successfully');
+    }
+    $recoveryTemplate = (string) @file_get_contents(
+        '/usr/lib/datto/device/templates/commonlookandfeel/Assets/RecoveryPoints/index.html.twig');
+    $recoveryScript = (string) @file_get_contents(
+        '/datto/web/commonlookandfeel/js/App/Assets/RecoveraRecoveryPoints.js');
+    if (!str_contains($recoveryTemplate, 'RecoveraRecoveryPoints.js') ||
+        !str_contains($recoveryScript, 'v1/device/snapshot/send')) {
+        throw new RuntimeException('Native recovery-point queue bridge is not installed');
+    }
     $added = curlRequest(['-b', $cookie, '-H', 'X-Requested-With: XMLHttpRequest',
         '--data-urlencode', 'csrf=' . $pageCsrf, '--data-urlencode',
         'payload={"secondsWeekStart":12345,"secondsWeekEnd":12600,"speed":1024}',

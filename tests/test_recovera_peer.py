@@ -2,6 +2,7 @@ import importlib.machinery
 import importlib.util
 import json
 import os
+import sys
 import tempfile
 import unittest
 from types import SimpleNamespace
@@ -13,10 +14,25 @@ SCRIPT = Path(__file__).parents[1] / "setup" / "peer" / "recovera-peer"
 
 
 def load_module(root: Path):
+    if "fcntl" not in sys.modules:
+        try:
+            __import__("fcntl")
+        except ModuleNotFoundError:
+            sys.modules["fcntl"] = SimpleNamespace(
+                LOCK_EX=2, LOCK_NB=4, flock=lambda *_args: None
+            )
+    if "grp" not in sys.modules:
+        try:
+            __import__("grp")
+        except ModuleNotFoundError:
+            sys.modules["grp"] = SimpleNamespace(
+                getgrnam=lambda _name: SimpleNamespace(gr_gid=0)
+            )
     os.environ["RECOVERA_PEER_ETC"] = str(root / "etc")
     os.environ["RECOVERA_PEER_STATE"] = str(root / "state")
     os.environ["RECOVERA_PEER_KEYS"] = str(root / "keys")
     os.environ["RECOVERA_PEER_LOCK"] = str(root / "lock")
+    os.environ["RECOVERA_PEER_STATE_LOCK"] = str(root / "state.lock")
     os.environ["RECOVERA_PEER_OFFSITE"] = str(root / "offsite.json")
     os.environ["RECOVERA_PEER_WEB_TOKEN"] = str(root / "web.token")
     os.environ["RECOVERA_TX_SPEED"] = str(root / "txSpeed")
@@ -126,6 +142,94 @@ class RecoveraPeerTests(unittest.TestCase):
             self.peer.configure_asset(asset, "12345678-1234-1234-1234-123456789abc", 1)
         result = self.peer.configure_asset(asset, "12345678-1234-1234-1234-123456789abc", 60)
         self.assertEqual(result["interval_minutes"], 60)
+
+    def test_native_queue_prefers_asset_policy_then_single_target(self):
+        asset = "6" * 32
+        first = "12345678-1234-1234-1234-123456789abc"
+        second = "87654321-4321-4321-4321-cba987654321"
+        cfg = self.peer.config()
+        cfg["peers"] = {
+            first: {"name": "one", "enabled": True},
+            second: {"name": "two", "enabled": True},
+        }
+        cfg["assets"][asset] = {"peer_id": second, "enabled": True}
+        self.assertEqual(self.peer.target_for_asset(cfg, asset), second)
+        cfg["assets"] = {}
+        cfg["peers"][first]["enabled"] = False
+        self.assertEqual(self.peer.target_for_asset(cfg, asset), second)
+
+    def test_native_queue_rejects_ambiguous_targets(self):
+        cfg = self.peer.config()
+        cfg["peers"] = {
+            "12345678-1234-1234-1234-123456789abc": {"enabled": True},
+            "87654321-4321-4321-4321-cba987654321": {"enabled": True},
+        }
+        with self.assertRaisesRegex(self.peer.PeerError, "multiple off-site targets"):
+            self.peer.target_for_asset(cfg, "7" * 32)
+
+    def test_native_queue_persists_and_wakes_worker(self):
+        asset, snapshot = "8" * 32, "1791756980"
+        target = "12345678-1234-1234-1234-123456789abc"
+        cfg = self.peer.config()
+        cfg["peers"][target] = {"name": "target", "enabled": True}
+        self.peer.save_config(cfg)
+        completed = mock.Mock(returncode=0, stdout=b"", stderr=b"")
+        with mock.patch.object(self.peer, "zfs_exists", return_value=True), \
+             mock.patch.object(self.peer, "zfs_snapshots", return_value=[snapshot]), \
+             mock.patch.object(self.peer, "load_origin", return_value={}), \
+             mock.patch.object(self.peer, "run", return_value=completed) as invoke:
+            item = self.peer.queue_snapshot(asset, snapshot)
+        self.assertEqual(item["status"], "queued")
+        self.assertEqual(self.peer.queue_document()["items"][0]["snapshot"], snapshot)
+        invoke.assert_called_once_with(
+            ["systemctl", "start", "--no-block", "recovera-peer-sync.service"],
+            check=False, timeout=10,
+        )
+
+    def test_native_queue_worker_tracks_success_and_error_in_order(self):
+        target = "12345678-1234-1234-1234-123456789abc"
+        first, second = "9" * 32, "a" * 32
+        value = self.peer.state()
+        value["queue"] = {
+            self.peer.queue_key(target, second, "200"): {
+                "key": self.peer.queue_key(target, second, "200"), "asset": second,
+                "snapshot": "200", "peer_id": target, "status": "queued", "queued_at": 2,
+            },
+            self.peer.queue_key(target, first, "100"): {
+                "key": self.peer.queue_key(target, first, "100"), "asset": first,
+                "snapshot": "100", "peer_id": target, "status": "queued", "queued_at": 1,
+            },
+        }
+        self.peer.save_state(value)
+
+        def replicate(asset, peer_id, snapshot, speed_kbps=0):
+            if asset == second:
+                raise self.peer.PeerError("network unavailable")
+            return {"ok": True, "asset": asset, "snapshot": snapshot, "status": "full"}
+
+        with mock.patch.object(self.peer, "replicate", side_effect=replicate) as invoke:
+            results = self.peer.queued_sync(1250)
+        self.assertEqual([call.args[0] for call in invoke.call_args_list], [first, second])
+        self.assertTrue(results[0]["ok"])
+        self.assertFalse(results[1]["ok"])
+        statuses = {item["snapshot"]: item["status"]
+                    for item in self.peer.queue_document()["items"]}
+        self.assertEqual(statuses, {"100": "completed", "200": "error"})
+
+    def test_native_queue_worker_resumes_interrupted_sync(self):
+        target, asset = "12345678-1234-1234-1234-123456789abc", "b" * 32
+        key = self.peer.queue_key(target, asset, "300")
+        value = self.peer.state()
+        value["queue"] = {key: {
+            "key": key, "asset": asset, "snapshot": "300", "peer_id": target,
+            "status": "syncing", "queued_at": 1,
+        }}
+        self.peer.save_state(value)
+        answer = {"ok": True, "asset": asset, "snapshot": "300", "status": "resumed"}
+        with mock.patch.object(self.peer, "replicate", return_value=answer) as invoke:
+            self.peer.queued_sync(0)
+        invoke.assert_called_once_with(asset, target, "300", speed_kbps=0)
+        self.assertEqual(self.peer.state()["queue"][key]["status"], "completed")
 
     def test_known_hosts_uses_brackets_for_nonstandard_port(self):
         lines = self.peer.known_host_lines("10.0.0.2", 2222, ["ssh-ed25519 AAAATEST comment"])

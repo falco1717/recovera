@@ -61,6 +61,11 @@ replication interval. **Configure → Off-site Synchronization** controls the
 weekly replication windows and upload-speed limit. The CLI workflow is documented in
 [`docs/peer-replication.md`](docs/peer-replication.md).
 
+Individual recovery points can also be queued from the native recovery-points
+page. The existing **Exists in Cloud** column is retained for SIRIS Private
+compatibility: **Queued**, **Streaming**, and the completed green indicator refer
+to the paired Recovera target, and the state survives normal page refreshes.
+
 Only TCP 9443 (pairing/status) and TCP 22 (encrypted backup streams) are used.
 For different sites, expose them only across a site-to-site VPN and restrict
 them to the two appliance addresses. Internet connectivity is not required.

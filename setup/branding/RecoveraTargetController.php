@@ -36,6 +36,8 @@ final class RecoveraTargetController extends AbstractController
             'peer' => ['POST', '/v1/admin/peer'],
             'rule' => ['POST', '/v1/admin/rule'],
             'sync' => ['POST', '/v1/admin/sync'],
+            'queue' => ['POST', '/v1/admin/queue'],
+            'queue-status' => ['GET', '/v1/admin/queue-status'],
             'offsite' => ['GET', '/v1/admin/offsite'],
             'schedule-add' => ['POST', '/v1/admin/offsite/schedule-add'],
             'schedule-delete' => ['POST', '/v1/admin/offsite/schedule-delete'],

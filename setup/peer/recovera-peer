@@ -30,7 +30,7 @@ import uuid
 from pathlib import Path
 from typing import Any, BinaryIO
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 ETC = Path(os.environ.get("RECOVERA_PEER_ETC", "/etc/recovera-peer"))
 STATE_DIR = Path(os.environ.get("RECOVERA_PEER_STATE", "/var/lib/recovera-peer"))
 CONFIG_PATH = ETC / "config.json"
@@ -42,6 +42,9 @@ SSH_KEY_PATH = ETC / "id_ed25519"
 KNOWN_HOSTS_PATH = ETC / "known_hosts"
 KEYS_DIR = Path(os.environ.get("RECOVERA_PEER_KEYS", "/datto/config/keys"))
 LOCK_PATH = Path(os.environ.get("RECOVERA_PEER_LOCK", "/run/recovera-peer-sync.lock"))
+STATE_LOCK_PATH = Path(os.environ.get(
+    "RECOVERA_PEER_STATE_LOCK", "/run/recovera-peer-state.lock"
+))
 OFFSITE_PATH = Path(os.environ.get("RECOVERA_PEER_OFFSITE", "/etc/recovera-peer/offsite.json"))
 WEB_TOKEN_PATH = Path(os.environ.get("RECOVERA_PEER_WEB_TOKEN", "/etc/recovera-peer/web.token"))
 TX_SPEED_PATH = Path(os.environ.get("RECOVERA_TX_SPEED", "/datto/config/local/txSpeed"))
@@ -134,7 +137,11 @@ def config() -> dict[str, Any]:
 
 
 def state() -> dict[str, Any]:
-    return load_json(STATE_PATH, {"assets": {}, "events": []})
+    value = load_json(STATE_PATH, {"assets": {}, "events": [], "queue": {}})
+    value.setdefault("assets", {})
+    value.setdefault("events", [])
+    value.setdefault("queue", {})
+    return value
 
 
 def save_config(cfg: dict[str, Any]) -> None:
@@ -143,7 +150,26 @@ def save_config(cfg: dict[str, Any]) -> None:
 
 def save_state(value: dict[str, Any]) -> None:
     value["events"] = value.get("events", [])[-200:]
+    queue = value.setdefault("queue", {})
+    if len(queue) > 1000:
+        active = [(key, item) for key, item in queue.items()
+                  if item.get("status") in ("queued", "syncing")]
+        history = [(key, item) for key, item in queue.items()
+                   if item.get("status") not in ("queued", "syncing")]
+        history.sort(key=lambda entry: int(entry[1].get("updated", 0)), reverse=True)
+        value["queue"] = dict(active + history[:max(0, 1000 - len(active))])
     atomic_json(STATE_PATH, value)
+
+
+@contextlib.contextmanager
+def locked_state() -> Any:
+    """Serialize state.json read/modify/write operations across service processes."""
+    STATE_LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with STATE_LOCK_PATH.open("a+") as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        value = state()
+        yield value
+        save_state(value)
 
 
 def default_offsite() -> dict[str, Any]:
@@ -236,11 +262,10 @@ def set_speed(speed_kbps: int) -> int:
 
 
 def event(kind: str, message: str, **fields: Any) -> None:
-    value = state()
-    value.setdefault("events", []).append(
-        {"time": int(time.time()), "kind": kind, "message": message, **fields}
-    )
-    save_state(value)
+    with locked_state() as value:
+        value.setdefault("events", []).append(
+            {"time": int(time.time()), "kind": kind, "message": message, **fields}
+        )
 
 
 def fingerprint_der(cert_der: bytes) -> str:
@@ -672,11 +697,10 @@ def replicate(asset: str, peer_id: str, snapshot: str | None = None,
             transfer_stream(["zfs", "send", f"{dataset}@{snapshot}"], peer,
                             ["receive", asset, snapshot, "-", metadata], speed_kbps)
             mode = "full"
-    value = state()
     key = f"{peer_id}:{asset}"
-    value.setdefault("assets", {})[key] = {"last_success": int(time.time()),
-        "last_snapshot": snapshot, "mode": mode, "error": None}
-    save_state(value)
+    with locked_state() as value:
+        value.setdefault("assets", {})[key] = {"last_success": int(time.time()),
+            "last_snapshot": snapshot, "mode": mode, "error": None}
     event("replication-success", f"Replicated {asset}@{snapshot}", asset=asset, peer_id=peer_id, mode=mode)
     return {"ok": True, "asset": asset, "snapshot": snapshot, "status": mode}
 
@@ -713,12 +737,11 @@ def receive_dataset(source_id: str, asset: str, snapshot: str, base: str,
             raise PeerError("refusing a full stream over an existing backup chain")
         if base != "-" and base not in existing:
             raise PeerError(f"incremental base {base} is not present on the target")
-    value = state()
-    value.setdefault("received", {})[asset] = {
-        "source_id": source_id, "snapshot": snapshot,
-        "status": "receiving", "updated": int(time.time()),
-    }
-    save_state(value)
+    with locked_state() as value:
+        value.setdefault("received", {})[asset] = {
+            "source_id": source_id, "snapshot": snapshot,
+            "status": "receiving", "updated": int(time.time()),
+        }
     proc = subprocess.run(["zfs", "receive", "-u", "-s", dataset], stdin=stream,
                           stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     if proc.returncode != 0:
@@ -738,12 +761,11 @@ def receive_dataset(source_id: str, asset: str, snapshot: str, base: str,
     # snapctl may rewrite originDevice using its legacy schema. Restore the
     # source identity used by collision and replication-loop protections.
     install_metadata(asset, metadata)
-    value = state()
-    value.setdefault("received", {})[asset] = {
-        "source_id": source_id, "snapshot": snapshot,
-        "status": "ready", "updated": int(time.time()),
-    }
-    save_state(value)
+    with locked_state() as value:
+        value.setdefault("received", {})[asset] = {
+            "source_id": source_id, "snapshot": snapshot,
+            "status": "ready", "updated": int(time.time()),
+        }
     hook_error = "; ".join(error for error in hook_errors if error) or None
     event("receive-success", f"Received {asset}@{snapshot}", source_id=source_id,
           native_hook_error=hook_error)
@@ -784,6 +806,102 @@ def ssh_entry(source_id: str) -> None:
     print(json.dumps(answer, separators=(",", ":")))
 
 
+def target_for_asset(cfg: dict[str, Any], asset: str) -> str:
+    """Resolve the target used by a manually queued native recovery point."""
+    rule = cfg.get("assets", {}).get(asset, {})
+    assigned = str(rule.get("peer_id", ""))
+    peer = cfg.get("peers", {}).get(assigned)
+    if assigned and peer and peer.get("enabled", True):
+        return assigned
+    enabled = [peer_id for peer_id, value in cfg.get("peers", {}).items()
+               if value.get("enabled", True)]
+    if len(enabled) == 1:
+        return enabled[0]
+    if not enabled:
+        raise PeerError("no enabled off-site target is paired")
+    raise PeerError("multiple off-site targets are paired; save a replication policy for this asset")
+
+
+def queue_key(peer_id: str, asset: str, snapshot: str) -> str:
+    return f"{peer_id}:{asset}:{snapshot}"
+
+
+def queue_snapshot(asset: str, snapshot: str) -> dict[str, Any]:
+    """Persist a native UI request and wake the background replication worker."""
+    require_root()
+    cfg = config()
+    asset, snapshot = validate_asset(asset), validate_snapshot(snapshot)
+    dataset = dataset_for(cfg, asset)
+    if not zfs_exists(dataset):
+        raise PeerError(f"source dataset does not exist: {dataset}")
+    if load_origin(asset).get("isReplicated"):
+        raise PeerError("a received replica cannot be queued as a replication source")
+    if snapshot not in zfs_snapshots(dataset):
+        raise PeerError(f"snapshot {snapshot} does not exist for {asset}")
+    peer_id = target_for_asset(cfg, asset)
+    now = int(time.time())
+    key = queue_key(peer_id, asset, snapshot)
+    peer = cfg["peers"][peer_id]
+    with locked_state() as value:
+        item = {
+            "key": key, "asset": asset, "snapshot": snapshot, "peer_id": peer_id,
+            "target": peer.get("name", peer_id), "status": "queued", "error": None,
+            "queued_at": int(value.get("queue", {}).get(key, {}).get("queued_at", now)),
+            "updated": now,
+        }
+        value.setdefault("queue", {})[key] = item
+    event("replication-queued", f"Queued {asset}@{snapshot}", asset=asset,
+          peer_id=peer_id, snapshot=snapshot)
+    # The timer is still the durable fallback if systemd is temporarily busy.
+    with contextlib.suppress(PeerError, subprocess.TimeoutExpired):
+        run(["systemctl", "start", "--no-block", "recovera-peer-sync.service"],
+            check=False, timeout=10)
+    return item
+
+
+def queue_document() -> dict[str, Any]:
+    items = list(state().get("queue", {}).values())
+    items.sort(key=lambda item: (int(item.get("snapshot", 0)),
+                                 int(item.get("queued_at", 0))), reverse=True)
+    return {"items": items}
+
+
+def queued_sync(speed: int) -> list[dict[str, Any]]:
+    """Process explicit recovery-point requests before interval policies."""
+    # A "syncing" item is safe to resume here: this function is called while
+    # holding the single worker lock, so no other transfer can still own it.
+    pending = [dict(item) for item in state().get("queue", {}).values()
+               if item.get("status") in ("queued", "syncing")]
+    pending.sort(key=lambda item: (int(item.get("snapshot", 0)),
+                                   int(item.get("queued_at", 0))))
+    results: list[dict[str, Any]] = []
+    for requested in pending:
+        key = str(requested["key"])
+        with locked_state() as value:
+            item = value.get("queue", {}).get(key)
+            if not item or item.get("status") not in ("queued", "syncing"):
+                continue
+            item.update({"status": "syncing", "updated": int(time.time()), "error": None})
+            transfer = dict(item)
+        try:
+            answer = replicate(str(transfer["asset"]), str(transfer["peer_id"]),
+                               str(transfer["snapshot"]), speed_kbps=speed)
+            with locked_state() as value:
+                value["queue"][key].update({"status": "completed", "updated": int(time.time()),
+                                             "error": None, "result": answer.get("status")})
+            results.append(answer)
+        except Exception as exc:
+            with locked_state() as value:
+                if key in value.get("queue", {}):
+                    value["queue"][key].update({"status": "error", "updated": int(time.time()),
+                                                 "error": str(exc)})
+            event("replication-error", str(exc), asset=requested.get("asset"),
+                  peer_id=requested.get("peer_id"), snapshot=requested.get("snapshot"))
+            results.append({"ok": False, "asset": requested.get("asset"),
+                            "snapshot": requested.get("snapshot"), "error": str(exc)})
+    return results
+
+
 def configured_sync() -> list[dict[str, Any]]:
     require_root()
     cfg, results, now, current = config(), [], int(time.time()), state()
@@ -791,8 +909,12 @@ def configured_sync() -> list[dict[str, Any]]:
     if speed < 0:
         event("replication-paused", "Off-site replication is paused by the active schedule")
         return [{"ok": True, "status": "paused-by-schedule"}]
+    queued_results = queued_sync(speed)
+    results.extend(queued_results)
+    queued_assets = {str(item.get("asset")) for item in queued_results if item.get("asset")}
+    current = state()
     for asset, rule in cfg.get("assets", {}).items():
-        if not rule.get("enabled", True):
+        if not rule.get("enabled", True) or asset in queued_assets:
             continue
         peer_id = str(rule["peer_id"])
         key = f"{peer_id}:{asset}"
@@ -803,10 +925,9 @@ def configured_sync() -> list[dict[str, Any]]:
         try:
             results.append(replicate(asset, peer_id, speed_kbps=speed))
         except Exception as exc:
-            value = state()
-            value.setdefault("assets", {}).setdefault(key, {})["error"] = str(exc)
-            value["assets"][key]["last_attempt"] = now
-            save_state(value)
+            with locked_state() as value:
+                value.setdefault("assets", {}).setdefault(key, {})["error"] = str(exc)
+                value["assets"][key]["last_attempt"] = now
             event("replication-error", str(exc), asset=asset, peer_id=peer_id)
             results.append({"ok": False, "asset": asset, "peer_id": peer_id, "error": str(exc)})
     return results
@@ -865,9 +986,8 @@ def received_forget(asset: str) -> None:
     cfg, asset = config(), validate_asset(asset)
     if zfs_exists(dataset_for(cfg, asset)):
         raise PeerError("refusing to forget provenance while the received dataset exists")
-    value = state()
-    value.setdefault("received", {}).pop(asset, None)
-    save_state(value)
+    with locked_state() as value:
+        value.setdefault("received", {}).pop(asset, None)
 
 
 def status_document() -> dict[str, Any]:
@@ -949,10 +1069,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
             elif self.path == "/assets/recovera-logo.png": self.reply(200, LOGO_PATH.read_bytes(), "image/png")
             elif self.path == "/":
                 self.reply(404, {"error": "Use /configure/offsite-target on the Recovera WebUI"})
-            elif self.path == "/v1/admin/status" and self.admin(): self.reply(200, status_document())
-            elif self.path == "/v1/admin/offsite" and self.admin():
-                self.reply(200, {"schedules": offsite()["schedules"], "averages": weekly_averages()})
-            elif self.path not in ("/", "/v1/admin/status"): self.reply(404, {"error": "not found"})
+            elif self.path in ("/v1/admin/status", "/v1/admin/queue-status", "/v1/admin/offsite"):
+                if not self.admin():
+                    return
+                if self.path == "/v1/admin/status":
+                    self.reply(200, status_document())
+                elif self.path == "/v1/admin/queue-status":
+                    self.reply(200, queue_document())
+                else:
+                    self.reply(200, {"schedules": offsite()["schedules"],
+                                     "averages": weekly_averages()})
+            else: self.reply(404, {"error": "not found"})
         except Exception as exc: self.reply(400, {"error": str(exc)})
     def do_POST(self) -> None:
         try:
@@ -970,6 +1097,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             elif self.path == "/v1/admin/sync":
                 with sync_lock():
                     self.reply(200, {"results": configured_sync()})
+            elif self.path == "/v1/admin/queue":
+                self.reply(200, queue_snapshot(str(body["assetKey"]), str(body["snapshotEpoch"])))
             elif self.path == "/v1/admin/offsite/schedule-add":
                 self.reply(200, schedule_add(int(body["secondsWeekStart"]),
                                              int(body["secondsWeekEnd"]), int(body["speed"])))

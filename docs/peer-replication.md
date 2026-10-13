@@ -22,7 +22,15 @@ vendor cloud service.
    fingerprint**. Compare it with the fingerprint displayed on the target.
 4. Enter the one-time code and pair the target.
 5. Select a protected asset, the target appliance, and a replication interval.
-   Save the policy and select **Sync configured assets now** for the first run.
+6. Save the policy and select **Sync configured assets now** for the first run.
+
+You can also open an asset's recovery-points page and queue a specific point
+from the **Exists in Cloud** column. Recovera maps the original SIRIS Private
+control to the asset's configured target. If the asset has no saved policy, a
+single enabled paired target is selected automatically; with multiple targets,
+save a policy first so the destination is unambiguous. The page reports
+**Queued**, **Streaming**, completion, or an actionable error while the transfer
+runs in the background.
 
 The scheduled service checks policies every five minutes. The policy interval
 determines whether a particular asset is due.

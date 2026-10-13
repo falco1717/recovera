@@ -17,6 +17,7 @@ peer_env() {
     RECOVERA_PEER_STATE="$WORK/state" \
     RECOVERA_PEER_KEYS="$WORK/keys" \
     RECOVERA_PEER_LOCK="$WORK/lock" \
+    RECOVERA_PEER_STATE_LOCK="$WORK/state.lock" \
     RECOVERA_PEER_AUTHORIZED_KEYS="$WORK/authorized_keys" \
     python3 "$SCRIPT" "$@"
 }
