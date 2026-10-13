@@ -299,6 +299,42 @@ class RecoveraPeerTests(unittest.TestCase):
         self.assertTrue(result["recovery_ready"])
         self.assertEqual(result["latest_snapshot"], "100")
 
+    def test_replication_capacity_preflight_preserves_target_reserve(self):
+        asset, snapshot = "f" * 32, "1791876008"
+        target = "12345678-1234-1234-1234-123456789abc"
+        cfg = self.peer.config()
+        cfg["peers"][target] = {"enabled": True, "host": "10.0.0.2", "ssh_port": 22}
+        self.peer.save_config(cfg)
+        remote = {"snapshots": [], "storage": {"size": 100 * 1024**3, "free": 1024**3}}
+        with mock.patch.object(self.peer, "zfs_exists", return_value=True), \
+             mock.patch.object(self.peer, "load_origin", return_value={}), \
+             mock.patch.object(self.peer, "zfs_snapshots", return_value=[snapshot]), \
+             mock.patch.object(self.peer, "remote_json", return_value=remote), \
+             mock.patch.object(self.peer, "zfs_send_estimate", return_value=512 * 1024**2):
+            with self.assertRaisesRegex(self.peer.PeerError, "capacity preflight failed"):
+                self.peer.replicate(asset, target)
+
+    def test_scheduler_applies_exponential_retry_backoff(self):
+        asset = "0" * 32
+        target = "12345678-1234-1234-1234-123456789abc"
+        cfg = self.peer.config()
+        cfg["peers"][target] = {"enabled": True}
+        cfg["assets"][asset] = {"peer_id": target, "enabled": True,
+                                 "schedule_mode": "interval", "interval_minutes": 5}
+        self.peer.save_config(cfg)
+        with mock.patch.object(self.peer, "zfs_exists", return_value=True), \
+             mock.patch.object(self.peer, "zfs_snapshots", return_value=["100"]), \
+             mock.patch.object(self.peer, "replicate", side_effect=self.peer.PeerError("offline")) as invoke, \
+             mock.patch.object(self.peer.time, "time", return_value=2_000_000_000):
+            first = self.peer.configured_sync()
+            second = self.peer.configured_sync()
+        self.assertFalse(first[0]["ok"])
+        self.assertEqual(second, [])
+        self.assertEqual(invoke.call_count, 1)
+        record = self.peer.state()["assets"][f"{target}:{asset}"]
+        self.assertEqual(record["consecutive_failures"], 1)
+        self.assertEqual(record["next_retry"], 2_000_000_300)
+
     def test_native_queue_prefers_asset_policy_then_single_target(self):
         asset = "6" * 32
         first = "12345678-1234-1234-1234-123456789abc"
