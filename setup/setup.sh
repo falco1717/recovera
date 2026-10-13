@@ -192,6 +192,8 @@ stage_bundle() {   # copy the bundle to /opt/spf-datto so nothing depends on /ho
   [ -d "$BUNDLE/debs" ] || die "missing debs/ in bundle: $BUNDLE"
   [ -d "$BUNDLE/lists" ] || die "missing lists/ in bundle: $BUNDLE"
   [ -d "$BUNDLE/wheels" ] || die "missing wheels/ in bundle: $BUNDLE"
+  [ -d "$BUNDLE/branding" ] || die "missing branding/ in bundle: $BUNDLE"
+  [ -d "$BUNDLE/peer" ] || die "missing peer/ in bundle: $BUNDLE"
   need_kb=$(( $(du -sk "$BUNDLE" | cut -f1) + 6*1024*1024 ))   # bundle + ~6 GB for the install itself
   free_kb=$(df -Pk / | awk 'NR==2{print $4}')
   [ "$free_kb" -ge "$need_kb" ] || { echo "not enough space on /: need ~$((need_kb/1024/1024)) GB, have $((free_kb/1024/1024)) GB"; exit 1; }
@@ -201,6 +203,8 @@ stage_bundle() {   # copy the bundle to /opt/spf-datto so nothing depends on /ho
   [ -f "$BUNDLE/README.txt" ] && cp -a "$BUNDLE/README.txt" "$INSTALL_DIR/"
   rm -rf "$INSTALL_DIR/wheels"; cp -a "$BUNDLE/wheels" "$INSTALL_DIR/"
   rm -rf "$INSTALL_DIR/lists"; cp -a "$BUNDLE/lists" "$INSTALL_DIR/"
+  rm -rf "$INSTALL_DIR/branding"; cp -a "$BUNDLE/branding" "$INSTALL_DIR/"
+  rm -rf "$INSTALL_DIR/peer"; cp -a "$BUNDLE/peer" "$INSTALL_DIR/"
   if [ -d "$BUNDLE/conffiles" ]; then rm -rf "$INSTALL_DIR/conffiles"; cp -a "$BUNDLE/conffiles" "$INSTALL_DIR/"; fi
   if [ ! -f "$INSTALL_DIR/debs/.verified" ]; then
     rm -rf "$INSTALL_DIR/debs"; cp -a "$BUNDLE/debs" "$INSTALL_DIR/"
