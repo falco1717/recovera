@@ -69,9 +69,12 @@ page. The existing **Exists in Cloud** column is retained for SIRIS Private
 compatibility: **Queued**, **Streaming**, and the completed green indicator refer
 to the paired Recovera target, and the state survives normal page refreshes.
 
-Only TCP 9443 (pairing/status) and TCP 22 (encrypted backup streams) are used.
-For different sites, expose them only across a site-to-site VPN and restrict
-them to the two appliance addresses. Internet connectivity is not required.
+Only TCP 443 (pairing/status through the normal Recovera site) and TCP 22
+(encrypted backup streams) are used between appliances. The peer service still
+uses TCP 9443 internally on loopback, but it must never be exposed through the
+host firewall. For different sites, expose 443 and 22 only across a site-to-site
+VPN and restrict them to the two appliance addresses. Internet connectivity is
+not required.
 
 ## Fully air-gapped install
 
@@ -108,6 +111,8 @@ safely; completed phases are skipped.
 - `setup/prune-packages.txt` is the reviewed source-appliance-only exclusion list.
 - `tools/make-bundle.sh` builds and validates the sanitized payload from the
   package export; `tools/sanitize-datto-package.py` removes embedded identity.
+- [`docs/upgrading.md`](docs/upgrading.md) documents upgrades and rollback.
+- [`docs/releasing.md`](docs/releasing.md) is the maintainer release checklist.
 
 The payload still contains proprietary/repacked appliance packages and selected
 configuration files. Keep the repository and release private and treat the

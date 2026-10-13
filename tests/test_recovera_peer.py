@@ -57,6 +57,13 @@ class RecoveraPeerTests(unittest.TestCase):
     def tearDown(self):
         self.temp.cleanup()
 
+    def test_peer_service_has_no_standalone_admin_page(self):
+        self.assertFalse(hasattr(self.peer, "HTML"))
+        self.assertFalse(hasattr(self.peer, "LOGO_PATH"))
+        source = SCRIPT.read_text(encoding="utf-8")
+        self.assertNotIn("/assets/recovera-logo.png", source)
+        self.assertIn("Use /configure/offsite-target on the Recovera WebUI", source)
+
     def test_offsite_schedule_add_apply_and_delete(self):
         item = self.peer.schedule_add(3600, 7200, -1)
         self.assertEqual(item["schedID"], 1)
