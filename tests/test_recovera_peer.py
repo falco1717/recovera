@@ -2,6 +2,7 @@ import importlib.machinery
 import importlib.util
 import json
 import os
+import socket
 import sys
 import tempfile
 import unittest
@@ -11,9 +12,14 @@ from unittest import mock
 
 
 SCRIPT = Path(__file__).parents[1] / "setup" / "peer" / "recovera-peer"
+GATEWAY = SCRIPT.with_name("recovera-peer-gateway.conf")
+SERVICE = SCRIPT.with_name("recovera-peer.service")
+CONTROLLER = SCRIPT.parents[1] / "branding" / "RecoveraTargetController.php"
 
 
 def load_module(root: Path):
+    if not hasattr(socket, "AF_UNIX"):
+        socket.AF_UNIX = 1
     if "fcntl" not in sys.modules:
         try:
             __import__("fcntl")
@@ -37,6 +43,8 @@ def load_module(root: Path):
     os.environ["RECOVERA_PEER_WEB_TOKEN"] = str(root / "web.token")
     os.environ["RECOVERA_TX_SPEED"] = str(root / "txSpeed")
     os.environ["RECOVERA_PEER_AUTHORIZED_KEYS"] = str(root / "authorized_keys")
+    os.environ["RECOVERA_PEER_SOCKET"] = str(root / "peer.sock")
+    os.environ["RECOVERA_APACHE_TLS_CERT"] = str(root / "apache.crt")
     loader = importlib.machinery.SourceFileLoader("recovera_peer_test", str(SCRIPT))
     spec = importlib.util.spec_from_loader(loader.name, loader)
     module = importlib.util.module_from_spec(spec)
@@ -62,7 +70,26 @@ class RecoveraPeerTests(unittest.TestCase):
         self.assertFalse(hasattr(self.peer, "LOGO_PATH"))
         source = SCRIPT.read_text(encoding="utf-8")
         self.assertNotIn("/assets/recovera-logo.png", source)
+        self.assertNotIn("ThreadingHTTPServer", source)
+        self.assertNotIn("9443", source)
         self.assertIn("Use /configure/offsite-target on the Recovera WebUI", source)
+
+    def test_peer_service_defaults_to_unix_socket_without_tcp_listener(self):
+        config = self.peer.default_config()
+        self.assertNotIn("listen", config)
+        self.assertNotIn("port", config)
+        self.assertEqual(self.peer.SOCKET_PATH, self.root / "peer.sock")
+
+    def test_webui_and_apache_use_restricted_unix_socket(self):
+        gateway = GATEWAY.read_text(encoding="utf-8")
+        controller = CONTROLLER.read_text(encoding="utf-8")
+        service = SERVICE.read_text(encoding="utf-8")
+        for text in (gateway, controller, service):
+            self.assertNotIn("9443", text)
+        self.assertIn("unix:/run/recovera-peer/http.sock|http://localhost", gateway)
+        self.assertIn("CURLOPT_UNIX_SOCKET_PATH", controller)
+        self.assertIn("RuntimeDirectory=recovera-peer", service)
+        self.assertIn("Group=www-data", service)
 
     def test_offsite_schedule_add_apply_and_delete(self):
         item = self.peer.schedule_add(3600, 7200, -1)
@@ -445,7 +472,7 @@ class RecoveraPeerTests(unittest.TestCase):
         connection.sock.getpeercert.return_value = b"target-certificate"
         with mock.patch.object(self.peer.http.client, "HTTPSConnection", return_value=connection):
             with self.assertRaises(self.peer.PeerError):
-                self.peer.ssl_json("10.0.0.2", 9443, "/v1/pair", {"code": "secret"},
+                self.peer.ssl_json("10.0.0.2", 443, "/recovera-peer/pair", {"code": "secret"},
                                    expected_fingerprint="SHA256:00")
         connection.request.assert_not_called()
 

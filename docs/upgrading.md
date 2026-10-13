@@ -26,7 +26,7 @@ not modified by this procedure.
 
    ```bash
    git fetch --tags origin
-   git checkout v0.5.0
+   git checkout <release-tag>
    sha256sum setup/release.env
    ```
 

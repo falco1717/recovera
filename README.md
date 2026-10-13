@@ -70,11 +70,10 @@ compatibility: **Queued**, **Streaming**, and the completed green indicator refe
 to the paired Recovera target, and the state survives normal page refreshes.
 
 Only TCP 443 (pairing/status through the normal Recovera site) and TCP 22
-(encrypted backup streams) are used between appliances. The peer service still
-uses TCP 9443 internally on loopback, but it must never be exposed through the
-host firewall. For different sites, expose 443 and 22 only across a site-to-site
-VPN and restrict them to the two appliance addresses. Internet connectivity is
-not required.
+(encrypted backup streams) are used. The internal peer API uses a restricted
+Unix-domain socket and does not open another TCP listener. For different sites,
+expose 443 and 22 only across a site-to-site VPN and restrict them to the two
+appliance addresses. Internet connectivity is not required.
 
 ## Fully air-gapped install
 
