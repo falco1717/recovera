@@ -56,9 +56,12 @@ replication-received hook so recovery points remain locally discoverable.
 
 Sign in to the normal Recovera WebUI and open **Configure → Off-site Target**.
 On the target, generate a one-time code. On the source, enter the target IP,
-verify its TLS fingerprint, enter that code, and choose the protected asset and
-replication interval. **Configure → Off-site Synchronization** controls the
-weekly replication windows and upload-speed limit. The CLI workflow is documented in
+verify its TLS fingerprint, and enter that code. The paired appliance then appears
+as an authorized target in **Protect a System → Replication & Retention**, where
+you select the destination, replication frequency, and target-side retention.
+The Off-site Target page can also create or revise a policy after protection.
+**Configure → Off-site Synchronization** controls the weekly replication windows
+and upload-speed limit. The CLI workflow is documented in
 [`docs/peer-replication.md`](docs/peer-replication.md).
 
 Individual recovery points can also be queued from the native recovery-points

@@ -143,6 +143,96 @@ class RecoveraPeerTests(unittest.TestCase):
         result = self.peer.configure_asset(asset, "12345678-1234-1234-1234-123456789abc", 60)
         self.assertEqual(result["interval_minutes"], 60)
 
+    def test_wizard_assigns_policy_by_serialized_asset_identity(self):
+        asset = "c" * 32
+        target = "12345678-1234-1234-1234-123456789abc"
+        cfg = self.peer.config()
+        cfg["peers"][target] = {"name": "target", "enabled": True}
+        self.peer.save_config(cfg)
+        self.peer.KEYS_DIR.mkdir(parents=True, exist_ok=True)
+        name = "Protected Test VM"
+        serialized = f'a:2:{{s:4:"name";s:{len(name)}:"{name}";s:8:"hostname";s:7:"test-vm";}}'
+        (self.peer.KEYS_DIR / f"{asset}.agentInfo").write_text(serialized)
+        results = self.peer.configure_systems(
+            [{"name": name}], target, interval=1440, retention_hours=2232
+        )
+        self.assertEqual(results[0]["asset"], asset)
+        rule = self.peer.config()["assets"][asset]
+        self.assertEqual(rule["peer_id"], target)
+        self.assertEqual(rule["interval_minutes"], 1440)
+        self.assertEqual(rule["retention_hours"], 2232)
+
+    def test_wizard_prefers_uuid_when_names_are_duplicated(self):
+        first, second = "d" * 32, "e" * 32
+        target = "12345678-1234-1234-1234-123456789abc"
+        cfg = self.peer.config()
+        cfg["peers"][target] = {"name": "target", "enabled": True}
+        self.peer.save_config(cfg)
+        self.peer.KEYS_DIR.mkdir(parents=True, exist_ok=True)
+        for asset, uuid in ((first, "uuid-one"), (second, "uuid-two")):
+            raw = f'a:2:{{s:4:"name";s:9:"Duplicate";s:4:"uuid";s:{len(uuid)}:"{uuid}";}}'
+            (self.peer.KEYS_DIR / f"{asset}.agentInfo").write_text(raw)
+        results = self.peer.configure_systems(
+            [{"name": "Duplicate", "uuid": "uuid-two"}], target, 60, 744
+        )
+        self.assertEqual([result["asset"] for result in results], [second])
+
+    def test_newly_protected_asset_is_available_before_first_snapshot(self):
+        asset = "f" * 32
+        self.peer.KEYS_DIR.mkdir(parents=True, exist_ok=True)
+        name = "Freshly Protected VM"
+        raw = f'a:1:{{s:4:"name";s:{len(name)}:"{name}";}}'
+        (self.peer.KEYS_DIR / f"{asset}.agentInfo").write_text(raw)
+        completed = mock.Mock(returncode=1, stdout=b"", stderr=b"missing")
+        with mock.patch.object(self.peer, "run", return_value=completed):
+            assets = self.peer.assets_local(self.peer.config())
+        self.assertEqual(assets, [{
+            "key": asset,
+            "name": name,
+            "dataset": f"homePool/home/agents/{asset}",
+            "snapshots": [],
+            "replicated": False,
+            "origin": {},
+        }])
+
+    def test_replication_metadata_carries_target_retention(self):
+        asset = "b" * 32
+        target = "12345678-1234-1234-1234-123456789abc"
+        cfg = self.peer.config()
+        cfg["peers"][target] = {"name": "target", "enabled": True}
+        cfg["assets"][asset] = {
+            "peer_id": target,
+            "interval_minutes": 1440,
+            "retention_hours": 2232,
+            "enabled": True,
+        }
+        self.peer.save_config(cfg)
+        with mock.patch.object(self.peer, "ssh_public_key", return_value="ssh-ed25519 test"):
+            metadata = self.peer.collect_metadata(asset, cfg)
+        self.assertEqual(metadata["retention_hours"], 2232)
+
+    def test_target_retention_prunes_expired_points_but_keeps_newest(self):
+        now = 2_000_000_000
+        expired = str(now - 10 * 86400)
+        recent = str(now - 3600)
+        newest = str(now - 1800)
+        completed = mock.Mock(returncode=0, stdout=b"", stderr=b"")
+        with mock.patch.object(self.peer, "zfs_snapshots",
+                               return_value=[expired, recent, newest]), \
+             mock.patch.object(self.peer, "run", return_value=completed) as invoke:
+            removed = self.peer.prune_received_snapshots(
+                "homePool/home/agents/" + "d" * 32, 24, now=now
+            )
+        self.assertEqual(removed, [expired])
+        invoke.assert_called_once_with([
+            "snapctl", "asset:recoverypoints:local:destroy", "d" * 32, expired
+        ])
+
+    def test_target_retention_refuses_unsafe_values(self):
+        for value in (0, 23, self.peer.MAX_RETENTION_HOURS + 1):
+            with self.assertRaises(self.peer.PeerError):
+                self.peer.prune_received_snapshots("homePool/test", value)
+
     def test_native_queue_prefers_asset_policy_then_single_target(self):
         asset = "6" * 32
         first = "12345678-1234-1234-1234-123456789abc"

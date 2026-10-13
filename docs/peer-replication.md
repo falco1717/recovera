@@ -21,8 +21,15 @@ vendor cloud service.
 3. On the source, enter the target IP and select **Discover and verify
    fingerprint**. Compare it with the fingerprint displayed on the target.
 4. Enter the one-time code and pair the target.
-5. Select a protected asset, the target appliance, and a replication interval.
-6. Save the policy and select **Sync configured assets now** for the first run.
+5. Start **Protect a System**. In **Replication & Retention**, choose **Target
+   Recovera appliance**, select the authorized target, the replication
+   frequency, and how long recovery points should remain on the target.
+6. Finish protecting the system. Recovera saves the replication policy as part
+   of the completed protection workflow.
+
+For systems that are already protected, **Configure → Off-site Target** can
+create or revise the same target, frequency, and retention policy. Select
+**Synchronize now** there to start an immediate policy run.
 
 You can also open an asset's recovery-points page and queue a specific point
 from the **Exists in Cloud** column. Recovera maps the original SIRIS Private
@@ -78,9 +85,9 @@ replication policy still references it.
 - Source metadata is copied from an allowlist; hypervisor credentials, logs and
   source schedules are excluded. The target marks the asset as replicated and
   calls `snapctl asset:replication:received` after each completed point.
-- This initial implementation does not automatically delete target recovery
-  points. That avoids irreversible retention mistakes until a target-specific
-  retention policy is explicitly implemented and tested.
+- Target retention is enforced after a successful receive. Points older than
+  the selected horizon are removed through the appliance's supported local
+  recovery-point deletion command, and the newest point is always retained.
 
 ## Security model
 

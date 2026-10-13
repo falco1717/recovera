@@ -35,6 +35,7 @@ final class RecoveraTargetController extends AbstractController
             'discover' => ['POST', '/v1/admin/discover'],
             'peer' => ['POST', '/v1/admin/peer'],
             'rule' => ['POST', '/v1/admin/rule'],
+            'wizard-rule' => ['POST', '/v1/admin/wizard-rule'],
             'sync' => ['POST', '/v1/admin/sync'],
             'queue' => ['POST', '/v1/admin/queue'],
             'queue-status' => ['GET', '/v1/admin/queue-status'],

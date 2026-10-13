@@ -30,7 +30,7 @@ import uuid
 from pathlib import Path
 from typing import Any, BinaryIO
 
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 ETC = Path(os.environ.get("RECOVERA_PEER_ETC", "/etc/recovera-peer"))
 STATE_DIR = Path(os.environ.get("RECOVERA_PEER_STATE", "/var/lib/recovera-peer"))
 CONFIG_PATH = ETC / "config.json"
@@ -68,6 +68,8 @@ METADATA_SUFFIXES = (
     "recoveryPoints", "recoveryPointsMeta", "screenshotVerification",
 )
 MAX_METADATA_BYTES = 512 * 1024
+MIN_RETENTION_HOURS = 24
+MAX_RETENTION_HOURS = 240_000
 
 
 class PeerError(RuntimeError):
@@ -357,19 +359,79 @@ def load_origin(asset: str) -> dict[str, Any]:
     return load_json(KEYS_DIR / f"{asset}.originDevice", {})
 
 
+def serialized_string(data: bytes, key: str) -> str | None:
+    """Read one string field from the appliance's PHP-serialized metadata."""
+    marker = f's:{len(key.encode("utf-8"))}:"{key}";s:'.encode()
+    start = data.find(marker)
+    if start < 0:
+        return None
+    length_start = start + len(marker)
+    length_end = data.find(b':"', length_start)
+    if length_end < 0 or not data[length_start:length_end].isdigit():
+        return None
+    size = int(data[length_start:length_end])
+    value_start = length_end + 2
+    value = data[value_start:value_start + size]
+    if data[value_start + size:value_start + size + 2] != b'";':
+        return None
+    return value.decode("utf-8", errors="replace")
+
+
+def asset_identifiers(asset: str) -> set[str]:
+    path = KEYS_DIR / f"{validate_asset(asset)}.agentInfo"
+    try:
+        raw = path.read_bytes()
+    except OSError:
+        return set()
+    values: list[Any] = []
+    with contextlib.suppress(json.JSONDecodeError, UnicodeDecodeError):
+        document = json.loads(raw.decode("utf-8"))
+        if isinstance(document, dict):
+            values.extend(document.get(key) for key in ("name", "hostname", "uuid", "keyName"))
+    values.extend(serialized_string(raw, key) for key in ("name", "hostname", "uuid", "keyName"))
+    return {str(value).strip().casefold() for value in values if value}
+
+
+def asset_display_name(asset: str) -> str:
+    path = KEYS_DIR / f"{validate_asset(asset)}.agentInfo"
+    try:
+        raw = path.read_bytes()
+    except OSError:
+        return asset
+    with contextlib.suppress(json.JSONDecodeError, UnicodeDecodeError):
+        document = json.loads(raw.decode("utf-8"))
+        if isinstance(document, dict):
+            for key in ("name", "hostname"):
+                if document.get(key):
+                    return str(document[key])
+    return serialized_string(raw, "name") or serialized_string(raw, "hostname") or asset
+
+
+def protected_asset_keys() -> list[str]:
+    found: list[str] = []
+    for path in KEYS_DIR.glob("*.agentInfo"):
+        asset = path.name[:-len(".agentInfo")].lower()
+        if ASSET_RE.fullmatch(asset) and not load_origin(asset).get("isReplicated"):
+            found.append(asset)
+    return sorted(set(found))
+
+
 def assets_local(cfg: dict[str, Any]) -> list[dict[str, Any]]:
     root = cfg["source_root"].rstrip("/")
     result = run(["zfs", "list", "-H", "-t", "filesystem", "-o", "name", "-r", root], check=False)
+    datasets: dict[str, str] = {}
+    if result.returncode == 0:
+        for line in result.stdout.decode().splitlines()[1:]:
+            key = line.rsplit("/", 1)[-1].lower()
+            if ASSET_RE.fullmatch(key):
+                datasets[key] = line
     found: list[dict[str, Any]] = []
-    if result.returncode != 0:
-        return found
-    for line in result.stdout.decode().splitlines()[1:]:
-        key = line.rsplit("/", 1)[-1]
-        if ASSET_RE.fullmatch(key):
-            origin = load_origin(key)
-            found.append({"key": key.lower(), "dataset": line,
-                          "snapshots": zfs_snapshots(line),
-                          "replicated": bool(origin.get("isReplicated")), "origin": origin})
+    for key in sorted(set(datasets) | set(protected_asset_keys())):
+        origin = load_origin(key)
+        dataset = datasets.get(key, f"{root}/{key}")
+        found.append({"key": key, "name": asset_display_name(key), "dataset": dataset,
+                      "snapshots": zfs_snapshots(dataset) if key in datasets else [],
+                      "replicated": bool(origin.get("isReplicated")), "origin": origin})
     return found
 
 
@@ -385,9 +447,27 @@ def collect_metadata(asset: str, cfg: dict[str, Any]) -> dict[str, Any]:
         if total > MAX_METADATA_BYTES:
             raise PeerError(f"metadata for {asset} exceeds {MAX_METADATA_BYTES} bytes")
         files[suffix] = base64.b64encode(data).decode("ascii")
+    rule = cfg.get("assets", {}).get(asset, {})
+    retention_hours = int(rule.get("retention_hours", MAX_RETENTION_HOURS))
     return {"schema": 1, "asset": asset, "source_id": cfg["appliance_id"],
             "source_numeric_id": cfg["numeric_id"], "source_name": cfg["name"],
-            "source_public_key": ssh_public_key(), "files": files}
+            "source_public_key": ssh_public_key(), "files": files,
+            "retention_hours": retention_hours}
+
+
+def prune_received_snapshots(dataset: str, retention_hours: int,
+                             now: int | None = None) -> list[str]:
+    if not MIN_RETENTION_HOURS <= retention_hours <= MAX_RETENTION_HOURS:
+        raise PeerError("target retention is outside the supported range")
+    snapshots = zfs_snapshots(dataset)
+    if len(snapshots) < 2 or retention_hours == MAX_RETENTION_HOURS:
+        return []
+    cutoff = int(now if now is not None else time.time()) - retention_hours * 3600
+    expired = [snapshot for snapshot in snapshots[:-1] if int(snapshot) < cutoff]
+    for snapshot in expired:
+        asset = dataset.rsplit("/", 1)[-1]
+        run(["snapctl", "asset:recoverypoints:local:destroy", asset, snapshot])
+    return expired
 
 
 def install_metadata(asset: str, metadata: dict[str, Any]) -> None:
@@ -724,6 +804,9 @@ def receive_dataset(source_id: str, asset: str, snapshot: str, base: str,
         raise PeerError("metadata source numeric ID is invalid")
     if not isinstance(metadata.get("source_name"), str) or len(metadata["source_name"]) > 128:
         raise PeerError("metadata source name is invalid")
+    retention_hours = int(metadata.get("retention_hours", MAX_RETENTION_HOURS))
+    if not MIN_RETENTION_HOURS <= retention_hours <= MAX_RETENTION_HOURS:
+        raise PeerError("replication metadata retention is invalid")
     dataset = dataset_for(cfg, asset)
     origin = load_origin(asset)
     exists = zfs_exists(dataset)
@@ -761,6 +844,7 @@ def receive_dataset(source_id: str, asset: str, snapshot: str, base: str,
     # snapctl may rewrite originDevice using its legacy schema. Restore the
     # source identity used by collision and replication-loop protections.
     install_metadata(asset, metadata)
+    pruned = prune_received_snapshots(dataset, retention_hours)
     with locked_state() as value:
         value.setdefault("received", {})[asset] = {
             "source_id": source_id, "snapshot": snapshot,
@@ -768,9 +852,9 @@ def receive_dataset(source_id: str, asset: str, snapshot: str, base: str,
         }
     hook_error = "; ".join(error for error in hook_errors if error) or None
     event("receive-success", f"Received {asset}@{snapshot}", source_id=source_id,
-          native_hook_error=hook_error)
+          native_hook_error=hook_error, pruned_snapshots=pruned)
     return {"ok": True, "asset": asset, "snapshot": snapshot,
-            "native_hook": "ok" if hook_error is None else "deferred"}
+            "native_hook": "ok" if hook_error is None else "deferred", "pruned": pruned}
 
 
 def asset_info_received(source_id: str, asset: str) -> dict[str, Any]:
@@ -933,16 +1017,75 @@ def configured_sync() -> list[dict[str, Any]]:
     return results
 
 
-def configure_asset(asset: str, peer_id: str, interval: int, enabled: bool = True) -> dict[str, Any]:
+def validate_policy(peer_id: str, interval: int, retention_hours: int) -> None:
+    cfg = config()
+    if peer_id not in cfg.get("peers", {}) or not cfg["peers"][peer_id].get("enabled", True):
+        raise PeerError("unknown or disabled target peer")
+    if not 5 <= interval <= 525600:
+        raise PeerError("replication interval must be between 5 minutes and 1 year")
+    if not MIN_RETENTION_HOURS <= retention_hours <= MAX_RETENTION_HOURS:
+        raise PeerError("target retention is outside the supported range")
+
+
+def configure_asset(asset: str, peer_id: str, interval: int, enabled: bool = True,
+                    retention_hours: int = MAX_RETENTION_HOURS) -> dict[str, Any]:
     cfg, asset = config(), validate_asset(asset)
-    if peer_id not in cfg.get("peers", {}):
-        raise PeerError("unknown target peer")
-    if not 5 <= interval <= 10080:
-        raise PeerError("replication interval must be between 5 and 10080 minutes")
+    validate_policy(peer_id, interval, retention_hours)
     cfg.setdefault("assets", {})[asset] = {"peer_id": peer_id,
-        "interval_minutes": interval, "enabled": enabled}
+        "interval_minutes": interval, "retention_hours": retention_hours,
+        "enabled": enabled}
     save_config(cfg)
     return cfg["assets"][asset] | {"asset": asset}
+
+
+def configure_systems(systems: list[Any], peer_id: str, interval: int,
+                      retention_hours: int) -> list[dict[str, Any]]:
+    """Attach a wizard policy to protected assets using their stored identities."""
+    require_root()
+    validate_policy(peer_id, interval, retention_hours)
+    requested: list[tuple[set[str], set[str]]] = []
+    for system in systems:
+        if not isinstance(system, dict):
+            raise PeerError("protected-system identity is invalid")
+        strong = {str(system.get(key, "")).strip().casefold()
+                  for key in ("uuid", "keyName") if system.get(key)}
+        weak = {str(system.get(key, "")).strip().casefold()
+                for key in ("name", "hostname") if system.get(key)}
+        if not strong and not weak:
+            raise PeerError("protected-system identity is missing")
+        requested.append((strong, weak))
+
+    matches: list[str] = []
+    deadline = time.monotonic() + 15
+    while True:
+        available = {asset: asset_identifiers(asset) for asset in protected_asset_keys()}
+        resolved: list[str] = []
+        unresolved = False
+        for strong, weak in requested:
+            found = [asset for asset, candidates in available.items() if strong & candidates]
+            if not found:
+                found = [asset for asset, candidates in available.items() if weak & candidates]
+            if len(found) > 1:
+                raise PeerError("more than one protected asset matches a selected system")
+            if not found:
+                unresolved = True
+                break
+            resolved.append(found[0])
+        if not unresolved:
+            matches = resolved
+            break
+        if time.monotonic() >= deadline:
+            raise PeerError("new protected assets were not available for replication policy assignment")
+        time.sleep(1)
+
+    if len(set(matches)) != len(matches):
+        raise PeerError("selected systems did not resolve to distinct protected assets")
+    results = [configure_asset(asset, peer_id, interval, retention_hours=retention_hours)
+               for asset in matches]
+    event("wizard-policy-saved", f"Configured replication for {len(results)} protected system(s)",
+          peer_id=peer_id, assets=matches, interval_minutes=interval,
+          retention_hours=retention_hours)
+    return results
 
 
 def peer_remove(peer_id: str) -> None:
@@ -1093,7 +1236,19 @@ class Handler(http.server.BaseHTTPRequestHandler):
             elif self.path == "/v1/admin/peer":
                 self.reply(200, peer_add(str(body["host"]), int(body.get("port", 9443)), str(body["code"]), str(body["fingerprint"]), {"appliance_id": str(body["appliance_id"])}))
             elif self.path == "/v1/admin/rule":
-                self.reply(200, configure_asset(str(body["asset"]), str(body["peer_id"]), int(body.get("interval_minutes", 60))))
+                self.reply(200, configure_asset(
+                    str(body["asset"]), str(body["peer_id"]),
+                    int(body.get("interval_minutes", 60)),
+                    retention_hours=int(body.get("retention_hours", MAX_RETENTION_HOURS)),
+                ))
+            elif self.path == "/v1/admin/wizard-rule":
+                systems = body.get("systems")
+                if not isinstance(systems, list) or not 1 <= len(systems) <= 30:
+                    raise PeerError("between 1 and 30 protected systems are required")
+                self.reply(200, {"assets": configure_systems(
+                    systems, str(body["peer_id"]), int(body["interval_minutes"]),
+                    int(body["retention_hours"]),
+                )})
             elif self.path == "/v1/admin/sync":
                 with sync_lock():
                     self.reply(200, {"results": configured_sync()})

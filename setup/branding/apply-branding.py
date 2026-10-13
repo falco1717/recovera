@@ -74,6 +74,9 @@ def brand_wizard(text: str) -> str:
 
 def brand_translation(text: str) -> str:
     text = re.sub(r"\bDatto\b", "Recovera", text)
+    text = text.replace("Authorized Target SIRIS", "Authorized Recovera Target")
+    text = text.replace("Target SIRIS", "Target Recovera appliance")
+    text = text.replace("your SIRIS", "your Recovera target")
     text = re.sub(
         r'^app\.title:.*$',
         'app.title: "Recovera - %deviceName%"',
@@ -159,6 +162,40 @@ def patch_recovery_points_template(text: str) -> str:
     return text
 
 
+def patch_protect_system_index(text: str) -> str:
+    text = text.replace("feature.isSupported('FEATURE_PEER_REPLICATION')", "true")
+    text = text.replace(
+        "canOffsite: {{ canOffsite|json_encode|raw }}",
+        "canOffsite: true",
+    )
+    if "RecoveraProtectSystem.js" not in text:
+        needle = "    <script type=\"text/javascript\" src=\"{{ asset('commonlookandfeel/js/App/Agents/WizardSystem.js') }}\"></script>\n"
+        script = "    <script type=\"text/javascript\" src=\"{{ asset('commonlookandfeel/js/App/Agents/RecoveraProtectSystem.js') }}\"></script>\n"
+        text = text.replace(needle, needle + script, 1)
+    if "recovera-protect-csrf" not in text:
+        text = text.replace(
+            "{% block agentsFinish %}",
+            "{% block agentsFinish %}\n    <div id=\"recovera-protect-csrf\" class=\"d-none\">{{ csrfTag() }}</div>",
+            1,
+        )
+    return text
+
+
+def patch_replication_pane(text: str) -> str:
+    if "inWizard or feature.isSupported('FEATURE_PEER_REPLICATION')" not in text:
+        text = text.replace(
+            "feature.isSupported('FEATURE_PEER_REPLICATION')",
+            "(inWizard or feature.isSupported('FEATURE_PEER_REPLICATION'))",
+        )
+    if "inWizard or feature.isSupported('FEATURE_OFFSITE')" not in text:
+        text = text.replace(
+            "feature.isSupported('FEATURE_OFFSITE')",
+            "(inWizard or feature.isSupported('FEATURE_OFFSITE'))",
+            1,
+        )
+    return text
+
+
 def add_routes(text: str) -> str:
     text = text.replace(
         "path: /configure/offsite-target/api/{operation}",
@@ -197,12 +234,14 @@ def main() -> int:
     target_js = WEB / "commonlookandfeel/js/App/Configure/RecoveraTarget.js"
     offsite_js = WEB / "commonlookandfeel/js/App/Configure/OffsiteSync/RecoveraOffsiteApiClient.js"
     recovery_points_js = WEB / "commonlookandfeel/js/App/Assets/RecoveraRecoveryPoints.js"
+    protect_system_js = WEB / "commonlookandfeel/js/App/Agents/RecoveraProtectSystem.js"
     for source, target in (
         (resources / "RecoveraTargetController.php", controller),
         (resources / "recovera-target.html.twig", target_template),
         (resources / "RecoveraTarget.js", target_js),
         (resources / "RecoveraOffsiteApiClient.js", offsite_js),
         (resources / "RecoveraRecoveryPoints.js", recovery_points_js),
+        (resources / "RecoveraProtectSystem.js", protect_system_js),
     ):
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(source, target)
@@ -233,6 +272,8 @@ def main() -> int:
         ROOT / "templates/vintage/Assets/RecoveryPoints/index.html.twig",
     ):
         update(path, patch_recovery_points_template)
+    update(ROOT / "templates/commonlookandfeel/Agents/Add/index.html.twig", patch_protect_system_index)
+    update(ROOT / "templates/commonlookandfeel/Assets/Configure/cloud.backup.html.twig", patch_replication_pane)
     update(ROOT / "config/routes.yaml", add_routes)
 
     update(ROOT / "templates/commonlookandfeel/Authentication/index.login.html.twig", brand_login)

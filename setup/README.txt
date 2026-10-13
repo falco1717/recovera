@@ -103,11 +103,13 @@ PEER REPLICATION
   the registered administrator session; no separate replication password is stored.
 
   On the target, generate a one-time pairing code. On the source, discover the target by
-  IP, compare the displayed TLS fingerprint, enter the code, select a protected asset, and
-  save its policy. Configure -> Off-site Synchronization sets weekly replication windows and
-  upload-speed limits. The first transfer is a full ZFS stream; later transfers are incremental
-  and interrupted receives are resumable. Data transport uses a pinned SSH host key and a
-  forced-command account that cannot request a shell, forwarding, or arbitrary dataset paths.
+  IP, compare the displayed TLS fingerprint, and enter the code. The paired appliance appears
+  in Protect a System -> Replication & Retention, where the target, replication frequency, and
+  target retention are selected. Existing protected systems can be configured from Off-site
+  Target. Configure -> Off-site Synchronization sets weekly replication windows and upload-speed
+  limits. The first transfer is a full ZFS stream; later transfers are incremental and interrupted
+  receives are resumable. Data transport uses a pinned SSH host key and a forced-command account
+  that cannot request a shell, forwarding, or arbitrary dataset paths.
 
   For separate sites, route the appliance IPs across a site-to-site VPN and allow TCP 22 and
   TCP 9443 between only those two addresses. No default route, DNS, or Internet is required.

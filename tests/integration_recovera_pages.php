@@ -74,6 +74,18 @@ try {
         !str_contains($recoveryScript, 'v1/device/snapshot/send')) {
         throw new RuntimeException('Native recovery-point queue bridge is not installed');
     }
+    $protectTemplate = (string) @file_get_contents(
+        '/usr/lib/datto/device/templates/commonlookandfeel/Agents/Add/index.html.twig');
+    $replicationTemplate = (string) @file_get_contents(
+        '/usr/lib/datto/device/templates/commonlookandfeel/Assets/Configure/cloud.backup.html.twig');
+    $protectScript = (string) @file_get_contents(
+        '/datto/web/commonlookandfeel/js/App/Agents/RecoveraProtectSystem.js');
+    if (!str_contains($protectTemplate, 'RecoveraProtectSystem.js') ||
+        !str_contains($protectTemplate, 'recovera-protect-csrf') ||
+        !str_contains($replicationTemplate, "inWizard or feature.isSupported('FEATURE_PEER_REPLICATION')") ||
+        !str_contains($protectScript, "request('wizard-rule'")) {
+        throw new RuntimeException('Protect a System replication integration is not installed');
+    }
     $added = curlRequest(['-b', $cookie, '-H', 'X-Requested-With: XMLHttpRequest',
         '--data-urlencode', 'csrf=' . $pageCsrf, '--data-urlencode',
         'payload={"secondsWeekStart":12345,"secondsWeekEnd":12600,"speed":1024}',
