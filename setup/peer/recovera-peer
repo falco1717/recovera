@@ -30,7 +30,7 @@ import uuid
 from pathlib import Path
 from typing import Any, BinaryIO
 
-VERSION = "0.4.1"
+VERSION = "0.5.0"
 ETC = Path(os.environ.get("RECOVERA_PEER_ETC", "/etc/recovera-peer"))
 STATE_DIR = Path(os.environ.get("RECOVERA_PEER_STATE", "/var/lib/recovera-peer"))
 CONFIG_PATH = ETC / "config.json"
@@ -125,7 +125,7 @@ def default_config() -> dict[str, Any]:
     return {
         "schema": 1, "version": VERSION, "appliance_id": appliance_id,
         "numeric_id": numeric_id, "name": socket.gethostname(),
-        "listen": "0.0.0.0", "port": 9443, "ssh_port": 22,
+        "listen": "127.0.0.1", "port": 9443, "ssh_port": 22,
         "pool": "homePool", "source_root": "homePool/home/agents",
         "peers": {}, "sources": {}, "assets": {},
     }
@@ -278,6 +278,20 @@ def fingerprint_der(cert_der: bytes) -> str:
     return "SHA256:" + ":".join(digest[i:i + 2] for i in range(0, len(digest), 2))
 
 
+def gateway_tls_fingerprint() -> str:
+    """Fingerprint the certificate clients see on the appliance HTTPS site."""
+    context = ssl.create_default_context()
+    context.check_hostname = False
+    context.verify_mode = ssl.CERT_NONE
+    try:
+        with socket.create_connection(("127.0.0.1", 443), timeout=5) as raw:
+            with context.wrap_socket(raw, server_hostname="localhost") as wrapped:
+                return fingerprint_der(wrapped.getpeercert(binary_form=True))
+    except OSError:
+        # Apache may not be running during the first installation pass.
+        return local_tls_fingerprint()
+
+
 def local_tls_fingerprint() -> str:
     pem = TLS_CERT_PATH.read_text(encoding="ascii")
     return fingerprint_der(ssl.PEM_cert_to_DER_cert(pem))
@@ -326,7 +340,7 @@ def init() -> None:
     with contextlib.suppress(KeyError, PermissionError):
         os.chown(WEB_TOKEN_PATH, 0, grp.getgrnam("www-data").gr_gid)
     print(f"Recovera peer replication initialized ({config()['appliance_id']})")
-    print(f"TLS fingerprint: {local_tls_fingerprint()}")
+    print(f"Pairing HTTPS fingerprint: {gateway_tls_fingerprint()}")
 
 
 def validate_asset(asset: str) -> str:
@@ -455,21 +469,66 @@ def collect_metadata(asset: str, cfg: dict[str, Any]) -> dict[str, Any]:
         files[suffix] = base64.b64encode(data).decode("ascii")
     rule = cfg.get("assets", {}).get(asset, {})
     retention_hours = int(rule.get("retention_hours", MAX_RETENTION_HOURS))
+    retention_tiers = rule.get("retention_tiers") or default_retention_tiers(retention_hours)
     return {"schema": 1, "asset": asset, "source_id": cfg["appliance_id"],
             "source_numeric_id": cfg["numeric_id"], "source_name": cfg["name"],
             "source_public_key": ssh_public_key(), "files": files,
-            "retention_hours": retention_hours}
+            "retention_hours": retention_hours, "retention_tiers": retention_tiers}
+
+
+def default_retention_tiers(retention_hours: int) -> dict[str, int]:
+    """SIRIS-style thinning boundaries expressed as cumulative hours."""
+    return {
+        "intra_daily": min(retention_hours, 7 * 24),
+        "daily": min(retention_hours, 14 * 24),
+        "weekly": min(retention_hours, 6 * 7 * 24),
+    }
+
+
+def validate_retention_tiers(retention_hours: int, tiers: Any) -> dict[str, int]:
+    if not isinstance(tiers, dict):
+        tiers = default_retention_tiers(retention_hours)
+    result = {key: int(tiers.get(key, value)) for key, value in
+              default_retention_tiers(retention_hours).items()}
+    if not (0 <= result["intra_daily"] <= result["daily"] <=
+            result["weekly"] <= retention_hours):
+        raise PeerError("target retention tiers are invalid")
+    return result
 
 
 def prune_received_snapshots(dataset: str, retention_hours: int,
+                             retention_tiers: dict[str, int] | None = None,
                              now: int | None = None) -> list[str]:
     if not MIN_RETENTION_HOURS <= retention_hours <= MAX_RETENTION_HOURS:
         raise PeerError("target retention is outside the supported range")
+    tiers = validate_retention_tiers(retention_hours, retention_tiers)
     snapshots = zfs_snapshots(dataset)
-    if len(snapshots) < 2 or retention_hours == MAX_RETENTION_HOURS:
+    if len(snapshots) < 2:
         return []
-    cutoff = int(now if now is not None else time.time()) - retention_hours * 3600
-    expired = [snapshot for snapshot in snapshots[:-1] if int(snapshot) < cutoff]
+    current = int(now if now is not None else time.time())
+    cutoff = current - retention_hours * 3600
+    keep = {snapshots[-1]}
+    buckets: dict[tuple[Any, ...], str] = {}
+    for snapshot in snapshots[:-1]:
+        epoch = int(snapshot)
+        age_hours = max(0, (current - epoch) // 3600)
+        stamp = time.gmtime(epoch)
+        if epoch < cutoff:
+            continue
+        if age_hours <= tiers["intra_daily"]:
+            keep.add(snapshot)
+            continue
+        if age_hours <= tiers["daily"]:
+            bucket: tuple[Any, ...] = ("day", stamp.tm_year, stamp.tm_yday)
+        elif age_hours <= tiers["weekly"]:
+            iso = time.strftime("%G-%V", stamp)
+            bucket = ("week", iso)
+        else:
+            bucket = ("month", stamp.tm_year, stamp.tm_mon)
+        if int(buckets.get(bucket, "0")) < epoch:
+            buckets[bucket] = snapshot
+    keep.update(buckets.values())
+    expired = [snapshot for snapshot in snapshots[:-1] if snapshot not in keep]
     for snapshot in expired:
         asset = dataset.rsplit("/", 1)[-1]
         run(["snapctl", "asset:recoverypoints:local:destroy", asset, snapshot])
@@ -583,7 +642,8 @@ def public_info() -> dict[str, Any]:
     return {"service": "recovera-peer", "version": VERSION,
             "appliance_id": cfg["appliance_id"], "numeric_id": cfg["numeric_id"],
             "name": cfg["name"], "ssh_port": cfg["ssh_port"],
-            "tls_fingerprint": local_tls_fingerprint(), "ssh_host_keys": ssh_host_keys(),
+            "tls_fingerprint": gateway_tls_fingerprint(), "ssh_host_keys": ssh_host_keys(),
+            "gateway": "/recovera-peer", "gateway_port": 443,
             "storage": storage}
 
 
@@ -649,10 +709,11 @@ def known_host_lines(host: str, port: int, keys: list[str]) -> list[str]:
 def peer_add(host: str, port: int, code: str, fingerprint: str,
              discovered: dict[str, Any] | None = None) -> dict[str, Any]:
     cfg = config()
-    info, actual = ssl_json(host, port, "/v1/info", expected_fingerprint=fingerprint)
+    prefix = "/v1" if port == 9443 else "/recovera-peer"
+    info, actual = ssl_json(host, port, prefix + "/info", expected_fingerprint=fingerprint)
     if discovered and info.get("appliance_id") != discovered.get("appliance_id"):
         raise PeerError("peer identity changed between discovery and pairing")
-    response, _ = ssl_json(host, port, "/v1/pair", {
+    response, _ = ssl_json(host, port, prefix + "/pair", {
         "code": code.upper(), "source_id": cfg["appliance_id"],
         "source_name": cfg["name"], "source_public_key": ssh_public_key(),
     }, expected_fingerprint=actual)
@@ -763,7 +824,26 @@ def replicate(asset: str, peer_id: str, snapshot: str | None = None,
     remote = remote_json(peer, ["asset-info", asset])
     remote_snaps = [str(value) for value in remote.get("snapshots", [])]
     if snapshot in remote_snaps:
+        now = int(time.time())
+        with locked_state() as value:
+            value.setdefault("assets", {})[f"{peer_id}:{asset}"] = {
+                "last_success": now, "last_snapshot": snapshot,
+                "mode": "already-present", "error": None,
+                "consecutive_failures": 0, "next_retry": 0,
+                "integrity": "target-confirmed"}
+            value.setdefault("peers", {}).setdefault(peer_id, {}).update(
+                {"last_contact": now, "status": "online",
+                 "storage": remote.get("storage", {})}
+            )
         return {"ok": True, "asset": asset, "snapshot": snapshot, "status": "already-present"}
+    estimate = zfs_send_estimate(dataset, snapshot, local, remote.get("snapshots", []))
+    free = int(remote.get("storage", {}).get("free", 0))
+    reserve = max(5 * 1024**3, int(remote.get("storage", {}).get("size", 0)) // 20)
+    if free and estimate + reserve > free:
+        raise PeerError(
+            f"target capacity preflight failed: need {estimate} bytes plus "
+            f"{reserve} bytes reserve, only {free} bytes free"
+        )
     metadata = encode_metadata(collect_metadata(asset, cfg))
     resume_token = remote.get("resume_token")
     if resume_token:
@@ -786,9 +866,29 @@ def replicate(asset: str, peer_id: str, snapshot: str | None = None,
     key = f"{peer_id}:{asset}"
     with locked_state() as value:
         value.setdefault("assets", {})[key] = {"last_success": int(time.time()),
-            "last_snapshot": snapshot, "mode": mode, "error": None}
+            "last_snapshot": snapshot, "mode": mode, "error": None,
+            "consecutive_failures": 0, "next_retry": 0,
+            "bytes_estimated": estimate, "integrity": "zfs-stream-verified"}
+        value.setdefault("peers", {}).setdefault(peer_id, {}).update(
+            {"last_contact": int(time.time()), "status": "online",
+             "storage": remote.get("storage", {})}
+        )
     event("replication-success", f"Replicated {asset}@{snapshot}", asset=asset, peer_id=peer_id, mode=mode)
     return {"ok": True, "asset": asset, "snapshot": snapshot, "status": mode}
+
+
+def zfs_send_estimate(dataset: str, snapshot: str, local: list[str],
+                      remote_snapshots: list[Any]) -> int:
+    """Ask ZFS for a conservative stream-size estimate before transfer."""
+    common = [value for value in local if value in {str(item) for item in remote_snapshots}]
+    command = ["zfs", "send", "-nP"]
+    if common:
+        command += ["-I", f"{dataset}@{common[-1]}"]
+    command.append(f"{dataset}@{snapshot}")
+    result = run(command, check=False, timeout=60)
+    text = (result.stdout + result.stderr).decode(errors="replace")
+    matches = re.findall(r"(?:size|total estimated size is)\s+([0-9]+)", text)
+    return int(matches[-1]) if result.returncode == 0 and matches else 0
 
 
 def receive_dataset(source_id: str, asset: str, snapshot: str, base: str,
@@ -813,6 +913,9 @@ def receive_dataset(source_id: str, asset: str, snapshot: str, base: str,
     retention_hours = int(metadata.get("retention_hours", MAX_RETENTION_HOURS))
     if not MIN_RETENTION_HOURS <= retention_hours <= MAX_RETENTION_HOURS:
         raise PeerError("replication metadata retention is invalid")
+    retention_tiers = validate_retention_tiers(
+        retention_hours, metadata.get("retention_tiers")
+    )
     dataset = dataset_for(cfg, asset)
     origin = load_origin(asset)
     exists = zfs_exists(dataset)
@@ -850,7 +953,7 @@ def receive_dataset(source_id: str, asset: str, snapshot: str, base: str,
     # snapctl may rewrite originDevice using its legacy schema. Restore the
     # source identity used by collision and replication-loop protections.
     install_metadata(asset, metadata)
-    pruned = prune_received_snapshots(dataset, retention_hours)
+    pruned = prune_received_snapshots(dataset, retention_hours, retention_tiers)
     with locked_state() as value:
         value.setdefault("received", {})[asset] = {
             "source_id": source_id, "snapshot": snapshot,
@@ -874,7 +977,17 @@ def asset_info_received(source_id: str, asset: str) -> dict[str, Any]:
         if result.returncode == 0 and result.stdout.decode().strip() != "-":
             token = result.stdout.decode().strip()
     return {"ok": True, "exists": zfs_exists(dataset), "snapshots": zfs_snapshots(dataset),
-            "resume_token": token or None}
+            "resume_token": token or None, "storage": storage_status(cfg)}
+
+
+def storage_status(cfg: dict[str, Any] | None = None) -> dict[str, Any]:
+    cfg = cfg or config()
+    result = run(["zpool", "list", "-Hp", "-o", "size,alloc,free,health", cfg["pool"]], check=False)
+    if result.returncode != 0:
+        return {"available": False}
+    size, allocated, free, health = result.stdout.decode().strip().split("\t")
+    return {"available": True, "size": int(size), "allocated": int(allocated),
+            "free": int(free), "health": health}
 
 
 def ssh_entry(source_id: str) -> None:
@@ -1003,52 +1116,100 @@ def configured_sync() -> list[dict[str, Any]]:
     results.extend(queued_results)
     queued_assets = {str(item.get("asset")) for item in queued_results if item.get("asset")}
     current = state()
-    for asset, rule in cfg.get("assets", {}).items():
+    priority_order = {"high": 0, "normal": 1, "low": 2}
+    rules = sorted(cfg.get("assets", {}).items(),
+                   key=lambda item: priority_order.get(str(item[1].get("priority", "normal")), 1))
+    for asset, rule in rules:
         if not rule.get("enabled", True) or asset in queued_assets:
             continue
         peer_id = str(rule["peer_id"])
         key = f"{peer_id}:{asset}"
         previous = current.get("assets", {}).get(key, {})
-        interval = max(300, int(rule.get("interval_minutes", 60)) * 60)
-        if now - int(previous.get("last_success", 0)) < interval:
+        if now < int(previous.get("next_retry", 0)):
+            continue
+        dataset = dataset_for(cfg, asset)
+        if not zfs_exists(dataset):
+            message = "Protected system no longer exists; remove or reassign this replication policy"
+            if previous.get("error") != message:
+                with locked_state() as value:
+                    value.setdefault("assets", {}).setdefault(key, {}).update(
+                        {"error": message, "last_attempt": now, "next_retry": now + 86400}
+                    )
+                event("replication-policy-orphaned", message, asset=asset, peer_id=peer_id)
+            continue
+        local_points = zfs_snapshots(dataset)
+        if not local_points:
+            continue
+        mode = str(rule.get("schedule_mode", "interval"))
+        if mode == "every_backup":
+            due = local_points[-1] != previous.get("last_snapshot")
+        elif mode == "daily":
+            hour = min(23, max(0, int(rule.get("daily_hour", 18))))
+            last = int(previous.get("last_success", 0))
+            now_day = time.localtime(now).tm_yday
+            due = time.localtime(now).tm_hour >= hour and (
+                not last or time.localtime(last).tm_yday != now_day
+            )
+        else:
+            interval = max(300, int(rule.get("interval_minutes", 60)) * 60)
+            due = now - int(previous.get("last_success", 0)) >= interval
+        if not due:
             continue
         try:
             results.append(replicate(asset, peer_id, speed_kbps=speed))
         except Exception as exc:
             with locked_state() as value:
-                value.setdefault("assets", {}).setdefault(key, {})["error"] = str(exc)
-                value["assets"][key]["last_attempt"] = now
+                record = value.setdefault("assets", {}).setdefault(key, {})
+                failures = int(record.get("consecutive_failures", 0)) + 1
+                record.update({"error": str(exc), "last_attempt": now,
+                               "consecutive_failures": failures,
+                               "next_retry": now + min(3600, 300 * (2 ** min(failures - 1, 4)))})
+                value.setdefault("peers", {}).setdefault(peer_id, {}).update(
+                    {"last_contact": now, "status": "error", "error": str(exc)}
+                )
             event("replication-error", str(exc), asset=asset, peer_id=peer_id)
             results.append({"ok": False, "asset": asset, "peer_id": peer_id, "error": str(exc)})
     return results
 
 
-def validate_policy(peer_id: str, interval: int, retention_hours: int) -> None:
+def validate_policy(peer_id: str, interval: int, retention_hours: int,
+                    schedule_mode: str = "interval", priority: str = "normal") -> None:
     cfg = config()
     if peer_id not in cfg.get("peers", {}) or not cfg["peers"][peer_id].get("enabled", True):
         raise PeerError("unknown or disabled target peer")
-    if not 5 <= interval <= 525600:
+    if schedule_mode not in ("every_backup", "daily", "interval"):
+        raise PeerError("replication schedule mode is invalid")
+    if priority not in ("high", "normal", "low"):
+        raise PeerError("replication priority is invalid")
+    if schedule_mode == "interval" and not 5 <= interval <= 525600:
         raise PeerError("replication interval must be between 5 minutes and 1 year")
     if not MIN_RETENTION_HOURS <= retention_hours <= MAX_RETENTION_HOURS:
         raise PeerError("target retention is outside the supported range")
 
 
 def configure_asset(asset: str, peer_id: str, interval: int, enabled: bool = True,
-                    retention_hours: int = MAX_RETENTION_HOURS) -> dict[str, Any]:
+                    retention_hours: int = MAX_RETENTION_HOURS,
+                    schedule_mode: str = "interval", priority: str = "normal",
+                    daily_hour: int = 18,
+                    retention_tiers: dict[str, int] | None = None) -> dict[str, Any]:
     cfg, asset = config(), validate_asset(asset)
-    validate_policy(peer_id, interval, retention_hours)
+    validate_policy(peer_id, interval, retention_hours, schedule_mode, priority)
+    tiers = validate_retention_tiers(retention_hours, retention_tiers)
     cfg.setdefault("assets", {})[asset] = {"peer_id": peer_id,
         "interval_minutes": interval, "retention_hours": retention_hours,
-        "enabled": enabled}
+        "retention_tiers": tiers, "schedule_mode": schedule_mode,
+        "daily_hour": min(23, max(0, int(daily_hour))),
+        "priority": priority, "enabled": enabled}
     save_config(cfg)
     return cfg["assets"][asset] | {"asset": asset}
 
 
 def configure_systems(systems: list[Any], peer_id: str, interval: int,
-                      retention_hours: int) -> list[dict[str, Any]]:
+                      retention_hours: int, schedule_mode: str = "interval",
+                      priority: str = "normal") -> list[dict[str, Any]]:
     """Attach a wizard policy to protected assets using their stored identities."""
     require_root()
-    validate_policy(peer_id, interval, retention_hours)
+    validate_policy(peer_id, interval, retention_hours, schedule_mode, priority)
     requested: list[tuple[set[str], set[str]]] = []
     for system in systems:
         if not isinstance(system, dict):
@@ -1086,7 +1247,8 @@ def configure_systems(systems: list[Any], peer_id: str, interval: int,
 
     if len(set(matches)) != len(matches):
         raise PeerError("selected systems did not resolve to distinct protected assets")
-    results = [configure_asset(asset, peer_id, interval, retention_hours=retention_hours)
+    results = [configure_asset(asset, peer_id, interval, retention_hours=retention_hours,
+                               schedule_mode=schedule_mode, priority=priority)
                for asset in matches]
     event("wizard-policy-saved", f"Configured replication for {len(results)} protected system(s)",
           peer_id=peer_id, assets=matches, interval_minutes=interval,
@@ -1139,14 +1301,42 @@ def received_forget(asset: str) -> None:
         value.setdefault("received", {}).pop(asset, None)
 
 
+def recovery_readiness(cfg: dict[str, Any], item: dict[str, Any]) -> dict[str, Any]:
+    """Run non-destructive target checks needed by local recovery workflows."""
+    asset, snapshots = str(item["key"]), item.get("snapshots", [])
+    dataset = dataset_for(cfg, asset)
+    issues: list[str] = []
+    if not zfs_exists(dataset): issues.append("Replica dataset is missing")
+    if not snapshots: issues.append("No received recovery points")
+    if not (KEYS_DIR / f"{asset}.agentInfo").is_file(): issues.append("Agent metadata is missing")
+    if not item.get("origin", {}).get("isReplicated"): issues.append("Replication provenance is missing")
+    properties = run(["zfs", "get", "-H", "-o", "property,value",
+                      "readonly,mountpoint", dataset], check=False)
+    values = dict(line.split("\t", 1) for line in properties.stdout.decode().splitlines()
+                  if "\t" in line) if properties.returncode == 0 else {}
+    if values.get("readonly") != "on": issues.append("Replica dataset is not read-only")
+    if values.get("mountpoint") != f"/home/agents/{asset}": issues.append("Replica mountpoint is invalid")
+    return {"recovery_ready": not issues, "recovery_issues": issues,
+            "latest_snapshot": snapshots[-1] if snapshots else None,
+            "validation": {"dataset": dataset, "readonly": values.get("readonly"),
+                           "mountpoint": values.get("mountpoint")}}
+
+
 def status_document() -> dict[str, Any]:
     cfg = config()
+    local_assets = assets_local(cfg)
+    received_assets = []
+    for item in local_assets:
+        if item.get("replicated"):
+            received_assets.append(item | recovery_readiness(cfg, item))
+    current = state()
     return {"service": "recovera-peer", "version": VERSION,
             "appliance": {"id": cfg["appliance_id"], "name": cfg["name"]},
             "peers": cfg.get("peers", {}), "sources": cfg.get("sources", {}),
-            "rules": cfg.get("assets", {}), "local_assets": assets_local(cfg),
-            "state": state(), "offsite": offsite(),
-            "tls_fingerprint": local_tls_fingerprint()}
+            "rules": cfg.get("assets", {}), "local_assets": local_assets,
+            "received_assets": received_assets, "state": current, "offsite": offsite(),
+            "storage": storage_status(cfg), "peer_health": current.get("peers", {}),
+            "tls_fingerprint": gateway_tls_fingerprint()}
 
 
 def authenticate_local_admin(username: str, password: str) -> bool:
@@ -1197,6 +1387,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if not isinstance(value, dict):
             raise PeerError("request must be a JSON object")
         return value
+    def client_ip(self) -> str:
+        address = self.client_address[0]
+        if address in ("127.0.0.1", "::1"):
+            forwarded = self.headers.get("X-Forwarded-For", "").split(",", 1)[0].strip()
+            if forwarded and HOST_RE.fullmatch(forwarded):
+                address = forwarded
+        return address
     def admin(self) -> bool:
         supplied = self.headers.get("X-Recovera-Internal", "")
         if self.client_address[0] in ("127.0.0.1", "::1") and WEB_TOKEN_PATH.is_file():
@@ -1232,20 +1429,26 @@ class Handler(http.server.BaseHTTPRequestHandler):
         except Exception as exc: self.reply(400, {"error": str(exc)})
     def do_POST(self) -> None:
         try:
-            if self.path == "/v1/pair": self.reply(200, pair_accept(self.json_body(), self.client_address[0])); return
+            if self.path == "/v1/pair": self.reply(200, pair_accept(self.json_body(), self.client_ip())); return
             if not self.admin(): return
             body = self.json_body()
             if self.path == "/v1/admin/pairing-code":
                 code = pairing_code(15); self.reply(200, {"code": code, "expires": int(time.time()) + 900})
             elif self.path == "/v1/admin/discover":
-                info, observed = ssl_json(str(body["host"]), int(body.get("port", 9443)), "/v1/info"); self.reply(200, info | {"observed_fingerprint": observed})
+                port = int(body.get("port", 443)); prefix = "/v1" if port == 9443 else "/recovera-peer"
+                info, observed = ssl_json(str(body["host"]), port, prefix + "/info"); self.reply(200, info | {"observed_fingerprint": observed})
             elif self.path == "/v1/admin/peer":
-                self.reply(200, peer_add(str(body["host"]), int(body.get("port", 9443)), str(body["code"]), str(body["fingerprint"]), {"appliance_id": str(body["appliance_id"])}))
+                self.reply(200, peer_add(str(body["host"]), int(body.get("port", 443)), str(body["code"]), str(body["fingerprint"]), {"appliance_id": str(body["appliance_id"])}))
             elif self.path == "/v1/admin/rule":
                 self.reply(200, configure_asset(
                     str(body["asset"]), str(body["peer_id"]),
                     int(body.get("interval_minutes", 60)),
+                    enabled=bool(body.get("enabled", True)),
                     retention_hours=int(body.get("retention_hours", MAX_RETENTION_HOURS)),
+                    schedule_mode=str(body.get("schedule_mode", "interval")),
+                    priority=str(body.get("priority", "normal")),
+                    daily_hour=int(body.get("daily_hour", 18)),
+                    retention_tiers=body.get("retention_tiers"),
                 ))
             elif self.path == "/v1/admin/wizard-rule":
                 systems = body.get("systems")
@@ -1253,7 +1456,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     raise PeerError("between 1 and 30 protected systems are required")
                 self.reply(200, {"assets": configure_systems(
                     systems, str(body["peer_id"]), int(body["interval_minutes"]),
-                    int(body["retention_hours"]),
+                    int(body["retention_hours"]), str(body.get("schedule_mode", "interval")),
+                    str(body.get("priority", "normal")),
                 )})
             elif self.path == "/v1/admin/sync":
                 with sync_lock():
@@ -1305,8 +1509,8 @@ def parser() -> argparse.ArgumentParser:
     sub = result.add_subparsers(dest="command", required=True)
     sub.add_parser("init"); sub.add_parser("serve"); sub.add_parser("status")
     code = sub.add_parser("pairing-code"); code.add_argument("--minutes", type=int, default=15)
-    discover = sub.add_parser("discover"); discover.add_argument("host"); discover.add_argument("--port", type=int, default=9443)
-    add = sub.add_parser("peer-add"); add.add_argument("host"); add.add_argument("--port", type=int, default=9443); add.add_argument("--code", required=True); add.add_argument("--fingerprint"); add.add_argument("--yes", action="store_true")
+    discover = sub.add_parser("discover"); discover.add_argument("host"); discover.add_argument("--port", type=int, default=443)
+    add = sub.add_parser("peer-add"); add.add_argument("host"); add.add_argument("--port", type=int, default=443); add.add_argument("--code", required=True); add.add_argument("--fingerprint"); add.add_argument("--yes", action="store_true")
     remove_peer = sub.add_parser("peer-remove"); remove_peer.add_argument("peer_id")
     remove_source = sub.add_parser("source-remove"); remove_source.add_argument("source_id")
     forget = sub.add_parser("received-forget"); forget.add_argument("asset")
@@ -1323,11 +1527,13 @@ def main() -> int:
         if args.command == "init": init()
         elif args.command == "serve": serve()
         elif args.command == "status": print(json.dumps(status_document(), indent=2))
-        elif args.command == "pairing-code": print(pairing_code(args.minutes)); print(f"TLS fingerprint: {local_tls_fingerprint()}")
+        elif args.command == "pairing-code": print(pairing_code(args.minutes)); print(f"Pairing HTTPS fingerprint: {gateway_tls_fingerprint()}")
         elif args.command == "discover":
-            info, observed = ssl_json(args.host, args.port, "/v1/info"); print(json.dumps(info | {"observed_fingerprint": observed}, indent=2))
+            prefix = "/v1" if args.port == 9443 else "/recovera-peer"
+            info, observed = ssl_json(args.host, args.port, prefix + "/info"); print(json.dumps(info | {"observed_fingerprint": observed}, indent=2))
         elif args.command == "peer-add":
-            info, observed = ssl_json(args.host, args.port, "/v1/info"); fingerprint = args.fingerprint or observed
+            prefix = "/v1" if args.port == 9443 else "/recovera-peer"
+            info, observed = ssl_json(args.host, args.port, prefix + "/info"); fingerprint = args.fingerprint or observed
             if not args.fingerprint and not args.yes:
                 print(f"Target: {info.get('name')} ({info.get('appliance_id')})\nTLS fingerprint: {observed}")
                 if input("Does this match the fingerprint shown on the target? [y/N] ").lower() != "y": raise PeerError("pairing cancelled")

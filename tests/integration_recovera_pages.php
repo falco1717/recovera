@@ -80,10 +80,18 @@ try {
         '/usr/lib/datto/device/templates/commonlookandfeel/Assets/Configure/cloud.backup.html.twig');
     $protectScript = (string) @file_get_contents(
         '/datto/web/commonlookandfeel/js/App/Agents/RecoveraProtectSystem.js');
+    $listTemplate = (string) @file_get_contents(
+        '/usr/lib/datto/device/templates/commonlookandfeel/Agents/List/index.html.twig');
+    $statusScript = (string) @file_get_contents(
+        '/datto/web/commonlookandfeel/js/App/Agents/RecoveraProtectStatus.js');
     if (!str_contains($protectTemplate, 'RecoveraProtectSystem.js') ||
         !str_contains($protectTemplate, 'recovera-protect-csrf') ||
         !str_contains($replicationTemplate, "inWizard or feature.isSupported('FEATURE_PEER_REPLICATION')") ||
-        !str_contains($protectScript, "request('wizard-rule'")) {
+        !str_contains($replicationTemplate, 'recovera-asset-replication') ||
+        !str_contains($protectScript, "request('wizard-rule'") ||
+        !str_contains($protectScript, "request('rule'") ||
+        !str_contains($listTemplate, 'RecoveraProtectStatus.js') ||
+        !str_contains($statusScript, 'Replication destination')) {
         throw new RuntimeException('Protect a System replication integration is not installed');
     }
     $homeTemplate = (string) @file_get_contents(

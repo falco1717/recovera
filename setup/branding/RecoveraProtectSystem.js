@@ -4,7 +4,7 @@
     var endpoint = '/api/recovera/offsite-target/';
 
     function csrf() {
-        var input = document.querySelector('#recovera-protect-csrf input[name="csrf"]');
+        var input = document.querySelector('#recovera-protect-csrf input[name="csrf"], #recovera-asset-replication input[name="csrf"]');
         return input ? input.value : '';
     }
 
@@ -62,7 +62,9 @@
             var policy = {
                 systems: selectedSystems(systems),
                 peer_id: String(model.replicationTargetSiris),
-                interval_minutes: seconds <= 0 ? 5 : Math.max(5, Math.ceil(seconds / 60)),
+                schedule_mode: seconds <= 0 ? 'every_backup' : (seconds === 86400 ? 'daily' : 'interval'),
+                interval_minutes: seconds <= 0 ? 60 : Math.max(5, Math.ceil(seconds / 60)),
+                priority: 'normal',
                 retention_hours: Number(model.offsiteRetention && model.offsiteRetention.keep) || 240000
             };
             var original = {
@@ -146,9 +148,58 @@
         };
     }
 
+    function option(value, label, selected) {
+        return $('<option>').val(value).text(label).prop('selected', String(value) === String(selected));
+    }
+
+    function installAssetPolicyPanel() {
+        var root = $('#recovera-asset-replication');
+        if (!root.length || root.data('installed')) return;
+        root.data('installed', true);
+        var asset = String(root.data('asset'));
+        request('status', 'GET').then(function (status) {
+            var rule = (status.rules || {})[asset] || {};
+            var box = $('<div class="row g-3">');
+            var peer = $('<select class="form-select">');
+            Object.keys(status.peers || {}).forEach(function (id) {
+                peer.append(option(id, status.peers[id].name + ' — ' + status.peers[id].host, rule.peer_id));
+            });
+            var mode = $('<select class="form-select">')
+                .append(option('every_backup', 'Every backup', rule.schedule_mode))
+                .append(option('daily', 'Every day', rule.schedule_mode))
+                .append(option('interval', 'Custom interval', rule.schedule_mode || 'interval'));
+            var interval = $('<input class="form-control" type="number" min="5">').val(rule.interval_minutes || 60);
+            var priority = $('<select class="form-select">')
+                .append(option('high', 'High', rule.priority))
+                .append(option('normal', 'Normal', rule.priority || 'normal'))
+                .append(option('low', 'Low', rule.priority));
+            var retention = $('<select class="form-select">');
+            [[168,'1 week'],[336,'2 weeks'],[744,'1 month'],[2232,'3 months'],[4464,'6 months'],[8760,'1 year'],[240000,'Forever']].forEach(function (item) {
+                retention.append(option(item[0], item[1], rule.retention_hours || 2232));
+            });
+            [['Target appliance',peer],['Schedule',mode],['Interval (minutes)',interval],['Priority',priority],['Target retention',retention]].forEach(function (item) {
+                $('<div class="col-lg-4">').append($('<label class="form-label">').text(item[0]), item[1]).appendTo(box);
+            });
+            var enabled = $('<input type="checkbox" class="form-check-input me-2">').prop('checked', rule.enabled !== false);
+            var save = $('<button type="button" class="btn btn-primary mt-3">').text('Save Recovera policy');
+            var message = $('<span class="ms-3">');
+            save.on('click', function () {
+                save.prop('disabled', true); message.text('Saving…');
+                request('rule', 'POST', {asset: asset, peer_id: peer.val(), schedule_mode: mode.val(), interval_minutes: Number(interval.val()), priority: priority.val(), retention_hours: Number(retention.val()), enabled: enabled.prop('checked')})
+                    .then(function () { message.text('Policy saved.'); })
+                    .catch(function (error) { message.text(error.message); })
+                    .finally(function () { save.prop('disabled', false); });
+            });
+            $('#recovera-asset-policy').empty().append(box, $('<div class="form-check mt-3">').append(enabled, $('<label class="form-check-label">').text('Replication enabled')), save, message);
+        }).catch(function (error) {
+            $('#recovera-asset-policy').text(error.message);
+        });
+    }
+
     installWizardBridge();
     $(function () {
         installWizardBridge();
         installTargetBridge();
+        installAssetPolicyPanel();
     });
 }(jQuery));

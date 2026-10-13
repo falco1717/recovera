@@ -921,11 +921,14 @@ p77_recovera_branding() {
   [ -f "$INSTALL_DIR/branding/recovera-logo.png" ] || { log "Recovera logo is missing"; return 1; }
   [ -f "$INSTALL_DIR/branding/RecoveraTargetController.php" ] || { log "Recovera off-site target controller is missing"; return 1; }
   [ -f "$INSTALL_DIR/branding/RecoveraProtectSystem.js" ] || { log "Recovera protection-wizard bridge is missing"; return 1; }
+  [ -f "$INSTALL_DIR/branding/RecoveraProtectStatus.js" ] || { log "Recovera native replication-status bridge is missing"; return 1; }
+  [ -f "$INSTALL_DIR/branding/apply-peer-ui.py" ] || { log "Recovera native peer-control installer is missing"; return 1; }
   [ -f "$INSTALL_DIR/branding/RecoveraRecoveryPoints.js" ] || { log "Recovera recovery-point bridge is missing"; return 1; }
   [ -f "$INSTALL_DIR/branding/RecoveraHome.js" ] || { log "Recovera home-page bridge is missing"; return 1; }
   ensure_recovera_device_id || return 1
   python3 "$INSTALL_DIR/branding/apply-branding.py" \
     "$INSTALL_DIR/branding/recovera-logo.png" || return 1
+  python3 "$INSTALL_DIR/branding/apply-peer-ui.py" || return 1
   systemctl restart php8.1-fpm >/dev/null 2>&1 || return 1
   log "Recovera branding installed"
 }
@@ -965,6 +968,7 @@ p78_peer_replication() {
   install -m 0644 "$INSTALL_DIR/peer/recovera-peer.service" /etc/systemd/system/recovera-peer.service
   install -m 0644 "$INSTALL_DIR/peer/recovera-peer-sync.service" /etc/systemd/system/recovera-peer-sync.service
   install -m 0644 "$INSTALL_DIR/peer/recovera-peer-sync.timer" /etc/systemd/system/recovera-peer-sync.timer
+  install -m 0644 "$INSTALL_DIR/peer/recovera-peer-gateway.conf" /etc/apache2/conf-available/recovera-peer-gateway.conf
   install -m 0644 "$INSTALL_DIR/peer/sshd-recovera-peer.conf" /etc/ssh/sshd_config.d/91-recovera-peer.conf
   install -m 0440 "$INSTALL_DIR/peer/sudoers-recovera-peer" /etc/sudoers.d/recovera-peer
   install -d -m 0755 /usr/local/lib/recovera /usr/local/share/recovera
@@ -1005,6 +1009,7 @@ from pathlib import Path
 p = Path('/etc/recovera-peer/config.json')
 c = json.loads(p.read_text())
 c['port'] = int('$PEER_PORT')
+c['listen'] = '127.0.0.1'
 c['pool'] = '$ZFS_POOL'
 c['source_root'] = '$ZFS_POOL/home/agents'
 device_id = Path('/datto/config/deviceID')
@@ -1016,15 +1021,19 @@ p.write_text(json.dumps(c, indent=2, sort_keys=True) + '\n')
 p.chmod(0o600)
 PY
 
+  a2enmod proxy proxy_http ssl >/dev/null || return 1
+  a2enconf recovera-peer-gateway >/dev/null || return 1
+  apache2ctl configtest >/dev/null || return 1
   if systemctl is-active --quiet firewalld && firewall-cmd --get-zones 2>/dev/null | grep -qw datto; then
-    firewall-cmd --zone=datto --add-port="${PEER_PORT}/tcp" >/dev/null || return 1
-    firewall-cmd --permanent --zone=datto --add-port="${PEER_PORT}/tcp" >/dev/null || return 1
+    firewall-cmd --zone=datto --remove-port="${PEER_PORT}/tcp" >/dev/null 2>&1 || true
+    firewall-cmd --permanent --zone=datto --remove-port="${PEER_PORT}/tcp" >/dev/null 2>&1 || true
   fi
   systemctl daemon-reload
   systemctl restart ssh.service || return 1
   systemctl enable recovera-peer.service recovera-peer-sync.timer >/dev/null || return 1
   systemctl restart recovera-peer.service recovera-peer-sync.timer || return 1
-  log "Recovera replication backend active on TCP $PEER_PORT; manage it at https://$(hostname -I | awk '{print $1}')/configure/offsite-target"
+  systemctl reload apache2 || return 1
+  log "Recovera pairing is available through HTTPS 443; replication uses restricted SSH and the internal service is loopback-only"
 }
 
 net_revert() {
@@ -1213,11 +1222,14 @@ verify() {
     check "br0 managed by NetworkManager: $(ip -4 -o addr show dev br0 2>/dev/null | awk '{print $4}')" "nmcli -t -f DEVICE,STATE dev | grep -q '^br0:connected'"
   fi
   if [ "$PEER_REPLICATION" = yes ]; then
-    local peer_code
+    local peer_code gateway_code
     peer_code=$(curl -sk -o /dev/null -w '%{http_code}' --max-time 10 "https://127.0.0.1:${PEER_PORT}/v1/info" 2>/dev/null)
+    gateway_code=$(curl -sk -o /dev/null -w '%{http_code}' --max-time 10 "https://127.0.0.1/recovera-peer/info" 2>/dev/null)
     check "peer replication service active"                 "systemctl is-active recovera-peer.service"
     check "peer scheduler enabled"                          "systemctl is-enabled recovera-peer-sync.timer"
     check "peer API https://127.0.0.1:${PEER_PORT}/ answers (HTTP $peer_code)" "[ '$peer_code' = 200 ]"
+    check "pairing gateway on HTTPS 443 answers (HTTP $gateway_code)" "[ '$gateway_code' = 200 ]"
+    check "internal peer API is loopback-only" "ss -Hltn '( sport = :${PEER_PORT} )' | awk '{print \$4}' | grep -Eq '^(127\\.0\\.0\\.1|\\[::1\\]):${PEER_PORT}$'"
   fi
   # Apache / Datto web UI
   local dup ip code

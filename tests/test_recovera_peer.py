@@ -238,6 +238,67 @@ class RecoveraPeerTests(unittest.TestCase):
             with self.assertRaises(self.peer.PeerError):
                 self.peer.prune_received_snapshots("homePool/test", value)
 
+    def test_tiered_retention_keeps_recent_daily_weekly_and_monthly_points(self):
+        now = 2_000_000_000
+        points = [str(now - days * 86400 - hour * 3600)
+                  for days, hour in ((1, 1), (1, 2), (8, 1), (8, 2),
+                                     (20, 1), (21, 1), (60, 1), (61, 1))]
+        points.append(str(now - 600))
+        points.sort(key=int)
+        completed = mock.Mock(returncode=0, stdout=b"", stderr=b"")
+        with mock.patch.object(self.peer, "zfs_snapshots", return_value=points), \
+             mock.patch.object(self.peer, "run", return_value=completed):
+            removed = self.peer.prune_received_snapshots(
+                "homePool/home/agents/" + "d" * 32, 2232, now=now
+            )
+        kept = set(points) - set(removed)
+        self.assertIn(points[-1], kept)
+        self.assertLess(len(kept), len(points))
+        self.assertGreaterEqual(len(kept), 5)
+
+    def test_policy_supports_siris_schedule_priority_and_pause(self):
+        asset = "1" * 32
+        target = "12345678-1234-1234-1234-123456789abc"
+        cfg = self.peer.config()
+        cfg["peers"][target] = {"name": "target", "enabled": True}
+        self.peer.save_config(cfg)
+        rule = self.peer.configure_asset(
+            asset, target, 60, enabled=False, retention_hours=2232,
+            schedule_mode="daily", priority="high", daily_hour=20,
+        )
+        self.assertEqual(rule["schedule_mode"], "daily")
+        self.assertEqual(rule["priority"], "high")
+        self.assertFalse(rule["enabled"])
+        self.assertEqual(rule["retention_tiers"]["weekly"], 1008)
+
+    def test_forever_retention_still_thins_old_intraday_points(self):
+        now = 2_000_000_000
+        points = sorted([str(now - 90 * 86400 - 3600),
+                         str(now - 90 * 86400 - 7200), str(now - 300)])
+        completed = mock.Mock(returncode=0, stdout=b"", stderr=b"")
+        with mock.patch.object(self.peer, "zfs_snapshots", return_value=points), \
+             mock.patch.object(self.peer, "run", return_value=completed):
+            removed = self.peer.prune_received_snapshots(
+                "homePool/home/agents/" + "e" * 32,
+                self.peer.MAX_RETENTION_HOURS, now=now,
+            )
+        self.assertEqual(len(removed), 1)
+
+    def test_target_recovery_readiness_checks_provenance_metadata_and_zfs(self):
+        asset = "a" * 32
+        self.peer.KEYS_DIR.mkdir(parents=True, exist_ok=True)
+        (self.peer.KEYS_DIR / f"{asset}.agentInfo").write_text("metadata")
+        completed = mock.Mock(returncode=0,
+                              stdout=f"readonly\ton\nmountpoint\t/home/agents/{asset}\n".encode(),
+                              stderr=b"")
+        item = {"key": asset, "snapshots": ["100"],
+                "origin": {"isReplicated": True}}
+        with mock.patch.object(self.peer, "zfs_exists", return_value=True), \
+             mock.patch.object(self.peer, "run", return_value=completed):
+            result = self.peer.recovery_readiness(self.peer.config(), item)
+        self.assertTrue(result["recovery_ready"])
+        self.assertEqual(result["latest_snapshot"], "100")
+
     def test_native_queue_prefers_asset_policy_then_single_target(self):
         asset = "6" * 32
         first = "12345678-1234-1234-1234-123456789abc"
