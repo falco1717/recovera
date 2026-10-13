@@ -21,6 +21,7 @@ import re
 import secrets
 import shlex
 import socket
+import socketserver
 import ssl
 import subprocess
 import sys
@@ -30,16 +31,20 @@ import uuid
 from pathlib import Path
 from typing import Any, BinaryIO
 
-VERSION = "0.5.0"
+VERSION = "0.5.1"
 ETC = Path(os.environ.get("RECOVERA_PEER_ETC", "/etc/recovera-peer"))
 STATE_DIR = Path(os.environ.get("RECOVERA_PEER_STATE", "/var/lib/recovera-peer"))
 CONFIG_PATH = ETC / "config.json"
 STATE_PATH = STATE_DIR / "state.json"
 PAIRING_PATH = STATE_DIR / "pairing.json"
-TLS_CERT_PATH = ETC / "tls.crt"
-TLS_KEY_PATH = ETC / "tls.key"
 SSH_KEY_PATH = ETC / "id_ed25519"
 KNOWN_HOSTS_PATH = ETC / "known_hosts"
+SOCKET_PATH = Path(os.environ.get(
+    "RECOVERA_PEER_SOCKET", "/run/recovera-peer/http.sock"
+))
+APACHE_TLS_CERT_PATH = Path(os.environ.get(
+    "RECOVERA_APACHE_TLS_CERT", "/etc/apache2/ssl/www.crt"
+))
 KEYS_DIR = Path(os.environ.get("RECOVERA_PEER_KEYS", "/datto/config/keys"))
 LOCK_PATH = Path(os.environ.get("RECOVERA_PEER_LOCK", "/run/recovera-peer-sync.lock"))
 STATE_LOCK_PATH = Path(os.environ.get(
@@ -120,8 +125,7 @@ def default_config() -> dict[str, Any]:
     numeric_id = 1_000_000_000 + (int(uuid.UUID(appliance_id)) % 8_000_000_000)
     return {
         "schema": 1, "version": VERSION, "appliance_id": appliance_id,
-        "numeric_id": numeric_id, "name": socket.gethostname(),
-        "listen": "127.0.0.1", "port": 9443, "ssh_port": 22,
+        "numeric_id": numeric_id, "name": socket.gethostname(), "ssh_port": 22,
         "pool": "homePool", "source_root": "homePool/home/agents",
         "peers": {}, "sources": {}, "assets": {},
     }
@@ -289,7 +293,7 @@ def gateway_tls_fingerprint() -> str:
 
 
 def local_tls_fingerprint() -> str:
-    pem = TLS_CERT_PATH.read_text(encoding="ascii")
+    pem = APACHE_TLS_CERT_PATH.read_text(encoding="ascii")
     return fingerprint_der(ssl.PEM_cert_to_DER_cert(pem))
 
 
@@ -317,13 +321,6 @@ def init() -> None:
     if not SSH_KEY_PATH.exists():
         run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C",
              f"recovera-peer@{socket.gethostname()}", "-f", str(SSH_KEY_PATH)])
-    if not TLS_CERT_PATH.exists() or not TLS_KEY_PATH.exists():
-        run(["openssl", "req", "-x509", "-newkey", "rsa:3072", "-sha256",
-             "-nodes", "-days", "3650", "-subj",
-             f"/CN={socket.gethostname()}/O=Recovera Peer Replication",
-             "-keyout", str(TLS_KEY_PATH), "-out", str(TLS_CERT_PATH)])
-        os.chmod(TLS_KEY_PATH, 0o600)
-        os.chmod(TLS_CERT_PATH, 0o644)
     KNOWN_HOSTS_PATH.touch(mode=0o600, exist_ok=True)
     if not OFFSITE_PATH.exists():
         atomic_json(OFFSITE_PATH, default_offsite())
@@ -705,7 +702,7 @@ def known_host_lines(host: str, port: int, keys: list[str]) -> list[str]:
 def peer_add(host: str, port: int, code: str, fingerprint: str,
              discovered: dict[str, Any] | None = None) -> dict[str, Any]:
     cfg = config()
-    prefix = "/v1" if port == 9443 else "/recovera-peer"
+    prefix = "/recovera-peer"
     info, actual = ssl_json(host, port, prefix + "/info", expected_fingerprint=fingerprint)
     if discovered and info.get("appliance_id") != discovered.get("appliance_id"):
         raise PeerError("peer identity changed between discovery and pairing")
@@ -1379,7 +1376,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             raise PeerError("request must be a JSON object")
         return value
     def client_ip(self) -> str:
-        address = self.client_address[0]
+        address = "127.0.0.1"
+        if getattr(self.server, "address_family", None) != socket.AF_UNIX:
+            address = self.client_address[0]
         if address in ("127.0.0.1", "::1"):
             forwarded = self.headers.get("X-Forwarded-For", "").split(",", 1)[0].strip()
             if forwarded and HOST_RE.fullmatch(forwarded):
@@ -1387,7 +1386,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         return address
     def admin(self) -> bool:
         supplied = self.headers.get("X-Recovera-Internal", "")
-        if self.client_address[0] in ("127.0.0.1", "::1") and WEB_TOKEN_PATH.is_file():
+        local = getattr(self.server, "address_family", None) == socket.AF_UNIX
+        if local and WEB_TOKEN_PATH.is_file():
             expected = WEB_TOKEN_PATH.read_text(encoding="ascii").strip()
             if expected and hmac.compare_digest(supplied, expected):
                 return True
@@ -1425,7 +1425,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if self.path == "/v1/admin/pairing-code":
                 code = pairing_code(15); self.reply(200, {"code": code, "expires": int(time.time()) + 900})
             elif self.path == "/v1/admin/discover":
-                port = int(body.get("port", 443)); prefix = "/v1" if port == 9443 else "/recovera-peer"
+                port = int(body.get("port", 443)); prefix = "/recovera-peer"
                 info, observed = ssl_json(str(body["host"]), port, prefix + "/info"); self.reply(200, info | {"observed_fingerprint": observed})
             elif self.path == "/v1/admin/peer":
                 self.reply(200, peer_add(str(body["host"]), int(body.get("port", 443)), str(body["code"]), str(body["fingerprint"]), {"appliance_id": str(body["appliance_id"])}))
@@ -1473,15 +1473,30 @@ class Handler(http.server.BaseHTTPRequestHandler):
         except Exception as exc: self.reply(400, {"error": str(exc)})
 
 
+class UnixHTTPServer(socketserver.TCPServer):
+    address_family = socket.AF_UNIX
+
+
+class ThreadingUnixHTTPServer(socketserver.ThreadingMixIn, UnixHTTPServer):
+    daemon_threads = True
+
+
 def serve() -> None:
-    require_root(); cfg = config()
-    server = http.server.ThreadingHTTPServer((cfg["listen"], int(cfg["port"])), Handler)
-    server.daemon_threads = True
-    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER); context.minimum_version = ssl.TLSVersion.TLSv1_2
-    context.load_cert_chain(str(TLS_CERT_PATH), str(TLS_KEY_PATH))
-    server.socket = context.wrap_socket(server.socket, server_side=True)
-    print(f"Recovera peer service listening on https://{cfg['listen']}:{cfg['port']}", flush=True)
-    server.serve_forever()
+    require_root(); config()
+    SOCKET_PATH.parent.mkdir(mode=0o750, parents=True, exist_ok=True)
+    with contextlib.suppress(FileNotFoundError):
+        SOCKET_PATH.unlink()
+    server = ThreadingUnixHTTPServer(str(SOCKET_PATH), Handler)
+    os.chmod(SOCKET_PATH, 0o770)
+    with contextlib.suppress(KeyError, PermissionError):
+        os.chown(SOCKET_PATH, 0, grp.getgrnam("www-data").gr_gid)
+    print(f"Recovera peer service listening on unix:{SOCKET_PATH}", flush=True)
+    try:
+        server.serve_forever()
+    finally:
+        server.server_close()
+        with contextlib.suppress(FileNotFoundError):
+            SOCKET_PATH.unlink()
 
 
 @contextlib.contextmanager
@@ -1519,10 +1534,10 @@ def main() -> int:
         elif args.command == "status": print(json.dumps(status_document(), indent=2))
         elif args.command == "pairing-code": print(pairing_code(args.minutes)); print(f"Pairing HTTPS fingerprint: {gateway_tls_fingerprint()}")
         elif args.command == "discover":
-            prefix = "/v1" if args.port == 9443 else "/recovera-peer"
+            prefix = "/recovera-peer"
             info, observed = ssl_json(args.host, args.port, prefix + "/info"); print(json.dumps(info | {"observed_fingerprint": observed}, indent=2))
         elif args.command == "peer-add":
-            prefix = "/v1" if args.port == 9443 else "/recovera-peer"
+            prefix = "/recovera-peer"
             info, observed = ssl_json(args.host, args.port, prefix + "/info"); fingerprint = args.fingerprint or observed
             if not args.fingerprint and not args.yes:
                 print(f"Target: {info.get('name')} ({info.get('appliance_id')})\nTLS fingerprint: {observed}")

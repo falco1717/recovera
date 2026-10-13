@@ -10,7 +10,8 @@ function requestStatus(string $username, string $password): string
 {
     $process = proc_open([
         '/usr/bin/curl', '-sk', '-o', '/dev/null', '-w', '%{http_code}',
-        '-u', $username . ':' . $password, 'https://127.0.0.1:9443/v1/admin/status',
+        '--unix-socket', '/run/recovera-peer/http.sock',
+        '-u', $username . ':' . $password, 'http://localhost/v1/admin/status',
     ], [['pipe', 'r'], ['pipe', 'w'], ['pipe', 'w']], $pipes);
     if (!is_resource($process)) {
         throw new RuntimeException('Could not launch curl');

@@ -1,0 +1,23 @@
+name: Test
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  unit:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate scripts
+        run: |
+          bash -n install.sh setup/setup.sh tests/e2e-recovera-peer.sh
+          php -l setup/branding/RecoveraTargetController.php
+          php -l tests/integration_recovera_auth.php
+          python3 -m py_compile setup/peer/recovera-peer setup/branding/apply-branding.py
+      - name: Run unit tests
+        run: python3 -m unittest discover -s tests -p 'test_*.py'

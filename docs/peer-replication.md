@@ -9,8 +9,8 @@ vendor cloud service.
 - Both appliances must be installed from this branch with `PEER_REPLICATION=yes`.
 - Each appliance needs a healthy `homePool` with enough free space.
 - The appliances must reach one another on TCP 443 and TCP 22, directly or
-  through a site-to-site VPN. TCP 9443 is an internal loopback-only API and
-  must not be opened between appliances.
+  through a site-to-site VPN. The internal API uses a Unix-domain socket and
+  does not require another network port.
 - System clocks should be reasonably close. Internet time synchronization is
   not required.
 

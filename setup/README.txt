@@ -113,8 +113,8 @@ PEER REPLICATION
 
   For separate sites, route the appliance IPs across a site-to-site VPN and allow TCP 22 and
   TCP 443 for one-time pairing and TCP 22 for replication between only those two
-  addresses. No default route, DNS, or Internet is required. TCP 9443 is internal
-  to each appliance and is not exposed on the network.
+  addresses. No default route, DNS, or Internet is required. The internal peer API
+  uses a restricted Unix-domain socket and does not listen on another TCP port.
 
 EXPECTED FAILED SERVICES (no IPMI hardware / no vendor cloud registration)
   openipmi, datto-https-check, datto-send-volumes-to-portal, datto-speedsync-cache-update,

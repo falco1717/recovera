@@ -57,17 +57,11 @@ final class RecoveraTargetController extends AbstractController
         if ($token === '') {
             return new JsonResponse(['error' => 'Recovera peer service is not initialized'], 503);
         }
-        $port = 9443;
-        $config = @json_decode((string) file_get_contents('/etc/recovera-peer/config.json'), true);
-        if (is_array($config) && isset($config['port'])) {
-            $port = (int) $config['port'];
-        }
-        $curl = curl_init('https://127.0.0.1:' . $port . $path);
+        $curl = curl_init('http://localhost' . $path);
         curl_setopt_array($curl, [
             CURLOPT_CUSTOMREQUEST => $method,
             CURLOPT_RETURNTRANSFER => true,
-            CURLOPT_SSL_VERIFYPEER => false,
-            CURLOPT_SSL_VERIFYHOST => false,
+            CURLOPT_UNIX_SOCKET_PATH => '/run/recovera-peer/http.sock',
             CURLOPT_CONNECTTIMEOUT => 5,
             CURLOPT_TIMEOUT => $operation === 'sync' ? 3600 : 30,
             CURLOPT_HTTPHEADER => ['Content-Type: application/json', 'X-Recovera-Internal: ' . $token],

@@ -97,7 +97,7 @@ load_conf() {
   : "${NET_CONFIGURE:=yes}" "${NET_IP:=current}" "${NET_GATEWAY:=}" "${NET_DNS:=}" "${NET_IFACE:=}"
   : "${REQUIRE_KVM:=yes}" "${MIN_RAM_GB:=8}"
   : "${ZFS_CONFIGURE:=yes}" "${ZFS_DISK:=auto}" "${ZFS_MIN_GB:=20}" "${ZFS_POOL:=homePool}" "${ZFS_MOVE_HOME:=yes}"
-  : "${PEER_REPLICATION:=yes}" "${PEER_PORT:=9443}"
+  : "${PEER_REPLICATION:=yes}"
   : "${FIPS_OFF:=yes}" "${REMOVE_SNAPD:=yes}" "${REMOVE_CLOUD_INIT:=yes}" "${APT_FREEZE:=yes}" "${OFFLINE_MODE:=yes}" "${AUTO_REBOOT:=yes}"
   LOGIN_USER="${LOGIN_USER:-${SUDO_USER:-}}"
   [ -n "$LOGIN_USER" ] || LOGIN_USER="$(getent passwd 1000 | cut -d: -f1)"
@@ -109,8 +109,6 @@ validate_conf() {
   [[ "$MIN_RAM_GB" =~ ^[1-9][0-9]*$ ]] || die "MIN_RAM_GB must be a positive integer"
   case "$ZFS_CONFIGURE" in yes|no|auto) ;; *) die "ZFS_CONFIGURE must be yes, no, or auto" ;; esac
   case "$PEER_REPLICATION" in yes|no) ;; *) die "PEER_REPLICATION must be yes or no" ;; esac
-  [[ "$PEER_PORT" =~ ^[0-9]+$ ]] && [ "$PEER_PORT" -ge 1024 ] && [ "$PEER_PORT" -le 65535 ] || \
-    die "PEER_PORT must be an unprivileged TCP port from 1024 through 65535"
   [ "$PEER_REPLICATION" != yes ] || [ "$ZFS_CONFIGURE" != no ] || \
     die "PEER_REPLICATION=yes requires ZFS_CONFIGURE=yes or auto"
   if [ "$OFFLINE_MODE" = yes ]; then
@@ -1008,8 +1006,8 @@ import json
 from pathlib import Path
 p = Path('/etc/recovera-peer/config.json')
 c = json.loads(p.read_text())
-c['port'] = int('$PEER_PORT')
-c['listen'] = '127.0.0.1'
+c.pop('port', None)
+c.pop('listen', None)
 c['pool'] = '$ZFS_POOL'
 c['source_root'] = '$ZFS_POOL/home/agents'
 device_id = Path('/datto/config/deviceID')
@@ -1021,19 +1019,20 @@ p.write_text(json.dumps(c, indent=2, sort_keys=True) + '\n')
 p.chmod(0o600)
 PY
 
-  a2enmod proxy proxy_http ssl >/dev/null || return 1
+  rm -f /etc/recovera-peer/tls.crt /etc/recovera-peer/tls.key
+  a2enmod proxy proxy_http >/dev/null || return 1
   a2enconf recovera-peer-gateway >/dev/null || return 1
   apache2ctl configtest >/dev/null || return 1
   if systemctl is-active --quiet firewalld && firewall-cmd --get-zones 2>/dev/null | grep -qw datto; then
-    firewall-cmd --zone=datto --remove-port="${PEER_PORT}/tcp" >/dev/null 2>&1 || true
-    firewall-cmd --permanent --zone=datto --remove-port="${PEER_PORT}/tcp" >/dev/null 2>&1 || true
+    firewall-cmd --zone=datto --remove-port="9443/tcp" >/dev/null 2>&1 || true
+    firewall-cmd --permanent --zone=datto --remove-port="9443/tcp" >/dev/null 2>&1 || true
   fi
   systemctl daemon-reload
   systemctl restart ssh.service || return 1
   systemctl enable recovera-peer.service recovera-peer-sync.timer >/dev/null || return 1
   systemctl restart recovera-peer.service recovera-peer-sync.timer || return 1
   systemctl reload apache2 || return 1
-  log "Recovera pairing is available through HTTPS 443; replication uses restricted SSH and the internal service is loopback-only"
+  log "Recovera pairing is available through HTTPS 443; replication uses restricted SSH and the internal API uses a Unix socket"
 }
 
 net_revert() {
@@ -1222,14 +1221,15 @@ verify() {
     check "br0 managed by NetworkManager: $(ip -4 -o addr show dev br0 2>/dev/null | awk '{print $4}')" "nmcli -t -f DEVICE,STATE dev | grep -q '^br0:connected'"
   fi
   if [ "$PEER_REPLICATION" = yes ]; then
-    local peer_code gateway_code
-    peer_code=$(curl -sk -o /dev/null -w '%{http_code}' --max-time 10 "https://127.0.0.1:${PEER_PORT}/v1/info" 2>/dev/null)
+    local peer_code gateway_code peer_socket=/run/recovera-peer/http.sock
+    peer_code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 --unix-socket "$peer_socket" "http://localhost/v1/info" 2>/dev/null)
     gateway_code=$(curl -sk -o /dev/null -w '%{http_code}' --max-time 10 "https://127.0.0.1/recovera-peer/info" 2>/dev/null)
     check "peer replication service active"                 "systemctl is-active recovera-peer.service"
     check "peer scheduler enabled"                          "systemctl is-enabled recovera-peer-sync.timer"
-    check "peer API https://127.0.0.1:${PEER_PORT}/ answers (HTTP $peer_code)" "[ '$peer_code' = 200 ]"
+    check "peer API Unix socket answers (HTTP $peer_code)"     "[ '$peer_code' = 200 ]"
     check "pairing gateway on HTTPS 443 answers (HTTP $gateway_code)" "[ '$gateway_code' = 200 ]"
-    check "internal peer API is loopback-only" "ss -Hltn '( sport = :${PEER_PORT} )' | awk '{print \$4}' | grep -Eq '^(127\\.0\\.0\\.1|\\[::1\\]):${PEER_PORT}$'"
+    check "peer API socket is restricted to root:www-data" "[ -S '$peer_socket' ] && [ \"\$(stat -c '%U:%G:%a' '$peer_socket')\" = root:www-data:770 ]"
+    check "legacy TCP 9443 listener is absent" "! ss -Hltn '( sport = :9443 )' | grep -q ."
   fi
   # Apache / Datto web UI
   local dup ip code
