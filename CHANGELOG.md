@@ -1,5 +1,16 @@
 # Changelog
 
+## v0.6.0 - 2026-10-13
+
+- Added a persistent local `backup-admin` account whose high-entropy password
+  changes only through an explicit administrator reset.
+- Added **Configure → Appliance Access** for authenticated password reveal and
+  copy, backed by a non-cacheable internal API.
+- Added hardened OVA preparation and first-boot initialization that remove
+  builder credentials and regenerate every clone-specific machine, SSH, TLS,
+  ZFS, device, replication, and administrative identity.
+- Documented OVA import, validation, publication, and recovery procedures.
+
 ## v0.5.1 - 2026-10-13
 
 - Replaced the internal loopback TCP/TLS listener on port 9443 with a

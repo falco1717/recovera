@@ -43,6 +43,7 @@ def load_module(root: Path):
     os.environ["RECOVERA_PEER_STATE_LOCK"] = str(root / "state.lock")
     os.environ["RECOVERA_PEER_OFFSITE"] = str(root / "offsite.json")
     os.environ["RECOVERA_PEER_WEB_TOKEN"] = str(root / "web.token")
+    os.environ["RECOVERA_BACKUP_ADMIN_CREDENTIAL"] = str(root / "backup-admin.json")
     os.environ["RECOVERA_TX_SPEED"] = str(root / "txSpeed")
     os.environ["RECOVERA_PEER_AUTHORIZED_KEYS"] = str(root / "authorized_keys")
     os.environ["RECOVERA_PEER_SOCKET"] = str(root / "peer.sock")
@@ -92,6 +93,18 @@ class RecoveraPeerTests(unittest.TestCase):
         self.assertIn("CURLOPT_UNIX_SOCKET_PATH", controller)
         self.assertIn("RuntimeDirectory=recovera-peer", service)
         self.assertIn("Group=www-data", service)
+
+    def test_backup_admin_credential_is_available_only_through_admin_api(self):
+        self.peer.BACKUP_ADMIN_CREDENTIAL_PATH.write_text(json.dumps({
+            "username": "backup-admin", "password": "stable-test-password"
+        }))
+        self.assertEqual(self.peer.backup_admin_credential(), {
+            "username": "backup-admin", "password": "stable-test-password"
+        })
+        controller = CONTROLLER.read_text(encoding="utf-8")
+        self.assertIn("'backup-admin-credential' => ['GET'", controller)
+        gateway = GATEWAY.read_text(encoding="utf-8")
+        self.assertNotIn("backup-admin-credential", gateway)
 
     @unittest.skipUnless(os.name == "posix", "Unix sockets are exercised on Linux CI")
     def test_unix_socket_serves_http_without_tcp(self):

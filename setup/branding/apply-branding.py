@@ -94,17 +94,23 @@ def brand_translation(text: str) -> str:
 
 def add_target_visibility(text: str) -> str:
     needle = "{% set showConfigureOffsiteSync = feature.isSupported('FEATURE_OFFSITE') and is_granted('PERMISSION_OFFSITE_WRITE') %}"
-    addition = needle + "\n{% set showRecoveraTarget = is_granted('PERMISSION_OFFSITE_WRITE') %}"
-    return text if "showRecoveraTarget" in text else text.replace(needle, addition, 1)
+    additions = []
+    if "showRecoveraTarget" not in text:
+        additions.append("{% set showRecoveraTarget = is_granted('PERMISSION_OFFSITE_WRITE') %}")
+    if "showRecoveraAccess" not in text:
+        additions.append("{% set showRecoveraAccess = is_granted('PERMISSION_OFFSITE_WRITE') %}")
+    return text.replace(needle, needle + "\n" + "\n".join(additions), 1) if additions else text
 
 
 def add_target_menu(text: str) -> str:
     text = text.replace(
         "if showConfigureNetworking or showConfigureOffsiteSync or showConfigureDeviceSettings",
-        "if showConfigureNetworking or showConfigureOffsiteSync or showRecoveraTarget or showConfigureDeviceSettings",
+        "if showConfigureNetworking or showConfigureOffsiteSync or showRecoveraTarget or showRecoveraAccess or showConfigureDeviceSettings",
     )
-    if "path('recovera_target')" in text:
-        return text
+    text = text.replace(
+        "if showConfigureNetworking or showConfigureOffsiteSync or showRecoveraTarget or showConfigureDeviceSettings",
+        "if showConfigureNetworking or showConfigureOffsiteSync or showRecoveraTarget or showRecoveraAccess or showConfigureDeviceSettings",
+    )
     end = "                            {% endif %}\n"
     anchor = "{{ \"menu.configure.offsite\"|trans }}"
     position = text.find(anchor)
@@ -116,15 +122,27 @@ def add_target_menu(text: str) -> str:
     position += len(end)
     mobile = "ps-5 py-1 pe-0" in text
     classes = ' class="dropdown-item ps-5 py-1 pe-0"' if mobile else ' class="dropdown-item"'
-    block = (
-        "                            {% if showRecoveraTarget %}\n"
-        "                                <li>\n"
-        f"                                    <a{classes} href=\"{{{{ path('recovera_target') }}}}\">\n"
-        "                                        Off-site Target\n"
-        "                                    </a>\n"
-        "                                </li>\n"
-        "                            {% endif %}\n"
-    )
+    block = ""
+    if "path('recovera_target')" not in text:
+        block += (
+            "                            {% if showRecoveraTarget %}\n"
+            "                                <li>\n"
+            f"                                    <a{classes} href=\"{{{{ path('recovera_target') }}}}\">\n"
+            "                                        Off-site Target\n"
+            "                                    </a>\n"
+            "                                </li>\n"
+            "                            {% endif %}\n"
+        )
+    if "path('recovera_access')" not in text:
+        block += (
+            "                            {% if showRecoveraAccess %}\n"
+            "                                <li>\n"
+            f"                                    <a{classes} href=\"{{{{ path('recovera_access') }}}}\">\n"
+            "                                        Appliance Access\n"
+            "                                    </a>\n"
+            "                                </li>\n"
+            "                            {% endif %}\n"
+        )
     return text[:position] + block + text[position:]
 
 
@@ -218,9 +236,9 @@ def add_routes(text: str) -> str:
         "path: /configure/offsite-target/api/{operation}",
         "path: /api/recovera/offsite-target/{operation}",
     )
-    if "recovera_target:" in text:
-        return text
-    return text.rstrip() + """
+    additions = ""
+    if "recovera_target:" not in text:
+        additions += """
 
 recovera_target:
     path: /configure/offsite-target
@@ -230,6 +248,14 @@ recovera_target_api:
     path: /api/recovera/offsite-target/{operation}
     defaults: { _controller: 'Datto\\App\\Controller\\Web\\Configure\\RecoveraTargetController::apiAction' }
 """
+    if "recovera_access:" not in text:
+        additions += """
+
+recovera_access:
+    path: /configure/appliance-access
+    defaults: { _controller: 'Datto\\App\\Controller\\Web\\Configure\\RecoveraTargetController::accessAction' }
+"""
+    return text.rstrip() + additions if additions else text
 
 
 def main() -> int:
@@ -249,6 +275,8 @@ def main() -> int:
     controller = ROOT / "src/App/Controller/Web/Configure/RecoveraTargetController.php"
     target_template = ROOT / "templates/commonlookandfeel/Configure/RecoveraTarget/index.html.twig"
     target_js = WEB / "commonlookandfeel/js/App/Configure/RecoveraTarget.js"
+    access_template = ROOT / "templates/commonlookandfeel/Configure/RecoveraAccess/index.html.twig"
+    access_js = WEB / "commonlookandfeel/js/App/Configure/RecoveraAccess.js"
     offsite_js = WEB / "commonlookandfeel/js/App/Configure/OffsiteSync/RecoveraOffsiteApiClient.js"
     recovery_points_js = WEB / "commonlookandfeel/js/App/Assets/RecoveraRecoveryPoints.js"
     protect_system_js = WEB / "commonlookandfeel/js/App/Agents/RecoveraProtectSystem.js"
@@ -257,6 +285,8 @@ def main() -> int:
         (resources / "RecoveraTargetController.php", controller),
         (resources / "recovera-target.html.twig", target_template),
         (resources / "RecoveraTarget.js", target_js),
+        (resources / "recovera-access.html.twig", access_template),
+        (resources / "RecoveraAccess.js", access_js),
         (resources / "RecoveraOffsiteApiClient.js", offsite_js),
         (resources / "RecoveraRecoveryPoints.js", recovery_points_js),
         (resources / "RecoveraProtectSystem.js", protect_system_js),

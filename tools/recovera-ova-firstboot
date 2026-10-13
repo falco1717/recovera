@@ -1,0 +1,67 @@
+#!/bin/bash
+# Generate every clone-specific identity before network services start.
+set -euo pipefail
+
+MARKER=/var/lib/recovera-ova/first-boot-complete
+[ ! -e "$MARKER" ] || exit 0
+
+hostnamectl set-hostname recovera
+if grep -qE '^127\.0\.1\.1[[:space:]]' /etc/hosts; then
+  sed -Ei 's/^127\.0\.1\.1[[:space:]].*/127.0.1.1 recovera/' /etc/hosts
+else
+  printf '127.0.1.1 recovera\n' >> /etc/hosts
+fi
+ssh-keygen -A
+
+# The image uses DHCP. A stable bridge MAC is derived from this clone's new
+# machine-id instead of retaining the OVA builder's virtual NIC address.
+if [ -f /etc/NetworkManager/system-connections/br0.nmconnection ]; then
+  sed -Ei 's/^cloned-mac-address=.*/cloned-mac-address=stable/' \
+    /etc/NetworkManager/system-connections/br0.nmconnection
+fi
+
+# Every deployment receives a new administrative password and a new peer
+# identity. No credential, pairing, or source/target relationship is cloned.
+/usr/local/sbin/recovera-backup-admin install
+rm -rf /etc/recovera-peer /var/lib/recovera-peer
+install -d -m 0700 /etc/recovera-peer
+install -d -o recovera-repl -g recovera-repl -m 0700 /var/lib/recovera-peer
+/usr/local/sbin/recovera-peer init
+
+python3 - <<'PY'
+import json
+import os
+from pathlib import Path
+
+config_path = Path('/etc/recovera-peer/config.json')
+config = json.loads(config_path.read_text())
+config['pool'] = 'homePool'
+config['source_root'] = 'homePool/home/agents'
+config_path.write_text(json.dumps(config, indent=2, sort_keys=True) + '\n')
+config_path.chmod(0o600)
+
+device_id = Path('/datto/config/deviceID')
+device_id.parent.mkdir(parents=True, exist_ok=True)
+temporary = device_id.with_name('.deviceID.recovera-ova')
+temporary.write_text(str(int(config['numeric_id'])) + '\n')
+temporary.chmod(0o644)
+os.replace(temporary, device_id)
+PY
+
+# Regenerate the browser certificate instead of shipping the builder's key.
+install -d -m 0755 /etc/apache2/ssl
+rm -f /etc/apache2/ssl/www.key /etc/apache2/ssl/www.crt
+openssl req -x509 -nodes -newkey rsa:3072 -sha256 -days 825 \
+  -subj '/CN=recovera' -addext 'subjectAltName=DNS:recovera' \
+  -keyout /etc/apache2/ssl/www.key -out /etc/apache2/ssl/www.crt >/dev/null 2>&1
+chmod 0600 /etc/apache2/ssl/www.key
+chmod 0644 /etc/apache2/ssl/www.crt
+
+# ZFS identifies the imported pool and host independently on every deployment.
+zgenhostid -f
+zpool reguid homePool
+
+install -d -m 0755 "$(dirname "$MARKER")"
+date -u +'%FT%TZ' > "$MARKER"
+systemctl disable recovera-ova-firstboot.service >/dev/null 2>&1 || true
+systemctl daemon-reload

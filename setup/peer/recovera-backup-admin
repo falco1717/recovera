@@ -1,0 +1,108 @@
+#!/usr/bin/env python3
+"""Create and display Recovera's persistent local appliance administrator."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import pwd
+import secrets
+import string
+import subprocess
+from pathlib import Path
+
+
+USERNAME = "backup-admin"
+CREDENTIAL = Path(os.environ.get(
+    "RECOVERA_BACKUP_ADMIN_CREDENTIAL", "/etc/recovera/backup-admin.json"
+))
+
+
+def require_root() -> None:
+    if os.geteuid() != 0:
+        raise SystemExit("run with sudo")
+
+
+def run(*args: str, input_text: str | None = None) -> None:
+    subprocess.run(args, input=input_text, text=True, check=True,
+                   stdout=subprocess.DEVNULL)
+
+
+def generated_password() -> str:
+    # Readable when typed from a console, while retaining more than 150 bits of entropy.
+    alphabet = string.ascii_letters + string.digits + "-_."
+    return "".join(secrets.choice(alphabet) for _ in range(28))
+
+
+def read_credential() -> dict[str, str] | None:
+    try:
+        value = json.loads(CREDENTIAL.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    if value.get("username") != USERNAME or not isinstance(value.get("password"), str):
+        raise SystemExit(f"invalid credential file: {CREDENTIAL}")
+    return {"username": USERNAME, "password": value["password"]}
+
+
+def write_credential(password: str) -> None:
+    CREDENTIAL.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    temporary = CREDENTIAL.with_name(f".{CREDENTIAL.name}.{os.getpid()}")
+    temporary.write_text(json.dumps({"username": USERNAME, "password": password},
+                                    indent=2) + "\n", encoding="utf-8")
+    temporary.chmod(0o600)
+    os.replace(temporary, CREDENTIAL)
+
+
+def account_exists() -> bool:
+    try:
+        pwd.getpwnam(USERNAME)
+        return True
+    except KeyError:
+        return False
+
+
+def install(reset: bool = False) -> dict[str, str]:
+    require_root()
+    existing = read_credential()
+    created = not account_exists()
+    run("groupadd", "-f", "remote-users")
+    if created:
+        run("useradd", "--create-home", "--shell", "/bin/bash", USERNAME)
+    run("usermod", "-aG", "remote-users,sudo", USERNAME)
+
+    if existing is None or reset:
+        password = generated_password()
+        run("chpasswd", input_text=f"{USERNAME}:{password}\n")
+        write_credential(password)
+    else:
+        password = existing["password"]
+        if created:
+            run("chpasswd", input_text=f"{USERNAME}:{password}\n")
+
+    # Password aging is disabled. Rotation only occurs through an explicit reset.
+    run("chage", "-m", "0", "-M", "-1", "-I", "-1", "-E", "-1", USERNAME)
+    return {"username": USERNAME, "password": password}
+
+
+def show() -> dict[str, str]:
+    require_root()
+    value = read_credential()
+    if value is None:
+        raise SystemExit("backup-admin is not initialized")
+    return value
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("command", choices=("install", "show", "reset"))
+    args = parser.parse_args()
+    value = install(reset=args.command == "reset") if args.command != "show" else show()
+    if args.command in ("show", "reset"):
+        print(f"Username: {value['username']}")
+        print(f"Password: {value['password']}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

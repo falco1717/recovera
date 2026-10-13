@@ -67,6 +67,17 @@ canOffsite: {{ canOffsite|json_encode|raw }}
         self.assertIn('id="recovera-offsite-servers"', patched)
         self.assertEqual(branding.patch_home_device_info(patched), patched)
 
+    def test_appliance_access_route_and_menu_are_idempotent(self):
+        branding = load_module()
+        routes = branding.add_routes("existing: true\n")
+        self.assertIn("path: /configure/appliance-access", routes)
+        self.assertEqual(branding.add_routes(routes), routes)
+
+        visibility = "{% set showConfigureOffsiteSync = feature.isSupported('FEATURE_OFFSITE') and is_granted('PERMISSION_OFFSITE_WRITE') %}"
+        visibility = branding.add_target_visibility(visibility)
+        self.assertIn("showRecoveraAccess", visibility)
+        self.assertEqual(branding.add_target_visibility(visibility), visibility)
+
 
 if __name__ == "__main__":
     unittest.main()
