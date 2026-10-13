@@ -1,3 +1,4 @@
+import contextlib
 import importlib.machinery
 import importlib.util
 import json
@@ -5,6 +6,7 @@ import os
 import socket
 import sys
 import tempfile
+import threading
 import unittest
 from types import SimpleNamespace
 from pathlib import Path
@@ -90,6 +92,33 @@ class RecoveraPeerTests(unittest.TestCase):
         self.assertIn("CURLOPT_UNIX_SOCKET_PATH", controller)
         self.assertIn("RuntimeDirectory=recovera-peer", service)
         self.assertIn("Group=www-data", service)
+
+    @unittest.skipUnless(os.name == "posix", "Unix sockets are exercised on Linux CI")
+    def test_unix_socket_serves_http_without_tcp(self):
+        socket_path = self.root / "service.sock"
+        server = self.peer.ThreadingUnixHTTPServer(str(socket_path), self.peer.Handler)
+        worker = threading.Thread(target=server.serve_forever, daemon=True)
+        worker.start()
+        try:
+            client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            client.settimeout(5)
+            client.connect(str(socket_path))
+            client.sendall(b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            response = b""
+            while True:
+                chunk = client.recv(4096)
+                if not chunk:
+                    break
+                response += chunk
+            client.close()
+            self.assertIn(b"HTTP/1.0 404 Not Found", response)
+            self.assertIn(b"Use /configure/offsite-target", response)
+        finally:
+            server.shutdown()
+            server.server_close()
+            worker.join(timeout=5)
+            with contextlib.suppress(FileNotFoundError):
+                socket_path.unlink()
 
     def test_offsite_schedule_add_apply_and_delete(self):
         item = self.peer.schedule_add(3600, 7200, -1)
