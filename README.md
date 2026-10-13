@@ -1,67 +1,119 @@
-# spf-datto replica
+# Recovera
 
-This repo exports every installed package from the Datto SIRIS appliance **spf-datto**
-(10.0.3.147) and rebuilds it as a VM, **spf-datto-pkgs** (10.0.3.200), on vCenter 10.0.3.12.
-The VM has the same 1,351 packages at the same versions, a ZFS `homePool` and a NetworkManager bridge.
+One command turns an existing Ubuntu 22.04 amd64 VM into a locally usable,
+offline-capable Recovera backup appliance. This branch does not deploy, modify, or require
+vCenter/ESXi.
 
-- **[WALKTHROUGH.md](WALKTHROUGH.md)**: what was done, step by step, including the dead ends
-- **[GOTCHAS.md](GOTCHAS.md)**: the traps, in short form
+The installation payload contains 1,329 packages. The bundle builder removes
+22 source-appliance-only security, telemetry, debug, and legacy FIPS-kernel
+packages while preserving the complete dependency closure needed by the local
+application. It also removes copied appliance credentials and private keys.
 
-## Layout
+## Install on an existing Ubuntu VM
 
-```
-scripts/export/    run on spf-datto (as roseadmin)
-  run.sh, pkgplan.py      attempt 1: download from the box's Datto repos (failed: gateway blocks Datto)
-  run2.sh, pkgplan2.py    public Ubuntu mirror (private apt root) + Launchpad + Elastic
-  run3.sh                 dpkg-repack everything still missing (runs after run2.sh)
-scripts/vcenter/   run on this PC (PowerShell 7 + PowerCLI 13)
-  vc-login.ps1            interactive sign-in; saves only the session secret
-  vc-connect.ps1          reuse that session (dot-sourced by the others)
-  vc-inventory.ps1        hosts / datastores / port groups
-  vc-deploy.ps1           attempt 1: OVA + cloud-init over DHCP (hit an IP conflict)
-  vc-redeploy.ps1         delete + re-import (its network-config property was ignored)
-  vc-fix-ssh.ps1          cloud-init lockout recovery; did NOT work, kept for the record
-  vc-add-disk.ps1         3 TB thin disk on Farmer-NAS-VMFS
-  vc-snapshot.ps1         create / replace / revert snapshots
-scripts/vm/        run on the VM (as ubuntu)
-  01-static-ip.sh         DHCP to static 10.0.3.200; turns off cloud-init's network handling
-  02-install-packages.sh  dry run, then exact-version install from /opt/localdebs
-  03-remove-snapd-cloud-init.sh   fixes the boot ordering cycles (and php-fpm)
-  04-zfs-homepool.sh      homePool + spf-datto dataset layout, /home moved onto ZFS
-  05-networkmanager-bridge.sh     br0 like spf-datto, with automatic revert
-config/            NetworkManager keyfiles, GRUB override, interim netplan
-lists/             package lists from the export (all, manual, portable, repacked, ...)
-docs/              README from the export folder
+The VM needs Ubuntu 22.04 amd64, at least 8 GB RAM, a normal user with `sudo`
+access, about 12 GB free on `/`, and a blank second disk of at least 20 GB for `homePool`.
+Hardware virtualization must be available. If the appliance runs as a VM,
+enable nested virtualization before powering it on (in VMware, expose
+hardware-assisted virtualization to the guest).
+
+Eight GB supports screenshot/boot verification of small protected VMs. Size the
+appliance with additional RAM when recovery VMs need more memory.
+
+```bash
+gh auth login
+gh repo clone falco1717/recovera
+cd recovera
+git switch feature/recovera-rebrand
+./install.sh --check   # optional preflight and package simulation
+./install.sh
 ```
 
-The scripts in `scripts/vm/` are the **corrected** versions. They include the fixes for each
-problem hit during the session (SSH lockout, needrestart re-run, overlay, snapctl link).
+`install.sh` prompts for `sudo`, downloads the pinned installation payload from
+this repository's private GitHub Release, verifies its checksum, and runs the
+setup workflow. The installation continues as a systemd unit if SSH disconnects
+and reboots automatically when finished.
 
-## Not in the repo
+The defaults preserve the VM's current IP address and require both KVM and a
+blank disk for ZFS. Edit `setup/setup.conf` first to change networking or disable
+the automatic reboot. `REQUIRE_KVM=no` and `ZFS_CONFIGURE=auto/no` are available
+only for limited troubleshooting installs; agentless protection or core UI and
+storage features will not be fully functional without them.
 
-| What | Where |
-|---|---|
-| The 1,351 `.deb` files (1.6 GB) + `SHA256SUMS` + `Packages.gz` | `F:\Users\jfarmer\Desktop\pkgexport-spf-datto\debs\` |
-| Ubuntu 22.04 cloud OVA (711 MB) | `cloud-images.ubuntu.com/jammy/current/jammy-server-cloudimg-amd64.ova`; put it in `scripts/vcenter/ova/` |
-| SSH key | `F:\Users\jfarmer\Documents\keys\sshkey Private` / `sshkey Public.pub` |
-| Passwords | never stored; typed into terminal prompts |
+After reboot, open `https://<VM-IP>/`, finish the local registration wizard, and
+sign in with the local administrator. Initial setup and local login do not need
+Internet. Legacy vendor enrollment, licensing, updates, and cloud services are not
+emulated.
 
-## Rebuilding from scratch
+## Offline appliance replication
 
-1. **Export:** on spf-datto, run `run2.sh` and then `run3.sh`. Copy the result off and run `sha256sum -c SHA256SUMS`.
-   Or reuse the export already on the Desktop.
-2. **Deploy:** run `vc-login.ps1`, then `vc-redeploy.ps1`.
-3. **On the VM:**
-   1. Run `01-static-ip.sh`, then snapshot `pre-package-install`.
-   2. Copy `debs` and `lists`, then run `02-install-packages.sh` (a dry run) and `02-install-packages.sh --install`.
-   3. **Prove a new SSH login works under Datto's sshd config before rebooting** (see GOTCHAS #10).
-   4. Run `03-remove-snapd-cloud-init.sh` and reboot.
-4. **Storage:** run `vc-add-disk.ps1`, then `04-zfs-homepool.sh`.
-5. **Network:** run `05-networkmanager-bridge.sh` and cancel the revert. Disable networkd, reboot, and snapshot `configured`.
+The installer also provides SIRIS-Private-style replication between Recovera
+appliances. It uses a one-time pairing code and a manually verified TLS
+fingerprint, then pins the target's SSH host key. Full ZFS streams are sent for
+new assets; subsequent recovery points use incremental, resumable ZFS streams.
+The target receives protected-system metadata and invokes the appliance's local
+replication-received hook so recovery points remain locally discoverable.
 
-## Open items
+Sign in to the normal Recovera WebUI and open **Configure → Off-site Target**.
+On the target, generate a one-time code. On the source, enter the target IP,
+verify its TLS fingerprint, and enter that code. The paired appliance then appears
+as an authorized target in **Protect a System → Replication & Retention**, where
+you select the destination, replication frequency, and target-side retention.
+The Off-site Target page can also create or revise a policy after protection.
+**Configure → Off-site Synchronization** controls the weekly replication windows
+and upload-speed limit. The CLI workflow is documented in
+[`docs/peer-replication.md`](docs/peer-replication.md).
 
-- Gateway 10.0.3.1 rejects Datto destinations, so **spf-datto's offsite sync is broken** (WALKTHROUGH, Phase 3).
-- `00:e0:ed:97:68:33` statically holds 10.0.3.21 inside the DHCP range.
-- Rotate the `administrator@vsphere.local` and `roseadmin` passwords.
-- Delete the `pre-package-install` snapshot when you no longer need it.
+Individual recovery points can also be queued from the native recovery-points
+page. The existing **Exists in Cloud** column is retained for SIRIS Private
+compatibility: **Queued**, **Streaming**, and the completed green indicator refer
+to the paired Recovera target, and the state survives normal page refreshes.
+
+Only TCP 443 (pairing/status through the normal Recovera site) and TCP 22
+(encrypted backup streams) are used between appliances. The peer service still
+uses TCP 9443 internally on loopback, but it must never be exposed through the
+host firewall. For different sites, expose 443 and 22 only across a site-to-site
+VPN and restrict them to the two appliance addresses. Internet connectivity is
+not required.
+
+## Fully air-gapped install
+
+Copy this repository and `spf-datto-setup.tar` to the VM, then run:
+
+```bash
+./install.sh --bundle /path/to/spf-datto-setup.tar --check
+./install.sh --bundle /path/to/spf-datto-setup.tar
+```
+
+All package and registration steps then run without network access. Apt uses
+only the bundle's local repository and pip uses only vendored wheels.
+
+Each installed VM generates its own local TLS key and certificate. The source
+appliance's web and log-shipping identities, active factory password hashes,
+and configuration for excluded telemetry agents are not included.
+
+## Status and verification
+
+```bash
+sudo /opt/spf-datto/setup.sh status
+sudo /opt/spf-datto/setup.sh verify
+sudo cat /var/log/spf-datto-verify.log
+```
+
+A successful build reports `RESULT: PASS`. Re-running the installer resumes
+safely; completed phases are skipped.
+
+## Maintainer notes
+
+- `setup/setup.sh` contains the idempotent installation phases.
+- `setup/setup.conf` contains user-editable defaults.
+- `setup/release.env` pins the private release payload and checksum.
+- `setup/prune-packages.txt` is the reviewed source-appliance-only exclusion list.
+- `tools/make-bundle.sh` builds and validates the sanitized payload from the
+  package export; `tools/sanitize-datto-package.py` removes embedded identity.
+- [`docs/upgrading.md`](docs/upgrading.md) documents upgrades and rollback.
+- [`docs/releasing.md`](docs/releasing.md) is the maintainer release checklist.
+
+The payload still contains proprietary/repacked appliance packages and selected
+configuration files. Keep the repository and release private and treat the
+payload as sensitive even though source-appliance credentials are removed.

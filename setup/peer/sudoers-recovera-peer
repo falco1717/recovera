@@ -1,0 +1,4 @@
+# The SSH key has a forced command. The entry point also validates the paired
+# source ID, command verb, asset ID, snapshot ID and destination dataset.
+Defaults:recovera-repl env_keep += "SSH_ORIGINAL_COMMAND"
+recovera-repl ALL=(root) NOPASSWD: /usr/local/sbin/recovera-peer ssh-entry *

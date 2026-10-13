@@ -1,0 +1,62 @@
+:root {
+    --recovera-navy: #07384a;
+    --recovera-blue: #078ed1;
+    --recovera-cyan: #21d7e5;
+}
+
+.recovera-brand {
+    align-items: center;
+    color: #fff !important;
+    display: inline-flex;
+    font-size: 1.25rem;
+    font-weight: 700;
+    gap: .6rem;
+    letter-spacing: .015em;
+    text-decoration: none;
+}
+
+.recovera-brand img {
+    height: 34px;
+    object-fit: contain;
+    width: 34px;
+}
+
+.recovera-login-brand {
+    align-items: center;
+    color: var(--recovera-navy);
+    display: flex;
+    font-size: 1.55rem;
+    font-weight: 750;
+    gap: .7rem;
+    margin-bottom: 1.25rem;
+}
+
+.recovera-login-brand img,
+.recovera-wizard-brand img {
+    height: 44px;
+    object-fit: contain;
+    width: 44px;
+}
+
+.recovera-device-name {
+    color: #5e7480;
+    font-size: .9rem;
+    margin: -.6rem 0 1.1rem;
+}
+
+.recovera-wizard-brand {
+    align-items: center;
+    color: var(--recovera-navy);
+    display: inline-flex;
+    font-size: 1.2rem;
+    font-weight: 750;
+    gap: .5rem;
+    margin-right: 1rem;
+}
+
+.btn-primary {
+    --bs-btn-bg: var(--recovera-blue);
+    --bs-btn-border-color: var(--recovera-blue);
+    --bs-btn-hover-bg: #0879ae;
+    --bs-btn-hover-border-color: #0879ae;
+}

@@ -1,0 +1,1548 @@
+#!/usr/bin/env python3
+"""Recovera appliance-to-appliance snapshot replication.
+
+Uses only Python's standard library and the OpenSSH/ZFS tools already present
+on an appliance. No cloud endpoint is contacted.
+"""
+from __future__ import annotations
+
+import argparse
+import base64
+import contextlib
+import fcntl
+import hashlib
+import hmac
+import http.client
+import http.server
+import json
+import os
+import grp
+import re
+import secrets
+import shlex
+import socket
+import ssl
+import subprocess
+import sys
+import tempfile
+import time
+import uuid
+from pathlib import Path
+from typing import Any, BinaryIO
+
+VERSION = "0.5.0"
+ETC = Path(os.environ.get("RECOVERA_PEER_ETC", "/etc/recovera-peer"))
+STATE_DIR = Path(os.environ.get("RECOVERA_PEER_STATE", "/var/lib/recovera-peer"))
+CONFIG_PATH = ETC / "config.json"
+STATE_PATH = STATE_DIR / "state.json"
+PAIRING_PATH = STATE_DIR / "pairing.json"
+TLS_CERT_PATH = ETC / "tls.crt"
+TLS_KEY_PATH = ETC / "tls.key"
+SSH_KEY_PATH = ETC / "id_ed25519"
+KNOWN_HOSTS_PATH = ETC / "known_hosts"
+KEYS_DIR = Path(os.environ.get("RECOVERA_PEER_KEYS", "/datto/config/keys"))
+LOCK_PATH = Path(os.environ.get("RECOVERA_PEER_LOCK", "/run/recovera-peer-sync.lock"))
+STATE_LOCK_PATH = Path(os.environ.get(
+    "RECOVERA_PEER_STATE_LOCK", "/run/recovera-peer-state.lock"
+))
+OFFSITE_PATH = Path(os.environ.get("RECOVERA_PEER_OFFSITE", "/etc/recovera-peer/offsite.json"))
+WEB_TOKEN_PATH = Path(os.environ.get("RECOVERA_PEER_WEB_TOKEN", "/etc/recovera-peer/web.token"))
+TX_SPEED_PATH = Path(os.environ.get("RECOVERA_TX_SPEED", "/datto/config/local/txSpeed"))
+AUTHORIZED_KEYS_PATH = Path(os.environ.get(
+    "RECOVERA_PEER_AUTHORIZED_KEYS", "/var/lib/recovera-peer/.ssh/authorized_keys"
+))
+AUTH_HELPER_PATH = Path(os.environ.get(
+    "RECOVERA_AUTH_HELPER", "/usr/local/lib/recovera/authenticate.php"
+))
+ASSET_RE = re.compile(r"^[0-9a-fA-F]{32}$")
+SNAPSHOT_RE = re.compile(r"^[0-9]{1,20}$")
+ID_RE = re.compile(r"^[0-9a-fA-F-]{8,64}$")
+HOST_RE = re.compile(r"^[A-Za-z0-9._:-]+$")
+METADATA_SUFFIXES = (
+    "agentInfo", "dateAdded", "diskDrives", "include",
+    "integrityCheckEnabled", "osType", "recoveryPointHistory",
+    "recoveryPoints", "recoveryPointsMeta", "screenshotVerification",
+)
+MAX_METADATA_BYTES = 512 * 1024
+MIN_RETENTION_HOURS = 24
+MAX_RETENTION_HOURS = 240_000
+
+
+class PeerError(RuntimeError):
+    pass
+
+
+def run(argv: list[str], *, check: bool = True, input_data: bytes | None = None,
+        timeout: int | None = None) -> subprocess.CompletedProcess[bytes]:
+    try:
+        return subprocess.run(argv, input=input_data, stdout=subprocess.PIPE,
+                              stderr=subprocess.PIPE, check=check, timeout=timeout)
+    except FileNotFoundError as exc:
+        raise PeerError(f"required command is missing: {argv[0]}") from exc
+    except subprocess.CalledProcessError as exc:
+        detail = exc.stderr.decode(errors="replace").strip()
+        raise PeerError(f"{' '.join(argv)} failed: {detail or exc.returncode}") from exc
+
+
+def atomic_json(path: Path, value: Any, mode: int = 0o600) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=f".{path.name}.", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(value, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(tmp, mode)
+        os.replace(tmp, path)
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(tmp)
+
+
+def load_json(path: Path, default: Any) -> Any:
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            return json.load(handle)
+    except FileNotFoundError:
+        return default
+    except json.JSONDecodeError as exc:
+        raise PeerError(f"invalid JSON in {path}: {exc}") from exc
+
+
+def require_root() -> None:
+    if os.geteuid() != 0:
+        raise PeerError("run this command with sudo")
+
+
+def default_config() -> dict[str, Any]:
+    appliance_id = str(uuid.uuid4())
+    numeric_id = 1_000_000_000 + (int(uuid.UUID(appliance_id)) % 8_000_000_000)
+    return {
+        "schema": 1, "version": VERSION, "appliance_id": appliance_id,
+        "numeric_id": numeric_id, "name": socket.gethostname(),
+        "listen": "127.0.0.1", "port": 9443, "ssh_port": 22,
+        "pool": "homePool", "source_root": "homePool/home/agents",
+        "peers": {}, "sources": {}, "assets": {},
+    }
+
+
+def config() -> dict[str, Any]:
+    cfg = load_json(CONFIG_PATH, None)
+    if not cfg:
+        raise PeerError("not initialized; run: sudo recovera-peer init")
+    return cfg
+
+
+def state() -> dict[str, Any]:
+    value = load_json(STATE_PATH, {"assets": {}, "events": [], "queue": {}})
+    value.setdefault("assets", {})
+    value.setdefault("events", [])
+    value.setdefault("queue", {})
+    return value
+
+
+def save_config(cfg: dict[str, Any]) -> None:
+    atomic_json(CONFIG_PATH, cfg)
+
+
+def save_state(value: dict[str, Any]) -> None:
+    value["events"] = value.get("events", [])[-200:]
+    queue = value.setdefault("queue", {})
+    if len(queue) > 1000:
+        active = [(key, item) for key, item in queue.items()
+                  if item.get("status") in ("queued", "syncing")]
+        history = [(key, item) for key, item in queue.items()
+                   if item.get("status") not in ("queued", "syncing")]
+        history.sort(key=lambda entry: int(entry[1].get("updated", 0)), reverse=True)
+        value["queue"] = dict(active + history[:max(0, 1000 - len(active))])
+    atomic_json(STATE_PATH, value)
+
+
+@contextlib.contextmanager
+def locked_state() -> Any:
+    """Serialize state.json read/modify/write operations across service processes."""
+    STATE_LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with STATE_LOCK_PATH.open("a+") as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        value = state()
+        yield value
+        save_state(value)
+
+
+def default_offsite() -> dict[str, Any]:
+    speed = 0
+    with contextlib.suppress(ValueError, OSError):
+        # The appliance stores this value in KB/s. Its UI converts between
+        # KB/s and Mb/s, so applying another factor here makes 10 Gbps appear
+        # as 80 Mbps on the home page.
+        speed = max(0, int(float(TX_SPEED_PATH.read_text().strip())))
+    return {"schema": 1, "speed_kbps": speed, "max_syncs": 1,
+            "next_schedule_id": 1, "schedules": []}
+
+
+def offsite() -> dict[str, Any]:
+    value = load_json(OFFSITE_PATH, default_offsite())
+    value.setdefault("speed_kbps", 0)
+    value.setdefault("max_syncs", 1)
+    value.setdefault("next_schedule_id", 1)
+    value.setdefault("schedules", [])
+    return value
+
+
+def save_offsite(value: dict[str, Any]) -> None:
+    atomic_json(OFFSITE_PATH, value)
+
+
+def schedule_speed(now: float | None = None) -> int:
+    settings = offsite()
+    current = time.localtime(now).tm_wday * 86400 + time.localtime(now).tm_hour * 3600 \
+        + time.localtime(now).tm_min * 60 + time.localtime(now).tm_sec
+    speed = int(settings.get("speed_kbps", 0))
+    for item in settings.get("schedules", []):
+        start, end = int(item["start"]), int(item["end"])
+        active = start <= current < end if start < end else current >= start or current < end
+        if active:
+            speed = int(item["speed"])
+    return speed
+
+
+def weekly_averages() -> dict[str, Any]:
+    settings = offsite()
+    default_speed = int(settings.get("speed_kbps", 0))
+    days: list[int] = []
+    for day in range(7):
+        total = 0
+        for minute in range(1440):
+            second = day * 86400 + minute * 60
+            speed = default_speed
+            for item in settings.get("schedules", []):
+                start, end = int(item["start"]), int(item["end"])
+                active = start <= second < end if start < end else second >= start or second < end
+                if active:
+                    speed = int(item["speed"])
+            if speed > 0:
+                total += speed * 60
+        days.append(total)
+    return {"days": days, "avgWeek": sum(days) // 7, "totalWeek": sum(days)}
+
+
+def schedule_add(start: int, end: int, speed: int) -> dict[str, Any]:
+    if not 0 <= start < 604800 or not 0 <= end < 604800 or start == end:
+        raise PeerError("schedule times must be different seconds within a week")
+    if speed < -1 or speed > 125_000_000:
+        raise PeerError("schedule speed is outside the supported range")
+    settings = offsite()
+    item = {"schedID": int(settings["next_schedule_id"]), "start": start,
+            "end": end, "speed": speed}
+    settings["next_schedule_id"] = item["schedID"] + 1
+    settings["schedules"].append(item)
+    save_offsite(settings)
+    return item
+
+
+def schedule_delete(schedule_id: int) -> None:
+    settings = offsite()
+    original = len(settings["schedules"])
+    settings["schedules"] = [item for item in settings["schedules"]
+                             if int(item["schedID"]) != schedule_id]
+    if len(settings["schedules"]) == original:
+        raise PeerError("schedule does not exist")
+    save_offsite(settings)
+
+
+def set_speed(speed_kbps: int) -> int:
+    if not 0 <= speed_kbps <= 125_000_000:
+        raise PeerError("upload speed is outside the supported range")
+    settings = offsite()
+    settings["speed_kbps"] = speed_kbps
+    save_offsite(settings)
+    TX_SPEED_PATH.parent.mkdir(parents=True, exist_ok=True)
+    TX_SPEED_PATH.write_text(f"{speed_kbps}\n", encoding="ascii")
+    return speed_kbps
+
+
+def event(kind: str, message: str, **fields: Any) -> None:
+    with locked_state() as value:
+        value.setdefault("events", []).append(
+            {"time": int(time.time()), "kind": kind, "message": message, **fields}
+        )
+
+
+def fingerprint_der(cert_der: bytes) -> str:
+    digest = hashlib.sha256(cert_der).hexdigest().upper()
+    return "SHA256:" + ":".join(digest[i:i + 2] for i in range(0, len(digest), 2))
+
+
+def gateway_tls_fingerprint() -> str:
+    """Fingerprint the certificate clients see on the appliance HTTPS site."""
+    context = ssl.create_default_context()
+    context.check_hostname = False
+    context.verify_mode = ssl.CERT_NONE
+    try:
+        with socket.create_connection(("127.0.0.1", 443), timeout=5) as raw:
+            with context.wrap_socket(raw, server_hostname="localhost") as wrapped:
+                return fingerprint_der(wrapped.getpeercert(binary_form=True))
+    except OSError:
+        # Apache may not be running during the first installation pass.
+        return local_tls_fingerprint()
+
+
+def local_tls_fingerprint() -> str:
+    pem = TLS_CERT_PATH.read_text(encoding="ascii")
+    return fingerprint_der(ssl.PEM_cert_to_DER_cert(pem))
+
+
+def ssh_public_key() -> str:
+    return SSH_KEY_PATH.with_suffix(".pub").read_text(encoding="ascii").strip()
+
+
+def ssh_host_keys() -> list[str]:
+    keys: list[str] = []
+    for path in sorted(Path("/etc/ssh").glob("ssh_host_*_key.pub")):
+        parts = path.read_text(encoding="ascii").strip().split()
+        if len(parts) >= 2:
+            keys.append(f"{parts[0]} {parts[1]}")
+    return keys
+
+
+def init() -> None:
+    require_root()
+    ETC.mkdir(mode=0o700, parents=True, exist_ok=True)
+    STATE_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if not CONFIG_PATH.exists():
+        save_config(default_config())
+    if not STATE_PATH.exists():
+        save_state({"assets": {}, "events": []})
+    if not SSH_KEY_PATH.exists():
+        run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C",
+             f"recovera-peer@{socket.gethostname()}", "-f", str(SSH_KEY_PATH)])
+    if not TLS_CERT_PATH.exists() or not TLS_KEY_PATH.exists():
+        run(["openssl", "req", "-x509", "-newkey", "rsa:3072", "-sha256",
+             "-nodes", "-days", "3650", "-subj",
+             f"/CN={socket.gethostname()}/O=Recovera Peer Replication",
+             "-keyout", str(TLS_KEY_PATH), "-out", str(TLS_CERT_PATH)])
+        os.chmod(TLS_KEY_PATH, 0o600)
+        os.chmod(TLS_CERT_PATH, 0o644)
+    KNOWN_HOSTS_PATH.touch(mode=0o600, exist_ok=True)
+    if not OFFSITE_PATH.exists():
+        atomic_json(OFFSITE_PATH, default_offsite())
+    # Keep the legacy appliance value in the same KB/s unit as Recovera's
+    # scheduler so the native off-site and home pages render the same limit.
+    set_speed(int(offsite()["speed_kbps"]))
+    if not WEB_TOKEN_PATH.exists():
+        WEB_TOKEN_PATH.write_text(secrets.token_urlsafe(48) + "\n", encoding="ascii")
+    os.chmod(WEB_TOKEN_PATH, 0o640)
+    with contextlib.suppress(KeyError, PermissionError):
+        os.chown(WEB_TOKEN_PATH, 0, grp.getgrnam("www-data").gr_gid)
+    print(f"Recovera peer replication initialized ({config()['appliance_id']})")
+    print(f"Pairing HTTPS fingerprint: {gateway_tls_fingerprint()}")
+
+
+def validate_asset(asset: str) -> str:
+    if not ASSET_RE.fullmatch(asset):
+        raise PeerError("asset key must be exactly 32 hexadecimal characters")
+    return asset.lower()
+
+
+def validate_snapshot(snapshot: str) -> str:
+    if not SNAPSHOT_RE.fullmatch(snapshot):
+        raise PeerError("snapshot name must be a numeric recovery-point epoch")
+    return snapshot
+
+
+def dataset_for(cfg: dict[str, Any], asset: str) -> str:
+    return f"{cfg['source_root'].rstrip('/')}/{validate_asset(asset)}"
+
+
+def zfs_exists(name: str) -> bool:
+    return run(["zfs", "list", "-H", "-o", "name", name], check=False).returncode == 0
+
+
+def zfs_snapshots(dataset: str) -> list[str]:
+    result = run(["zfs", "list", "-H", "-t", "snapshot", "-o", "name",
+                  "-s", "creation", "-r", dataset], check=False)
+    if result.returncode != 0:
+        return []
+    values, prefix = [], dataset + "@"
+    for line in result.stdout.decode().splitlines():
+        if line.startswith(prefix) and SNAPSHOT_RE.fullmatch(line[len(prefix):]):
+            values.append(line[len(prefix):])
+    return values
+
+
+def load_origin(asset: str) -> dict[str, Any]:
+    return load_json(KEYS_DIR / f"{asset}.originDevice", {})
+
+
+def serialized_string(data: bytes, key: str) -> str | None:
+    """Read one string field from the appliance's PHP-serialized metadata."""
+    marker = f's:{len(key.encode("utf-8"))}:"{key}";s:'.encode()
+    start = data.find(marker)
+    if start < 0:
+        return None
+    length_start = start + len(marker)
+    length_end = data.find(b':"', length_start)
+    if length_end < 0 or not data[length_start:length_end].isdigit():
+        return None
+    size = int(data[length_start:length_end])
+    value_start = length_end + 2
+    value = data[value_start:value_start + size]
+    if data[value_start + size:value_start + size + 2] != b'";':
+        return None
+    return value.decode("utf-8", errors="replace")
+
+
+def asset_identifiers(asset: str) -> set[str]:
+    path = KEYS_DIR / f"{validate_asset(asset)}.agentInfo"
+    try:
+        raw = path.read_bytes()
+    except OSError:
+        return set()
+    values: list[Any] = []
+    with contextlib.suppress(json.JSONDecodeError, UnicodeDecodeError):
+        document = json.loads(raw.decode("utf-8"))
+        if isinstance(document, dict):
+            values.extend(document.get(key) for key in ("name", "hostname", "uuid", "keyName"))
+    values.extend(serialized_string(raw, key) for key in ("name", "hostname", "uuid", "keyName"))
+    return {str(value).strip().casefold() for value in values if value}
+
+
+def asset_display_name(asset: str) -> str:
+    path = KEYS_DIR / f"{validate_asset(asset)}.agentInfo"
+    try:
+        raw = path.read_bytes()
+    except OSError:
+        return asset
+    with contextlib.suppress(json.JSONDecodeError, UnicodeDecodeError):
+        document = json.loads(raw.decode("utf-8"))
+        if isinstance(document, dict):
+            for key in ("name", "hostname"):
+                if document.get(key):
+                    return str(document[key])
+    return serialized_string(raw, "name") or serialized_string(raw, "hostname") or asset
+
+
+def protected_asset_keys() -> list[str]:
+    found: list[str] = []
+    for path in KEYS_DIR.glob("*.agentInfo"):
+        asset = path.name[:-len(".agentInfo")].lower()
+        if ASSET_RE.fullmatch(asset) and not load_origin(asset).get("isReplicated"):
+            found.append(asset)
+    return sorted(set(found))
+
+
+def assets_local(cfg: dict[str, Any]) -> list[dict[str, Any]]:
+    root = cfg["source_root"].rstrip("/")
+    result = run(["zfs", "list", "-H", "-t", "filesystem", "-o", "name", "-r", root], check=False)
+    datasets: dict[str, str] = {}
+    if result.returncode == 0:
+        for line in result.stdout.decode().splitlines()[1:]:
+            key = line.rsplit("/", 1)[-1].lower()
+            if ASSET_RE.fullmatch(key):
+                datasets[key] = line
+    found: list[dict[str, Any]] = []
+    for key in sorted(set(datasets) | set(protected_asset_keys())):
+        origin = load_origin(key)
+        dataset = datasets.get(key, f"{root}/{key}")
+        found.append({"key": key, "name": asset_display_name(key), "dataset": dataset,
+                      "snapshots": zfs_snapshots(dataset) if key in datasets else [],
+                      "replicated": bool(origin.get("isReplicated")), "origin": origin})
+    return found
+
+
+def collect_metadata(asset: str, cfg: dict[str, Any]) -> dict[str, Any]:
+    files: dict[str, str] = {}
+    total = 0
+    for suffix in METADATA_SUFFIXES:
+        path = KEYS_DIR / f"{asset}.{suffix}"
+        if not path.is_file():
+            continue
+        data = path.read_bytes()
+        total += len(data)
+        if total > MAX_METADATA_BYTES:
+            raise PeerError(f"metadata for {asset} exceeds {MAX_METADATA_BYTES} bytes")
+        files[suffix] = base64.b64encode(data).decode("ascii")
+    rule = cfg.get("assets", {}).get(asset, {})
+    retention_hours = int(rule.get("retention_hours", MAX_RETENTION_HOURS))
+    retention_tiers = rule.get("retention_tiers") or default_retention_tiers(retention_hours)
+    return {"schema": 1, "asset": asset, "source_id": cfg["appliance_id"],
+            "source_numeric_id": cfg["numeric_id"], "source_name": cfg["name"],
+            "source_public_key": ssh_public_key(), "files": files,
+            "retention_hours": retention_hours, "retention_tiers": retention_tiers}
+
+
+def default_retention_tiers(retention_hours: int) -> dict[str, int]:
+    """SIRIS-style thinning boundaries expressed as cumulative hours."""
+    return {
+        "intra_daily": min(retention_hours, 7 * 24),
+        "daily": min(retention_hours, 14 * 24),
+        "weekly": min(retention_hours, 6 * 7 * 24),
+    }
+
+
+def validate_retention_tiers(retention_hours: int, tiers: Any) -> dict[str, int]:
+    if not isinstance(tiers, dict):
+        tiers = default_retention_tiers(retention_hours)
+    result = {key: int(tiers.get(key, value)) for key, value in
+              default_retention_tiers(retention_hours).items()}
+    if not (0 <= result["intra_daily"] <= result["daily"] <=
+            result["weekly"] <= retention_hours):
+        raise PeerError("target retention tiers are invalid")
+    return result
+
+
+def prune_received_snapshots(dataset: str, retention_hours: int,
+                             retention_tiers: dict[str, int] | None = None,
+                             now: int | None = None) -> list[str]:
+    if not MIN_RETENTION_HOURS <= retention_hours <= MAX_RETENTION_HOURS:
+        raise PeerError("target retention is outside the supported range")
+    tiers = validate_retention_tiers(retention_hours, retention_tiers)
+    snapshots = zfs_snapshots(dataset)
+    if len(snapshots) < 2:
+        return []
+    current = int(now if now is not None else time.time())
+    cutoff = current - retention_hours * 3600
+    keep = {snapshots[-1]}
+    buckets: dict[tuple[Any, ...], str] = {}
+    for snapshot in snapshots[:-1]:
+        epoch = int(snapshot)
+        age_hours = max(0, (current - epoch) // 3600)
+        stamp = time.gmtime(epoch)
+        if epoch < cutoff:
+            continue
+        if age_hours <= tiers["intra_daily"]:
+            keep.add(snapshot)
+            continue
+        if age_hours <= tiers["daily"]:
+            bucket: tuple[Any, ...] = ("day", stamp.tm_year, stamp.tm_yday)
+        elif age_hours <= tiers["weekly"]:
+            iso = time.strftime("%G-%V", stamp)
+            bucket = ("week", iso)
+        else:
+            bucket = ("month", stamp.tm_year, stamp.tm_mon)
+        if int(buckets.get(bucket, "0")) < epoch:
+            buckets[bucket] = snapshot
+    keep.update(buckets.values())
+    expired = [snapshot for snapshot in snapshots[:-1] if snapshot not in keep]
+    for snapshot in expired:
+        asset = dataset.rsplit("/", 1)[-1]
+        run(["snapctl", "asset:recoverypoints:local:destroy", asset, snapshot])
+    return expired
+
+
+def install_metadata(asset: str, metadata: dict[str, Any]) -> None:
+    if metadata.get("asset") != asset:
+        raise PeerError("metadata asset does not match the receive request")
+    files = metadata.get("files")
+    if not isinstance(files, dict):
+        raise PeerError("metadata files are missing")
+    KEYS_DIR.mkdir(parents=True, exist_ok=True)
+    for suffix, encoded in files.items():
+        if suffix not in METADATA_SUFFIXES or not isinstance(encoded, str):
+            raise PeerError(f"unapproved metadata key: {suffix}")
+        data = base64.b64decode(encoded, validate=True)
+        if len(data) > MAX_METADATA_BYTES:
+            raise PeerError("individual metadata file is too large")
+        target = KEYS_DIR / f"{asset}.{suffix}"
+        fd, tmp = tempfile.mkstemp(prefix=f".{target.name}.", dir=str(KEYS_DIR))
+        try:
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(data)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.chmod(tmp, 0o640)
+            os.replace(tmp, target)
+        finally:
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(tmp)
+    origin = {"deviceId": int(metadata["source_numeric_id"]), "resellerId": None,
+              "isReplicated": True, "isOrphaned": False,
+              "sourceApplianceId": metadata["source_id"],
+              "sourceApplianceName": metadata["source_name"]}
+    atomic_json(KEYS_DIR / f"{asset}.originDevice", origin, 0o640)
+
+
+def pairing_code(minutes: int) -> str:
+    require_root()
+    if minutes < 1 or minutes > 60:
+        raise PeerError("pairing-code lifetime must be between 1 and 60 minutes")
+    raw = base64.b32encode(secrets.token_bytes(10)).decode("ascii").rstrip("=")
+    code = "-".join(raw[i:i + 4] for i in range(0, len(raw), 4))
+    salt = secrets.token_bytes(16)
+    digest = hashlib.scrypt(code.encode(), salt=salt, n=2**14, r=8, p=1)
+    atomic_json(PAIRING_PATH, {"salt": base64.b64encode(salt).decode(),
+                               "digest": base64.b64encode(digest).decode(),
+                               "expires": int(time.time()) + minutes * 60})
+    return code
+
+
+def consume_pairing_code(code: str) -> None:
+    record = load_json(PAIRING_PATH, None)
+    if not record or int(record.get("expires", 0)) < time.time():
+        raise PeerError("pairing code is missing or expired")
+    salt, expected = base64.b64decode(record["salt"]), base64.b64decode(record["digest"])
+    actual = hashlib.scrypt(code.upper().encode(), salt=salt, n=2**14, r=8, p=1)
+    if not hmac.compare_digest(actual, expected):
+        raise PeerError("pairing code is invalid")
+    PAIRING_PATH.unlink(missing_ok=True)
+
+
+def ssl_json(host: str, port: int, path: str, payload: dict[str, Any] | None = None,
+             expected_fingerprint: str | None = None) -> tuple[dict[str, Any], str]:
+    if not HOST_RE.fullmatch(host):
+        raise PeerError("peer host contains invalid characters")
+    if not 1 <= port <= 65535:
+        raise PeerError("peer port must be between 1 and 65535")
+    context = ssl.create_default_context()
+    context.check_hostname = False
+    context.verify_mode = ssl.CERT_NONE
+    data = None if payload is None else json.dumps(payload).encode()
+    connection = http.client.HTTPSConnection(host, port, timeout=15, context=context)
+    try:
+        connection.connect()
+        if connection.sock is None:
+            raise PeerError("peer closed the TLS connection before identification")
+        cert = connection.sock.getpeercert(binary_form=True)
+        fingerprint = fingerprint_der(cert)
+        if expected_fingerprint and fingerprint != expected_fingerprint.upper():
+            raise PeerError(
+                f"peer TLS fingerprint changed: expected {expected_fingerprint}, got {fingerprint}"
+            )
+        connection.request("GET" if data is None else "POST", path, body=data,
+                           headers={"Content-Type": "application/json", "Accept": "application/json"})
+        response = connection.getresponse()
+        raw = response.read()
+        body = json.loads(raw.decode())
+        if not isinstance(body, dict):
+            raise PeerError("peer response is not a JSON object")
+        if response.status >= 400:
+            raise PeerError(str(body.get("error", f"HTTP {response.status}")))
+    except (TimeoutError, OSError, http.client.HTTPException, json.JSONDecodeError) as exc:
+        raise PeerError(f"could not contact peer {host}:{port}: {exc}") from exc
+    finally:
+        connection.close()
+    if body.get("error"):
+        raise PeerError(str(body["error"]))
+    return body, fingerprint
+
+
+def public_info() -> dict[str, Any]:
+    cfg = config()
+    result = run(["zpool", "list", "-Hp", "-o", "size,alloc,free,health", cfg["pool"]], check=False)
+    storage: dict[str, Any] = {"available": False}
+    if result.returncode == 0:
+        size, allocated, free, health = result.stdout.decode().strip().split("\t")
+        storage = {"available": True, "size": int(size), "allocated": int(allocated),
+                   "free": int(free), "health": health}
+    return {"service": "recovera-peer", "version": VERSION,
+            "appliance_id": cfg["appliance_id"], "numeric_id": cfg["numeric_id"],
+            "name": cfg["name"], "ssh_port": cfg["ssh_port"],
+            "tls_fingerprint": gateway_tls_fingerprint(), "ssh_host_keys": ssh_host_keys(),
+            "gateway": "/recovera-peer", "gateway_port": 443,
+            "storage": storage}
+
+
+def authorized_keys_path() -> Path:
+    return AUTHORIZED_KEYS_PATH
+
+
+def authorize_source(source_id: str, name: str, public_key: str, address: str) -> None:
+    if not ID_RE.fullmatch(source_id):
+        raise PeerError("source appliance ID is invalid")
+    parts = public_key.strip().split()
+    if len(parts) < 2 or parts[0] != "ssh-ed25519" or not re.fullmatch(r"[A-Za-z0-9+/=]+", parts[1]):
+        raise PeerError("source replication key is not a valid Ed25519 public key")
+    path = authorized_keys_path()
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    existing = path.read_text(encoding="ascii").splitlines() if path.exists() else []
+    marker = f"recovera-source={source_id}"
+    legacy_marker = f"backops-source={source_id}"
+    existing = [line for line in existing if marker not in line and legacy_marker not in line]
+    forced = f"/usr/bin/sudo -n /usr/local/sbin/recovera-peer ssh-entry {source_id}"
+    existing.append(f'restrict,command="{forced}" {parts[0]} {parts[1]} {marker}')
+    path.write_text("\n".join(existing) + "\n", encoding="ascii")
+    os.chmod(path, 0o600)
+    with contextlib.suppress(KeyError):
+        import pwd
+        account = pwd.getpwnam("recovera-repl")
+        os.chown(path.parent, account.pw_uid, account.pw_gid)
+        os.chown(path, account.pw_uid, account.pw_gid)
+    cfg = config()
+    cfg.setdefault("sources", {})[source_id] = {
+        "name": name[:128], "address": address, "paired_at": int(time.time()),
+        "public_key_fingerprint": hashlib.sha256(parts[1].encode()).hexdigest()}
+    save_config(cfg)
+    event("paired-source", f"Paired source {name}", source_id=source_id, address=address)
+
+
+def pair_accept(payload: dict[str, Any], address: str) -> dict[str, Any]:
+    required = ("code", "source_id", "source_name", "source_public_key")
+    if any(not isinstance(payload.get(key), str) for key in required):
+        raise PeerError("pairing request is incomplete")
+    if not ID_RE.fullmatch(payload["source_id"]):
+        raise PeerError("source appliance ID is invalid")
+    if payload["source_id"] == config()["appliance_id"]:
+        raise PeerError("an appliance cannot replicate to itself")
+    consume_pairing_code(payload["code"])
+    authorize_source(payload["source_id"], payload["source_name"], payload["source_public_key"], address)
+    return public_info()
+
+
+def known_host_lines(host: str, port: int, keys: list[str]) -> list[str]:
+    prefix = host if port == 22 else f"[{host}]:{port}"
+    lines = []
+    for key in keys:
+        parts = key.split()
+        if ("\n" in key or "\r" in key or len(parts) < 2 or not re.fullmatch(
+                r"(?:ssh-ed25519|ssh-rsa|rsa-sha2-[0-9]+|ecdsa-sha2-nistp[0-9]+)", parts[0])
+                or not re.fullmatch(r"[A-Za-z0-9+/=]+", parts[1])):
+            raise PeerError("target returned an invalid SSH host key")
+        lines.append(f"{prefix} {parts[0]} {parts[1]}")
+    return lines
+
+
+def peer_add(host: str, port: int, code: str, fingerprint: str,
+             discovered: dict[str, Any] | None = None) -> dict[str, Any]:
+    cfg = config()
+    prefix = "/v1" if port == 9443 else "/recovera-peer"
+    info, actual = ssl_json(host, port, prefix + "/info", expected_fingerprint=fingerprint)
+    if discovered and info.get("appliance_id") != discovered.get("appliance_id"):
+        raise PeerError("peer identity changed between discovery and pairing")
+    response, _ = ssl_json(host, port, prefix + "/pair", {
+        "code": code.upper(), "source_id": cfg["appliance_id"],
+        "source_name": cfg["name"], "source_public_key": ssh_public_key(),
+    }, expected_fingerprint=actual)
+    if response.get("appliance_id") != info.get("appliance_id"):
+        raise PeerError("pairing response came from a different appliance")
+    peer_id = str(response["appliance_id"])
+    if not ID_RE.fullmatch(peer_id):
+        raise PeerError("target appliance ID is invalid")
+    if peer_id == cfg["appliance_id"]:
+        raise PeerError("an appliance cannot replicate to itself")
+    keys = response.get("ssh_host_keys") or []
+    if not keys:
+        raise PeerError("target did not provide SSH host keys")
+    ssh_port = int(response.get("ssh_port", 22))
+    if not 1 <= ssh_port <= 65535:
+        raise PeerError("target SSH port is invalid")
+    old = KNOWN_HOSTS_PATH.read_text(encoding="ascii").splitlines() if KNOWN_HOSTS_PATH.exists() else []
+    prefixes = {host, f"[{host}]:{ssh_port}"}
+    old = [line for line in old if not any(line.startswith(p + " ") for p in prefixes)]
+    old.extend(known_host_lines(host, ssh_port, keys))
+    KNOWN_HOSTS_PATH.write_text("\n".join(old) + "\n", encoding="ascii")
+    os.chmod(KNOWN_HOSTS_PATH, 0o600)
+    cfg.setdefault("peers", {})[peer_id] = {
+        "name": response.get("name", host), "host": host, "port": port,
+        "ssh_port": ssh_port, "tls_fingerprint": actual,
+        "paired_at": int(time.time()), "enabled": True}
+    save_config(cfg)
+    event("paired-target", f"Paired target {response.get('name', host)}", peer_id=peer_id)
+    return cfg["peers"][peer_id] | {"id": peer_id}
+
+
+def ssh_base(peer: dict[str, Any]) -> list[str]:
+    return ["ssh", "-T", "-i", str(SSH_KEY_PATH), "-p", str(peer["ssh_port"]),
+            "-o", "BatchMode=yes", "-o", "IdentitiesOnly=yes",
+            "-o", "StrictHostKeyChecking=yes", "-o", f"UserKnownHostsFile={KNOWN_HOSTS_PATH}",
+            "-o", "ConnectTimeout=15", f"recovera-repl@{peer['host']}"]
+
+
+def remote_json(peer: dict[str, Any], command: list[str]) -> dict[str, Any]:
+    result = run(ssh_base(peer) + [shlex.join(command)], timeout=30)
+    try:
+        return json.loads(result.stdout.decode())
+    except json.JSONDecodeError as exc:
+        raise PeerError(f"target returned an invalid response: {result.stdout.decode(errors='replace')}") from exc
+
+
+def encode_metadata(metadata: dict[str, Any]) -> str:
+    raw = json.dumps(metadata, separators=(",", ":")).encode()
+    if len(raw) > MAX_METADATA_BYTES * 2:
+        raise PeerError("encoded metadata is too large")
+    return base64.urlsafe_b64encode(raw).decode()
+
+
+def transfer_stream(send_command: list[str], peer: dict[str, Any], remote_command: list[str],
+                    speed_kbps: int = 0) -> None:
+    sender = subprocess.Popen(send_command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    assert sender.stdout is not None
+    stream = sender.stdout
+    limiter = None
+    if speed_kbps > 0:
+        limiter = subprocess.Popen(["pv", "-q", "-L", str(speed_kbps * 1024)],
+                                   stdin=sender.stdout, stdout=subprocess.PIPE,
+                                   stderr=subprocess.PIPE)
+        sender.stdout.close()
+        assert limiter.stdout is not None
+        stream = limiter.stdout
+    receiver = subprocess.Popen(ssh_base(peer) + [shlex.join(remote_command)], stdin=stream,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    stream.close()
+    recv_out, recv_err = receiver.communicate()
+    limit_err = b""
+    limit_rc = 0
+    if limiter:
+        limit_err = limiter.stderr.read() if limiter.stderr else b""
+        limit_rc = limiter.wait()
+    send_err = sender.stderr.read() if sender.stderr else b""
+    send_rc = sender.wait()
+    if send_rc != 0 or limit_rc != 0 or receiver.returncode != 0:
+        details = (send_err + b"\n" + limit_err + b"\n" + recv_err + b"\n" + recv_out).decode(errors="replace").strip()
+        raise PeerError(f"snapshot transfer failed: {details}")
+    try:
+        answer = json.loads(recv_out.decode())
+    except json.JSONDecodeError as exc:
+        raise PeerError(f"target did not confirm the transfer: {recv_out.decode(errors='replace')}") from exc
+    if not answer.get("ok"):
+        raise PeerError(str(answer.get("error", "target rejected the transfer")))
+
+
+def replicate(asset: str, peer_id: str, snapshot: str | None = None,
+              speed_kbps: int = 0) -> dict[str, Any]:
+    require_root()
+    cfg = config()
+    asset = validate_asset(asset)
+    peer = cfg.get("peers", {}).get(peer_id)
+    if not peer or not peer.get("enabled"):
+        raise PeerError(f"peer is missing or disabled: {peer_id}")
+    dataset = dataset_for(cfg, asset)
+    if not zfs_exists(dataset):
+        raise PeerError(f"source dataset does not exist: {dataset}")
+    if load_origin(asset).get("isReplicated"):
+        raise PeerError("a received replica cannot be used as a replication source")
+    local = zfs_snapshots(dataset)
+    if not local:
+        raise PeerError(f"asset {asset} has no completed snapshots")
+    snapshot = validate_snapshot(snapshot) if snapshot else local[-1]
+    if snapshot not in local:
+        raise PeerError(f"snapshot {snapshot} does not exist for {asset}")
+    remote = remote_json(peer, ["asset-info", asset])
+    remote_snaps = [str(value) for value in remote.get("snapshots", [])]
+    if snapshot in remote_snaps:
+        now = int(time.time())
+        with locked_state() as value:
+            value.setdefault("assets", {})[f"{peer_id}:{asset}"] = {
+                "last_success": now, "last_snapshot": snapshot,
+                "mode": "already-present", "error": None,
+                "consecutive_failures": 0, "next_retry": 0,
+                "integrity": "target-confirmed"}
+            value.setdefault("peers", {}).setdefault(peer_id, {}).update(
+                {"last_contact": now, "status": "online",
+                 "storage": remote.get("storage", {})}
+            )
+        return {"ok": True, "asset": asset, "snapshot": snapshot, "status": "already-present"}
+    estimate = zfs_send_estimate(dataset, snapshot, local, remote.get("snapshots", []))
+    free = int(remote.get("storage", {}).get("free", 0))
+    reserve = max(5 * 1024**3, int(remote.get("storage", {}).get("size", 0)) // 20)
+    if free and estimate + reserve > free:
+        raise PeerError(
+            f"target capacity preflight failed: need {estimate} bytes plus "
+            f"{reserve} bytes reserve, only {free} bytes free"
+        )
+    metadata = encode_metadata(collect_metadata(asset, cfg))
+    resume_token = remote.get("resume_token")
+    if resume_token:
+        transfer_stream(["zfs", "send", "-t", str(resume_token)], peer,
+                        ["receive-resume", asset, snapshot, metadata], speed_kbps)
+        mode = "resumed"
+    else:
+        common = [value for value in local if value in remote_snaps]
+        if remote_snaps and not common:
+            raise PeerError("target has no common base snapshot; a controlled reseed is required")
+        if common:
+            base = common[-1]
+            transfer_stream(["zfs", "send", "-I", f"{dataset}@{base}", f"{dataset}@{snapshot}"],
+                            peer, ["receive", asset, snapshot, base, metadata], speed_kbps)
+            mode = f"incremental-from-{base}"
+        else:
+            transfer_stream(["zfs", "send", f"{dataset}@{snapshot}"], peer,
+                            ["receive", asset, snapshot, "-", metadata], speed_kbps)
+            mode = "full"
+    key = f"{peer_id}:{asset}"
+    with locked_state() as value:
+        value.setdefault("assets", {})[key] = {"last_success": int(time.time()),
+            "last_snapshot": snapshot, "mode": mode, "error": None,
+            "consecutive_failures": 0, "next_retry": 0,
+            "bytes_estimated": estimate, "integrity": "zfs-stream-verified"}
+        value.setdefault("peers", {}).setdefault(peer_id, {}).update(
+            {"last_contact": int(time.time()), "status": "online",
+             "storage": remote.get("storage", {})}
+        )
+    event("replication-success", f"Replicated {asset}@{snapshot}", asset=asset, peer_id=peer_id, mode=mode)
+    return {"ok": True, "asset": asset, "snapshot": snapshot, "status": mode}
+
+
+def zfs_send_estimate(dataset: str, snapshot: str, local: list[str],
+                      remote_snapshots: list[Any]) -> int:
+    """Ask ZFS for a conservative stream-size estimate before transfer."""
+    common = [value for value in local if value in {str(item) for item in remote_snapshots}]
+    command = ["zfs", "send", "-nP"]
+    if common:
+        command += ["-I", f"{dataset}@{common[-1]}"]
+    command.append(f"{dataset}@{snapshot}")
+    result = run(command, check=False, timeout=60)
+    text = (result.stdout + result.stderr).decode(errors="replace")
+    matches = re.findall(r"(?:size|total estimated size is)\s+([0-9]+)", text)
+    return int(matches[-1]) if result.returncode == 0 and matches else 0
+
+
+def receive_dataset(source_id: str, asset: str, snapshot: str, base: str,
+                    encoded_metadata: str, resume: bool, stream: BinaryIO) -> dict[str, Any]:
+    require_root()
+    cfg = config()
+    if source_id not in cfg.get("sources", {}):
+        raise PeerError("source is not paired")
+    asset, snapshot = validate_asset(asset), validate_snapshot(snapshot)
+    if base != "-":
+        validate_snapshot(base)
+    try:
+        metadata = json.loads(base64.urlsafe_b64decode(encoded_metadata.encode()))
+    except Exception as exc:
+        raise PeerError("replication metadata is invalid") from exc
+    if metadata.get("source_id") != source_id:
+        raise PeerError("metadata source does not match the paired SSH identity")
+    if not isinstance(metadata.get("source_numeric_id"), int) or not 1 <= metadata["source_numeric_id"] <= 9_999_999_999:
+        raise PeerError("metadata source numeric ID is invalid")
+    if not isinstance(metadata.get("source_name"), str) or len(metadata["source_name"]) > 128:
+        raise PeerError("metadata source name is invalid")
+    retention_hours = int(metadata.get("retention_hours", MAX_RETENTION_HOURS))
+    if not MIN_RETENTION_HOURS <= retention_hours <= MAX_RETENTION_HOURS:
+        raise PeerError("replication metadata retention is invalid")
+    retention_tiers = validate_retention_tiers(
+        retention_hours, metadata.get("retention_tiers")
+    )
+    dataset = dataset_for(cfg, asset)
+    origin = load_origin(asset)
+    exists = zfs_exists(dataset)
+    received_record = state().get("received", {}).get(asset, {})
+    trusted_source = received_record.get("source_id") or origin.get("sourceApplianceId")
+    if exists and trusted_source != source_id:
+        raise PeerError("asset key already belongs to another local or replicated asset")
+    existing = zfs_snapshots(dataset)
+    if not resume:
+        if base == "-" and existing:
+            raise PeerError("refusing a full stream over an existing backup chain")
+        if base != "-" and base not in existing:
+            raise PeerError(f"incremental base {base} is not present on the target")
+    with locked_state() as value:
+        value.setdefault("received", {})[asset] = {
+            "source_id": source_id, "snapshot": snapshot,
+            "status": "receiving", "updated": int(time.time()),
+        }
+    proc = subprocess.run(["zfs", "receive", "-u", "-s", dataset], stdin=stream,
+                          stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if proc.returncode != 0:
+        raise PeerError(f"zfs receive failed: {proc.stderr.decode(errors='replace').strip()}")
+    run(["zfs", "set", "canmount=on", dataset])
+    run(["zfs", "set", f"mountpoint=/home/agents/{asset}", dataset])
+    run(["zfs", "set", "readonly=on", dataset])
+    run(["zfs", "mount", dataset], check=False)
+    install_metadata(asset, metadata)
+    universal = f"{int(metadata['source_numeric_id'])}+{asset}+agent"
+    hook_errors = []
+    received = [point for point in zfs_snapshots(dataset) if point not in existing]
+    for point in received or [snapshot]:
+        hook = run(["snapctl", "asset:replication:received", universal, point, point], check=False)
+        if hook.returncode != 0:
+            hook_errors.append(hook.stderr.decode(errors="replace").strip())
+    # snapctl may rewrite originDevice using its legacy schema. Restore the
+    # source identity used by collision and replication-loop protections.
+    install_metadata(asset, metadata)
+    pruned = prune_received_snapshots(dataset, retention_hours, retention_tiers)
+    with locked_state() as value:
+        value.setdefault("received", {})[asset] = {
+            "source_id": source_id, "snapshot": snapshot,
+            "status": "ready", "updated": int(time.time()),
+        }
+    hook_error = "; ".join(error for error in hook_errors if error) or None
+    event("receive-success", f"Received {asset}@{snapshot}", source_id=source_id,
+          native_hook_error=hook_error, pruned_snapshots=pruned)
+    return {"ok": True, "asset": asset, "snapshot": snapshot,
+            "native_hook": "ok" if hook_error is None else "deferred", "pruned": pruned}
+
+
+def asset_info_received(source_id: str, asset: str) -> dict[str, Any]:
+    cfg = config()
+    if source_id not in cfg.get("sources", {}):
+        raise PeerError("source is not paired")
+    dataset = dataset_for(cfg, validate_asset(asset))
+    token = ""
+    if zfs_exists(dataset):
+        result = run(["zfs", "get", "-H", "-o", "value", "receive_resume_token", dataset], check=False)
+        if result.returncode == 0 and result.stdout.decode().strip() != "-":
+            token = result.stdout.decode().strip()
+    return {"ok": True, "exists": zfs_exists(dataset), "snapshots": zfs_snapshots(dataset),
+            "resume_token": token or None, "storage": storage_status(cfg)}
+
+
+def storage_status(cfg: dict[str, Any] | None = None) -> dict[str, Any]:
+    cfg = cfg or config()
+    result = run(["zpool", "list", "-Hp", "-o", "size,alloc,free,health", cfg["pool"]], check=False)
+    if result.returncode != 0:
+        return {"available": False}
+    size, allocated, free, health = result.stdout.decode().strip().split("\t")
+    return {"available": True, "size": int(size), "allocated": int(allocated),
+            "free": int(free), "health": health}
+
+
+def ssh_entry(source_id: str) -> None:
+    require_root()
+    if not ID_RE.fullmatch(source_id):
+        raise PeerError("invalid paired source identity")
+    argv = shlex.split(os.environ.get("SSH_ORIGINAL_COMMAND", ""))
+    if not argv:
+        raise PeerError("a replication command is required")
+    command = argv.pop(0)
+    if command == "asset-info" and len(argv) == 1:
+        answer = asset_info_received(source_id, argv[0])
+    elif command == "receive" and len(argv) == 4:
+        answer = receive_dataset(source_id, argv[0], argv[1], argv[2], argv[3], False, sys.stdin.buffer)
+    elif command == "receive-resume" and len(argv) == 3:
+        answer = receive_dataset(source_id, argv[0], argv[1], "-", argv[2], True, sys.stdin.buffer)
+    else:
+        raise PeerError("unsupported replication command")
+    print(json.dumps(answer, separators=(",", ":")))
+
+
+def target_for_asset(cfg: dict[str, Any], asset: str) -> str:
+    """Resolve the target used by a manually queued native recovery point."""
+    rule = cfg.get("assets", {}).get(asset, {})
+    assigned = str(rule.get("peer_id", ""))
+    peer = cfg.get("peers", {}).get(assigned)
+    if assigned and peer and peer.get("enabled", True):
+        return assigned
+    enabled = [peer_id for peer_id, value in cfg.get("peers", {}).items()
+               if value.get("enabled", True)]
+    if len(enabled) == 1:
+        return enabled[0]
+    if not enabled:
+        raise PeerError("no enabled off-site target is paired")
+    raise PeerError("multiple off-site targets are paired; save a replication policy for this asset")
+
+
+def queue_key(peer_id: str, asset: str, snapshot: str) -> str:
+    return f"{peer_id}:{asset}:{snapshot}"
+
+
+def queue_snapshot(asset: str, snapshot: str) -> dict[str, Any]:
+    """Persist a native UI request and wake the background replication worker."""
+    require_root()
+    cfg = config()
+    asset, snapshot = validate_asset(asset), validate_snapshot(snapshot)
+    dataset = dataset_for(cfg, asset)
+    if not zfs_exists(dataset):
+        raise PeerError(f"source dataset does not exist: {dataset}")
+    if load_origin(asset).get("isReplicated"):
+        raise PeerError("a received replica cannot be queued as a replication source")
+    if snapshot not in zfs_snapshots(dataset):
+        raise PeerError(f"snapshot {snapshot} does not exist for {asset}")
+    peer_id = target_for_asset(cfg, asset)
+    now = int(time.time())
+    key = queue_key(peer_id, asset, snapshot)
+    peer = cfg["peers"][peer_id]
+    with locked_state() as value:
+        item = {
+            "key": key, "asset": asset, "snapshot": snapshot, "peer_id": peer_id,
+            "target": peer.get("name", peer_id), "status": "queued", "error": None,
+            "queued_at": int(value.get("queue", {}).get(key, {}).get("queued_at", now)),
+            "updated": now,
+        }
+        value.setdefault("queue", {})[key] = item
+    event("replication-queued", f"Queued {asset}@{snapshot}", asset=asset,
+          peer_id=peer_id, snapshot=snapshot)
+    # The timer is still the durable fallback if systemd is temporarily busy.
+    with contextlib.suppress(PeerError, subprocess.TimeoutExpired):
+        run(["systemctl", "start", "--no-block", "recovera-peer-sync.service"],
+            check=False, timeout=10)
+    return item
+
+
+def queue_document() -> dict[str, Any]:
+    items = list(state().get("queue", {}).values())
+    items.sort(key=lambda item: (int(item.get("snapshot", 0)),
+                                 int(item.get("queued_at", 0))), reverse=True)
+    return {"items": items}
+
+
+def queued_sync(speed: int) -> list[dict[str, Any]]:
+    """Process explicit recovery-point requests before interval policies."""
+    # A "syncing" item is safe to resume here: this function is called while
+    # holding the single worker lock, so no other transfer can still own it.
+    pending = [dict(item) for item in state().get("queue", {}).values()
+               if item.get("status") in ("queued", "syncing")]
+    pending.sort(key=lambda item: (int(item.get("snapshot", 0)),
+                                   int(item.get("queued_at", 0))))
+    results: list[dict[str, Any]] = []
+    for requested in pending:
+        key = str(requested["key"])
+        with locked_state() as value:
+            item = value.get("queue", {}).get(key)
+            if not item or item.get("status") not in ("queued", "syncing"):
+                continue
+            item.update({"status": "syncing", "updated": int(time.time()), "error": None})
+            transfer = dict(item)
+        try:
+            answer = replicate(str(transfer["asset"]), str(transfer["peer_id"]),
+                               str(transfer["snapshot"]), speed_kbps=speed)
+            with locked_state() as value:
+                value["queue"][key].update({"status": "completed", "updated": int(time.time()),
+                                             "error": None, "result": answer.get("status")})
+            results.append(answer)
+        except Exception as exc:
+            with locked_state() as value:
+                if key in value.get("queue", {}):
+                    value["queue"][key].update({"status": "error", "updated": int(time.time()),
+                                                 "error": str(exc)})
+            event("replication-error", str(exc), asset=requested.get("asset"),
+                  peer_id=requested.get("peer_id"), snapshot=requested.get("snapshot"))
+            results.append({"ok": False, "asset": requested.get("asset"),
+                            "snapshot": requested.get("snapshot"), "error": str(exc)})
+    return results
+
+
+def configured_sync() -> list[dict[str, Any]]:
+    require_root()
+    cfg, results, now, current = config(), [], int(time.time()), state()
+    speed = schedule_speed(now)
+    if speed < 0:
+        event("replication-paused", "Off-site replication is paused by the active schedule")
+        return [{"ok": True, "status": "paused-by-schedule"}]
+    queued_results = queued_sync(speed)
+    results.extend(queued_results)
+    queued_assets = {str(item.get("asset")) for item in queued_results if item.get("asset")}
+    current = state()
+    priority_order = {"high": 0, "normal": 1, "low": 2}
+    rules = sorted(cfg.get("assets", {}).items(),
+                   key=lambda item: priority_order.get(str(item[1].get("priority", "normal")), 1))
+    for asset, rule in rules:
+        if not rule.get("enabled", True) or asset in queued_assets:
+            continue
+        peer_id = str(rule["peer_id"])
+        key = f"{peer_id}:{asset}"
+        previous = current.get("assets", {}).get(key, {})
+        if now < int(previous.get("next_retry", 0)):
+            continue
+        dataset = dataset_for(cfg, asset)
+        if not zfs_exists(dataset):
+            message = "Protected system no longer exists; remove or reassign this replication policy"
+            if previous.get("error") != message:
+                with locked_state() as value:
+                    value.setdefault("assets", {}).setdefault(key, {}).update(
+                        {"error": message, "last_attempt": now, "next_retry": now + 86400}
+                    )
+                event("replication-policy-orphaned", message, asset=asset, peer_id=peer_id)
+            continue
+        local_points = zfs_snapshots(dataset)
+        if not local_points:
+            continue
+        mode = str(rule.get("schedule_mode", "interval"))
+        if mode == "every_backup":
+            due = local_points[-1] != previous.get("last_snapshot")
+        elif mode == "daily":
+            hour = min(23, max(0, int(rule.get("daily_hour", 18))))
+            last = int(previous.get("last_success", 0))
+            now_day = time.localtime(now).tm_yday
+            due = time.localtime(now).tm_hour >= hour and (
+                not last or time.localtime(last).tm_yday != now_day
+            )
+        else:
+            interval = max(300, int(rule.get("interval_minutes", 60)) * 60)
+            due = now - int(previous.get("last_success", 0)) >= interval
+        if not due:
+            continue
+        try:
+            results.append(replicate(asset, peer_id, speed_kbps=speed))
+        except Exception as exc:
+            with locked_state() as value:
+                record = value.setdefault("assets", {}).setdefault(key, {})
+                failures = int(record.get("consecutive_failures", 0)) + 1
+                record.update({"error": str(exc), "last_attempt": now,
+                               "consecutive_failures": failures,
+                               "next_retry": now + min(3600, 300 * (2 ** min(failures - 1, 4)))})
+                value.setdefault("peers", {}).setdefault(peer_id, {}).update(
+                    {"last_contact": now, "status": "error", "error": str(exc)}
+                )
+            event("replication-error", str(exc), asset=asset, peer_id=peer_id)
+            results.append({"ok": False, "asset": asset, "peer_id": peer_id, "error": str(exc)})
+    return results
+
+
+def validate_policy(peer_id: str, interval: int, retention_hours: int,
+                    schedule_mode: str = "interval", priority: str = "normal") -> None:
+    cfg = config()
+    if peer_id not in cfg.get("peers", {}) or not cfg["peers"][peer_id].get("enabled", True):
+        raise PeerError("unknown or disabled target peer")
+    if schedule_mode not in ("every_backup", "daily", "interval"):
+        raise PeerError("replication schedule mode is invalid")
+    if priority not in ("high", "normal", "low"):
+        raise PeerError("replication priority is invalid")
+    if schedule_mode == "interval" and not 5 <= interval <= 525600:
+        raise PeerError("replication interval must be between 5 minutes and 1 year")
+    if not MIN_RETENTION_HOURS <= retention_hours <= MAX_RETENTION_HOURS:
+        raise PeerError("target retention is outside the supported range")
+
+
+def configure_asset(asset: str, peer_id: str, interval: int, enabled: bool = True,
+                    retention_hours: int = MAX_RETENTION_HOURS,
+                    schedule_mode: str = "interval", priority: str = "normal",
+                    daily_hour: int = 18,
+                    retention_tiers: dict[str, int] | None = None) -> dict[str, Any]:
+    cfg, asset = config(), validate_asset(asset)
+    validate_policy(peer_id, interval, retention_hours, schedule_mode, priority)
+    tiers = validate_retention_tiers(retention_hours, retention_tiers)
+    cfg.setdefault("assets", {})[asset] = {"peer_id": peer_id,
+        "interval_minutes": interval, "retention_hours": retention_hours,
+        "retention_tiers": tiers, "schedule_mode": schedule_mode,
+        "daily_hour": min(23, max(0, int(daily_hour))),
+        "priority": priority, "enabled": enabled}
+    save_config(cfg)
+    return cfg["assets"][asset] | {"asset": asset}
+
+
+def configure_systems(systems: list[Any], peer_id: str, interval: int,
+                      retention_hours: int, schedule_mode: str = "interval",
+                      priority: str = "normal") -> list[dict[str, Any]]:
+    """Attach a wizard policy to protected assets using their stored identities."""
+    require_root()
+    validate_policy(peer_id, interval, retention_hours, schedule_mode, priority)
+    requested: list[tuple[set[str], set[str]]] = []
+    for system in systems:
+        if not isinstance(system, dict):
+            raise PeerError("protected-system identity is invalid")
+        strong = {str(system.get(key, "")).strip().casefold()
+                  for key in ("uuid", "keyName") if system.get(key)}
+        weak = {str(system.get(key, "")).strip().casefold()
+                for key in ("name", "hostname") if system.get(key)}
+        if not strong and not weak:
+            raise PeerError("protected-system identity is missing")
+        requested.append((strong, weak))
+
+    matches: list[str] = []
+    deadline = time.monotonic() + 15
+    while True:
+        available = {asset: asset_identifiers(asset) for asset in protected_asset_keys()}
+        resolved: list[str] = []
+        unresolved = False
+        for strong, weak in requested:
+            found = [asset for asset, candidates in available.items() if strong & candidates]
+            if not found:
+                found = [asset for asset, candidates in available.items() if weak & candidates]
+            if len(found) > 1:
+                raise PeerError("more than one protected asset matches a selected system")
+            if not found:
+                unresolved = True
+                break
+            resolved.append(found[0])
+        if not unresolved:
+            matches = resolved
+            break
+        if time.monotonic() >= deadline:
+            raise PeerError("new protected assets were not available for replication policy assignment")
+        time.sleep(1)
+
+    if len(set(matches)) != len(matches):
+        raise PeerError("selected systems did not resolve to distinct protected assets")
+    results = [configure_asset(asset, peer_id, interval, retention_hours=retention_hours,
+                               schedule_mode=schedule_mode, priority=priority)
+               for asset in matches]
+    event("wizard-policy-saved", f"Configured replication for {len(results)} protected system(s)",
+          peer_id=peer_id, assets=matches, interval_minutes=interval,
+          retention_hours=retention_hours)
+    return results
+
+
+def peer_remove(peer_id: str) -> None:
+    require_root()
+    cfg = config()
+    if peer_id not in cfg.get("peers", {}):
+        raise PeerError("unknown target peer")
+    used = [asset for asset, rule in cfg.get("assets", {}).items()
+            if rule.get("peer_id") == peer_id]
+    if used:
+        raise PeerError("target is still assigned to: " + ", ".join(used))
+    name = cfg["peers"][peer_id].get("name", peer_id)
+    del cfg["peers"][peer_id]
+    save_config(cfg)
+    event("target-removed", f"Removed target {name}", peer_id=peer_id)
+
+
+def source_remove(source_id: str) -> None:
+    require_root()
+    if not ID_RE.fullmatch(source_id):
+        raise PeerError("source appliance ID is invalid")
+    cfg = config()
+    if source_id not in cfg.get("sources", {}):
+        raise PeerError("unknown source peer")
+    name = cfg["sources"][source_id].get("name", source_id)
+    del cfg["sources"][source_id]
+    save_config(cfg)
+    path = authorized_keys_path()
+    if path.exists():
+        markers = (f"recovera-source={source_id}", f"backops-source={source_id}")
+        lines = [line for line in path.read_text(encoding="ascii").splitlines()
+                 if not any(marker in line for marker in markers)]
+        path.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="ascii")
+        os.chmod(path, 0o600)
+    event("source-removed", f"Removed source {name}", source_id=source_id)
+
+
+def received_forget(asset: str) -> None:
+    """Remove provenance only after an administrator has removed the dataset."""
+    require_root()
+    cfg, asset = config(), validate_asset(asset)
+    if zfs_exists(dataset_for(cfg, asset)):
+        raise PeerError("refusing to forget provenance while the received dataset exists")
+    with locked_state() as value:
+        value.setdefault("received", {}).pop(asset, None)
+
+
+def recovery_readiness(cfg: dict[str, Any], item: dict[str, Any]) -> dict[str, Any]:
+    """Run non-destructive target checks needed by local recovery workflows."""
+    asset, snapshots = str(item["key"]), item.get("snapshots", [])
+    dataset = dataset_for(cfg, asset)
+    issues: list[str] = []
+    if not zfs_exists(dataset): issues.append("Replica dataset is missing")
+    if not snapshots: issues.append("No received recovery points")
+    if not (KEYS_DIR / f"{asset}.agentInfo").is_file(): issues.append("Agent metadata is missing")
+    if not item.get("origin", {}).get("isReplicated"): issues.append("Replication provenance is missing")
+    properties = run(["zfs", "get", "-H", "-o", "property,value",
+                      "readonly,mountpoint", dataset], check=False)
+    values = dict(line.split("\t", 1) for line in properties.stdout.decode().splitlines()
+                  if "\t" in line) if properties.returncode == 0 else {}
+    if values.get("readonly") != "on": issues.append("Replica dataset is not read-only")
+    if values.get("mountpoint") != f"/home/agents/{asset}": issues.append("Replica mountpoint is invalid")
+    return {"recovery_ready": not issues, "recovery_issues": issues,
+            "latest_snapshot": snapshots[-1] if snapshots else None,
+            "validation": {"dataset": dataset, "readonly": values.get("readonly"),
+                           "mountpoint": values.get("mountpoint")}}
+
+
+def status_document() -> dict[str, Any]:
+    cfg = config()
+    local_assets = assets_local(cfg)
+    received_assets = []
+    for item in local_assets:
+        if item.get("replicated"):
+            received_assets.append(item | recovery_readiness(cfg, item))
+    current = state()
+    return {"service": "recovera-peer", "version": VERSION,
+            "appliance": {"id": cfg["appliance_id"], "name": cfg["name"]},
+            "peers": cfg.get("peers", {}), "sources": cfg.get("sources", {}),
+            "rules": cfg.get("assets", {}), "local_assets": local_assets,
+            "received_assets": received_assets, "state": current, "offsite": offsite(),
+            "storage": storage_status(cfg), "peer_health": current.get("peers", {}),
+            "tls_fingerprint": gateway_tls_fingerprint()}
+
+
+def authenticate_local_admin(username: str, password: str) -> bool:
+    """Use the appliance's registered local administrator credential store."""
+    if (not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_-]{0,31}", username)
+            or not password or len(password.encode("utf-8")) > 4096):
+        return False
+    try:
+        result = run(
+            ["php", str(AUTH_HELPER_PATH), username],
+            check=False,
+            input_data=password.encode("utf-8"),
+            timeout=8,
+        )
+        authorized = result.returncode == 0
+        if not authorized:
+            time.sleep(0.25)
+        return authorized
+    except (PeerError, subprocess.TimeoutExpired):
+        time.sleep(0.25)
+        return False
+
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    server_version = "RecoveraPeer/" + VERSION
+    def log_message(self, fmt: str, *args: Any) -> None:
+        sys.stderr.write("peer-http: " + fmt % args + "\n")
+    def reply(self, status: int, value: Any, content_type: str = "application/json") -> None:
+        raw = value if isinstance(value, bytes) else (value.encode() if isinstance(value, str) else json.dumps(value).encode())
+        self.send_response(status)
+        for key, val in (("Content-Type", content_type), ("Content-Length", str(len(raw))),
+                         ("Cache-Control", "no-store"), ("X-Content-Type-Options", "nosniff"),
+                         ("Content-Security-Policy", "default-src 'self'; style-src 'unsafe-inline'; script-src 'unsafe-inline'")):
+            self.send_header(key, val)
+        self.end_headers(); self.wfile.write(raw)
+    def json_body(self) -> dict[str, Any]:
+        if self.headers.get_content_type() != "application/json":
+            raise PeerError("Content-Type must be application/json")
+        size = int(self.headers.get("Content-Length", "0"))
+        if size < 0 or size > 1024 * 1024:
+            raise PeerError("request body is too large")
+        value = json.loads(self.rfile.read(size))
+        if not isinstance(value, dict):
+            raise PeerError("request must be a JSON object")
+        return value
+    def client_ip(self) -> str:
+        address = self.client_address[0]
+        if address in ("127.0.0.1", "::1"):
+            forwarded = self.headers.get("X-Forwarded-For", "").split(",", 1)[0].strip()
+            if forwarded and HOST_RE.fullmatch(forwarded):
+                address = forwarded
+        return address
+    def admin(self) -> bool:
+        supplied = self.headers.get("X-Recovera-Internal", "")
+        if self.client_address[0] in ("127.0.0.1", "::1") and WEB_TOKEN_PATH.is_file():
+            expected = WEB_TOKEN_PATH.read_text(encoding="ascii").strip()
+            if expected and hmac.compare_digest(supplied, expected):
+                return True
+        header = self.headers.get("Authorization", "")
+        try:
+            kind, encoded = header.split(" ", 1)
+            user, password = base64.b64decode(encoded, validate=True).decode("utf-8").split(":", 1)
+        except Exception:
+            kind = user = password = ""
+        if kind.lower() == "basic" and authenticate_local_admin(user, password):
+            return True
+        self.send_response(401); self.send_header("WWW-Authenticate", 'Basic realm="Recovera Peer Replication"'); self.send_header("Content-Length", "0"); self.end_headers(); return False
+    def do_GET(self) -> None:
+        try:
+            if self.path == "/v1/info": self.reply(200, public_info())
+            elif self.path == "/":
+                self.reply(404, {"error": "Use /configure/offsite-target on the Recovera WebUI"})
+            elif self.path in ("/v1/admin/status", "/v1/admin/queue-status", "/v1/admin/offsite"):
+                if not self.admin():
+                    return
+                if self.path == "/v1/admin/status":
+                    self.reply(200, status_document())
+                elif self.path == "/v1/admin/queue-status":
+                    self.reply(200, queue_document())
+                else:
+                    self.reply(200, {"schedules": offsite()["schedules"],
+                                     "averages": weekly_averages()})
+            else: self.reply(404, {"error": "not found"})
+        except Exception as exc: self.reply(400, {"error": str(exc)})
+    def do_POST(self) -> None:
+        try:
+            if self.path == "/v1/pair": self.reply(200, pair_accept(self.json_body(), self.client_ip())); return
+            if not self.admin(): return
+            body = self.json_body()
+            if self.path == "/v1/admin/pairing-code":
+                code = pairing_code(15); self.reply(200, {"code": code, "expires": int(time.time()) + 900})
+            elif self.path == "/v1/admin/discover":
+                port = int(body.get("port", 443)); prefix = "/v1" if port == 9443 else "/recovera-peer"
+                info, observed = ssl_json(str(body["host"]), port, prefix + "/info"); self.reply(200, info | {"observed_fingerprint": observed})
+            elif self.path == "/v1/admin/peer":
+                self.reply(200, peer_add(str(body["host"]), int(body.get("port", 443)), str(body["code"]), str(body["fingerprint"]), {"appliance_id": str(body["appliance_id"])}))
+            elif self.path == "/v1/admin/rule":
+                self.reply(200, configure_asset(
+                    str(body["asset"]), str(body["peer_id"]),
+                    int(body.get("interval_minutes", 60)),
+                    enabled=bool(body.get("enabled", True)),
+                    retention_hours=int(body.get("retention_hours", MAX_RETENTION_HOURS)),
+                    schedule_mode=str(body.get("schedule_mode", "interval")),
+                    priority=str(body.get("priority", "normal")),
+                    daily_hour=int(body.get("daily_hour", 18)),
+                    retention_tiers=body.get("retention_tiers"),
+                ))
+            elif self.path == "/v1/admin/wizard-rule":
+                systems = body.get("systems")
+                if not isinstance(systems, list) or not 1 <= len(systems) <= 30:
+                    raise PeerError("between 1 and 30 protected systems are required")
+                self.reply(200, {"assets": configure_systems(
+                    systems, str(body["peer_id"]), int(body["interval_minutes"]),
+                    int(body["retention_hours"]), str(body.get("schedule_mode", "interval")),
+                    str(body.get("priority", "normal")),
+                )})
+            elif self.path == "/v1/admin/sync":
+                with sync_lock():
+                    self.reply(200, {"results": configured_sync()})
+            elif self.path == "/v1/admin/queue":
+                self.reply(200, queue_snapshot(str(body["assetKey"]), str(body["snapshotEpoch"])))
+            elif self.path == "/v1/admin/offsite/schedule-add":
+                self.reply(200, schedule_add(int(body["secondsWeekStart"]),
+                                             int(body["secondsWeekEnd"]), int(body["speed"])))
+            elif self.path == "/v1/admin/offsite/schedule-delete":
+                schedule_delete(int(body["scheduleId"])); self.reply(200, {"ok": True})
+            elif self.path == "/v1/admin/offsite/speed-set":
+                self.reply(200, set_speed(int(body["speed"])))
+            elif self.path == "/v1/admin/offsite/speed-test":
+                self.reply(200, int(offsite()["speed_kbps"]))
+            elif self.path == "/v1/admin/offsite/concurrency-set":
+                count = int(body["maxSyncs"])
+                if not 1 <= count <= 64: raise PeerError("concurrent sync count must be between 1 and 64")
+                settings = offsite(); settings["max_syncs"] = count; save_offsite(settings)
+                run(["speedsync", "setMaxSyncs", str(count)], check=False, timeout=10)
+                self.reply(200, {"ok": True, "maxSyncs": count})
+            else: self.reply(404, {"error": "not found"})
+        except Exception as exc: self.reply(400, {"error": str(exc)})
+
+
+def serve() -> None:
+    require_root(); cfg = config()
+    server = http.server.ThreadingHTTPServer((cfg["listen"], int(cfg["port"])), Handler)
+    server.daemon_threads = True
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER); context.minimum_version = ssl.TLSVersion.TLSv1_2
+    context.load_cert_chain(str(TLS_CERT_PATH), str(TLS_KEY_PATH))
+    server.socket = context.wrap_socket(server.socket, server_side=True)
+    print(f"Recovera peer service listening on https://{cfg['listen']}:{cfg['port']}", flush=True)
+    server.serve_forever()
+
+
+@contextlib.contextmanager
+def sync_lock() -> Any:
+    LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with LOCK_PATH.open("w") as handle:
+        try: fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc: raise PeerError("another replication run is already active") from exc
+        yield
+
+
+def parser() -> argparse.ArgumentParser:
+    result = argparse.ArgumentParser(description="Offline Recovera appliance replication")
+    result.add_argument("--version", action="version", version=VERSION)
+    sub = result.add_subparsers(dest="command", required=True)
+    sub.add_parser("init"); sub.add_parser("serve"); sub.add_parser("status")
+    code = sub.add_parser("pairing-code"); code.add_argument("--minutes", type=int, default=15)
+    discover = sub.add_parser("discover"); discover.add_argument("host"); discover.add_argument("--port", type=int, default=443)
+    add = sub.add_parser("peer-add"); add.add_argument("host"); add.add_argument("--port", type=int, default=443); add.add_argument("--code", required=True); add.add_argument("--fingerprint"); add.add_argument("--yes", action="store_true")
+    remove_peer = sub.add_parser("peer-remove"); remove_peer.add_argument("peer_id")
+    remove_source = sub.add_parser("source-remove"); remove_source.add_argument("source_id")
+    forget = sub.add_parser("received-forget"); forget.add_argument("asset")
+    rule = sub.add_parser("asset-configure"); rule.add_argument("asset"); rule.add_argument("--peer", required=True); rule.add_argument("--interval", type=int, default=60)
+    rep = sub.add_parser("replicate"); rep.add_argument("asset"); rep.add_argument("--peer", required=True); rep.add_argument("--snapshot")
+    sync = sub.add_parser("sync"); sync.add_argument("--all", action="store_true", required=True)
+    entry = sub.add_parser("ssh-entry"); entry.add_argument("source_id")
+    return result
+
+
+def main() -> int:
+    args = parser().parse_args()
+    try:
+        if args.command == "init": init()
+        elif args.command == "serve": serve()
+        elif args.command == "status": print(json.dumps(status_document(), indent=2))
+        elif args.command == "pairing-code": print(pairing_code(args.minutes)); print(f"Pairing HTTPS fingerprint: {gateway_tls_fingerprint()}")
+        elif args.command == "discover":
+            prefix = "/v1" if args.port == 9443 else "/recovera-peer"
+            info, observed = ssl_json(args.host, args.port, prefix + "/info"); print(json.dumps(info | {"observed_fingerprint": observed}, indent=2))
+        elif args.command == "peer-add":
+            prefix = "/v1" if args.port == 9443 else "/recovera-peer"
+            info, observed = ssl_json(args.host, args.port, prefix + "/info"); fingerprint = args.fingerprint or observed
+            if not args.fingerprint and not args.yes:
+                print(f"Target: {info.get('name')} ({info.get('appliance_id')})\nTLS fingerprint: {observed}")
+                if input("Does this match the fingerprint shown on the target? [y/N] ").lower() != "y": raise PeerError("pairing cancelled")
+            print(json.dumps(peer_add(args.host, args.port, args.code, fingerprint, info), indent=2))
+        elif args.command == "asset-configure": print(json.dumps(configure_asset(args.asset, args.peer, args.interval), indent=2))
+        elif args.command == "peer-remove": peer_remove(args.peer_id); print("target removed")
+        elif args.command == "source-remove": source_remove(args.source_id); print("source removed")
+        elif args.command == "received-forget": received_forget(args.asset); print("received provenance removed")
+        elif args.command == "replicate":
+            with sync_lock(): print(json.dumps(replicate(args.asset, args.peer, args.snapshot), indent=2))
+        elif args.command == "sync":
+            with sync_lock(): print(json.dumps({"results": configured_sync()}, indent=2))
+        elif args.command == "ssh-entry": ssh_entry(args.source_id)
+        return 0
+    except Exception as exc:
+        if args.command == "ssh-entry": print(json.dumps({"ok": False, "error": str(exc)}, separators=(",", ":")))
+        else: print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
