@@ -1014,8 +1014,8 @@ p.chmod(0o600)
 PY
 
   if systemctl is-active --quiet firewalld && firewall-cmd --get-zones 2>/dev/null | grep -qw datto; then
+    firewall-cmd --zone=datto --add-port="${PEER_PORT}/tcp" >/dev/null || return 1
     firewall-cmd --permanent --zone=datto --add-port="${PEER_PORT}/tcp" >/dev/null || return 1
-    firewall-cmd --reload >/dev/null || return 1
   fi
   systemctl daemon-reload
   systemctl restart ssh.service || return 1
