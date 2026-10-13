@@ -86,6 +86,15 @@ try {
         !str_contains($protectScript, "request('wizard-rule'")) {
         throw new RuntimeException('Protect a System replication integration is not installed');
     }
+    $homeTemplate = (string) @file_get_contents(
+        '/usr/lib/datto/device/templates/commonlookandfeel/Home/deviceInfo.block.html.twig');
+    $homeScript = (string) @file_get_contents(
+        '/datto/web/commonlookandfeel/js/App/Home/RecoveraHome.js');
+    if (!str_contains($homeTemplate, 'recovera-offsite-servers') ||
+        !str_contains($homeTemplate, 'RecoveraHome.js') ||
+        !str_contains($homeScript, '/api/recovera/offsite-target/status')) {
+        throw new RuntimeException('Recovera home-page target integration is not installed');
+    }
     $added = curlRequest(['-b', $cookie, '-H', 'X-Requested-With: XMLHttpRequest',
         '--data-urlencode', 'csrf=' . $pageCsrf, '--data-urlencode',
         'payload={"secondsWeekStart":12345,"secondsWeekEnd":12600,"speed":1024}',

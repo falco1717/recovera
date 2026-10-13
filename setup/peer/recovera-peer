@@ -30,7 +30,7 @@ import uuid
 from pathlib import Path
 from typing import Any, BinaryIO
 
-VERSION = "0.4.0"
+VERSION = "0.4.1"
 ETC = Path(os.environ.get("RECOVERA_PEER_ETC", "/etc/recovera-peer"))
 STATE_DIR = Path(os.environ.get("RECOVERA_PEER_STATE", "/var/lib/recovera-peer"))
 CONFIG_PATH = ETC / "config.json"
@@ -177,7 +177,10 @@ def locked_state() -> Any:
 def default_offsite() -> dict[str, Any]:
     speed = 0
     with contextlib.suppress(ValueError, OSError):
-        speed = max(0, int(float(TX_SPEED_PATH.read_text().strip()) * 125))
+        # The appliance stores this value in KB/s. Its UI converts between
+        # KB/s and Mb/s, so applying another factor here makes 10 Gbps appear
+        # as 80 Mbps on the home page.
+        speed = max(0, int(float(TX_SPEED_PATH.read_text().strip())))
     return {"schema": 1, "speed_kbps": speed, "max_syncs": 1,
             "next_schedule_id": 1, "schedules": []}
 
@@ -259,7 +262,7 @@ def set_speed(speed_kbps: int) -> int:
     settings["speed_kbps"] = speed_kbps
     save_offsite(settings)
     TX_SPEED_PATH.parent.mkdir(parents=True, exist_ok=True)
-    TX_SPEED_PATH.write_text(f"{speed_kbps / 125:g}\n", encoding="ascii")
+    TX_SPEED_PATH.write_text(f"{speed_kbps}\n", encoding="ascii")
     return speed_kbps
 
 
@@ -314,6 +317,9 @@ def init() -> None:
     KNOWN_HOSTS_PATH.touch(mode=0o600, exist_ok=True)
     if not OFFSITE_PATH.exists():
         atomic_json(OFFSITE_PATH, default_offsite())
+    # Keep the legacy appliance value in the same KB/s unit as Recovera's
+    # scheduler so the native off-site and home pages render the same limit.
+    set_speed(int(offsite()["speed_kbps"]))
     if not WEB_TOKEN_PATH.exists():
         WEB_TOKEN_PATH.write_text(secrets.token_urlsafe(48) + "\n", encoding="ascii")
     os.chmod(WEB_TOKEN_PATH, 0o640)

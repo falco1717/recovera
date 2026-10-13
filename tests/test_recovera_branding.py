@@ -56,6 +56,17 @@ canOffsite: {{ canOffsite|json_encode|raw }}
         self.assertIn("inWizard or feature.isSupported('FEATURE_OFFSITE')", patched)
         self.assertEqual(branding.patch_replication_pane(patched), patched)
 
+    def test_home_page_replaces_native_universal_with_recovera_target(self):
+        branding = load_module()
+        source = """{% set numOffsiteTargets = deviceInfo.offsiteTargets|length %}
+                <td class=\"label-dark w-33\">
+                    {% if numOffsiteTargets == 0 %}
+"""
+        patched = branding.patch_home_device_info(source)
+        self.assertIn("RecoveraHome.js", patched)
+        self.assertIn('id="recovera-offsite-servers"', patched)
+        self.assertEqual(branding.patch_home_device_info(patched), patched)
+
 
 if __name__ == "__main__":
     unittest.main()

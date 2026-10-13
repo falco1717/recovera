@@ -69,7 +69,12 @@ class RecoveraPeerTests(unittest.TestCase):
     def test_offsite_speed_updates_peer_and_legacy_config(self):
         self.assertEqual(self.peer.set_speed(1250), 1250)
         self.assertEqual(self.peer.offsite()["speed_kbps"], 1250)
-        self.assertEqual(self.peer.TX_SPEED_PATH.read_text().strip(), "10")
+        self.assertEqual(self.peer.TX_SPEED_PATH.read_text().strip(), "1250")
+
+    def test_default_offsite_reads_native_kilobytes_without_rescaling(self):
+        self.peer.TX_SPEED_PATH.parent.mkdir(parents=True, exist_ok=True)
+        self.peer.TX_SPEED_PATH.write_text("1250000\n")
+        self.assertEqual(self.peer.default_offsite()["speed_kbps"], 1250000)
 
     def test_offsite_schedule_rejects_invalid_ranges(self):
         for start, end, speed in ((1, 1, 100), (-1, 2, 100), (1, 604800, 100), (1, 2, -2)):

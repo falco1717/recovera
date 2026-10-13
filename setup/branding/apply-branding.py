@@ -196,6 +196,23 @@ def patch_replication_pane(text: str) -> str:
     return text
 
 
+def patch_home_device_info(text: str) -> str:
+    if "RecoveraHome.js" not in text:
+        text = text.replace(
+            "{% set numOffsiteTargets = deviceInfo.offsiteTargets|length %}",
+            "{% set numOffsiteTargets = deviceInfo.offsiteTargets|length %}\n"
+            "<script type=\"text/javascript\" src=\"{{ asset('commonlookandfeel/js/App/Home/RecoveraHome.js') }}\"></script>",
+            1,
+        )
+    if 'id="recovera-offsite-servers"' not in text:
+        marker = """                <td class=\"label-dark w-33\">
+                    {% if numOffsiteTargets == 0 %}"""
+        replacement = """                <td id=\"recovera-offsite-servers\" class=\"label-dark w-33\">
+                    {% if numOffsiteTargets == 0 %}"""
+        text = text.replace(marker, replacement, 1)
+    return text
+
+
 def add_routes(text: str) -> str:
     text = text.replace(
         "path: /configure/offsite-target/api/{operation}",
@@ -235,6 +252,7 @@ def main() -> int:
     offsite_js = WEB / "commonlookandfeel/js/App/Configure/OffsiteSync/RecoveraOffsiteApiClient.js"
     recovery_points_js = WEB / "commonlookandfeel/js/App/Assets/RecoveraRecoveryPoints.js"
     protect_system_js = WEB / "commonlookandfeel/js/App/Agents/RecoveraProtectSystem.js"
+    home_js = WEB / "commonlookandfeel/js/App/Home/RecoveraHome.js"
     for source, target in (
         (resources / "RecoveraTargetController.php", controller),
         (resources / "recovera-target.html.twig", target_template),
@@ -242,6 +260,7 @@ def main() -> int:
         (resources / "RecoveraOffsiteApiClient.js", offsite_js),
         (resources / "RecoveraRecoveryPoints.js", recovery_points_js),
         (resources / "RecoveraProtectSystem.js", protect_system_js),
+        (resources / "RecoveraHome.js", home_js),
     ):
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(source, target)
@@ -274,6 +293,7 @@ def main() -> int:
         update(path, patch_recovery_points_template)
     update(ROOT / "templates/commonlookandfeel/Agents/Add/index.html.twig", patch_protect_system_index)
     update(ROOT / "templates/commonlookandfeel/Assets/Configure/cloud.backup.html.twig", patch_replication_pane)
+    update(ROOT / "templates/commonlookandfeel/Home/deviceInfo.block.html.twig", patch_home_device_info)
     update(ROOT / "config/routes.yaml", add_routes)
 
     update(ROOT / "templates/commonlookandfeel/Authentication/index.login.html.twig", brand_login)

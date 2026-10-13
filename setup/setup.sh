@@ -922,6 +922,7 @@ p77_recovera_branding() {
   [ -f "$INSTALL_DIR/branding/RecoveraTargetController.php" ] || { log "Recovera off-site target controller is missing"; return 1; }
   [ -f "$INSTALL_DIR/branding/RecoveraProtectSystem.js" ] || { log "Recovera protection-wizard bridge is missing"; return 1; }
   [ -f "$INSTALL_DIR/branding/RecoveraRecoveryPoints.js" ] || { log "Recovera recovery-point bridge is missing"; return 1; }
+  [ -f "$INSTALL_DIR/branding/RecoveraHome.js" ] || { log "Recovera home-page bridge is missing"; return 1; }
   ensure_recovera_device_id || return 1
   python3 "$INSTALL_DIR/branding/apply-branding.py" \
     "$INSTALL_DIR/branding/recovera-logo.png" || return 1
