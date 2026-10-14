@@ -47,6 +47,9 @@ the default. When Apache, PHP-FPM, and Recovera replication are active, the
 validation service commits the candidate as the default. A validation failure
 selects the previous image and reboots. A kernel-level failure also falls back
 on the next reset because the candidate was only a one-time GRUB selection.
+During the first conversion from a conventional installation, the image-layout
+marker records that installation's GRUB entry as the fallback until the first
+candidate has passed validation.
 
 The signing private key is not in Git. It is currently stored on the maintainer
 workstation at `F:\Users\jfarmer\Documents\Recovera Secrets\recovera-upgrade-signing-key`.

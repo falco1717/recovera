@@ -451,9 +451,10 @@ def command_validation_failed(config, args):
     require_root()
     state = read_json(state_path(), {})
     previous = state.get("previous", {})
-    if not previous.get("version"):
-        raise UpgradeError("no previous image is recorded")
-    run([BOOT_HELPER, "rollback", previous["version"]])
+    if previous.get("version"):
+        run([BOOT_HELPER, "rollback", previous["version"]])
+    else:
+        run([BOOT_HELPER, "fallback"])
     state["last_failure"] = {"version": current_release().get("version"), "reason": args.reason}
     atomic_json(state_path(), state)
     PENDING_MARKER.unlink(missing_ok=True)

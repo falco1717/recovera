@@ -28,5 +28,14 @@ case "${1:-}" in
     grub-set-default "$(entry "$2")"
     grub-editenv /boot/grub/grubenv unset next_entry
     ;;
-  *) echo "usage: $0 {stage VERSION IMAGE|commit VERSION IMAGE|rollback VERSION}" >&2; exit 2 ;;
+  fallback)
+    [ "$#" -eq 1 ] || exit 2
+    fallback_entry=$(python3 -c 'import json; print(json.load(open("/etc/recovera/image-layout.json"))["fallback_entry"])')
+    [[ "$fallback_entry" =~ ^[0-9A-Za-z][0-9A-Za-z._-]{0,127}$ ]] || {
+      echo "invalid conventional fallback entry" >&2; exit 1;
+    }
+    grub-set-default "$fallback_entry"
+    grub-editenv /boot/grub/grubenv unset next_entry
+    ;;
+  *) echo "usage: $0 {stage VERSION IMAGE|commit VERSION IMAGE|rollback VERSION|fallback}" >&2; exit 2 ;;
 esac

@@ -143,6 +143,12 @@ class RecoveraUpgradeTests(unittest.TestCase):
         self.assertIn("WantedBy=multi-user.target", unit)
         self.assertNotIn("After=multi-user.target", unit)
 
+    def test_first_image_can_fall_back_to_conventional_root(self):
+        boot = (ROOT / "upgrade" / "recovera-image-boot").read_text()
+        updater = UPDATER.read_text()
+        self.assertIn("fallback_entry", boot)
+        self.assertIn('run([BOOT_HELPER, "fallback"])', updater)
+
 
 if __name__ == "__main__":
     unittest.main()
