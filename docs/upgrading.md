@@ -82,6 +82,14 @@ sudo tools/build-upgrade-image.sh \
   --signing-key /secure/recovera-upgrade-signing-key
 ```
 
+The signing key is optional during the image-build step. Omitting
+`--signing-key` produces the image parts and manifest without a signature so a
+build appliance never needs access to the release private key. Copy only the
+manifest to the isolated release workstation, sign it there with
+`ssh-keygen -Y sign -f /secure/recovera-upgrade-signing-key -n recovera-upgrade
+recovera-image-manifest.json`, and return only the resulting `.sig` file to the
+release assets.
+
 The builder creates an ext4 root image, installs the loop-root initramfs logic,
 shrinks it, compresses it with XZ, splits it, creates SHA-256 metadata,
 and signs the manifest using the `recovera-upgrade` SSH signature namespace.

@@ -12,7 +12,7 @@ SIGNING_KEY=
 PART_SIZE=1900M
 
 usage() {
-  echo "usage: sudo $0 --root DIR --version VERSION --sequence N --output DIR --signing-key FILE [--channel NAME]" >&2
+  echo "usage: sudo $0 --root DIR --version VERSION --sequence N --output DIR [--signing-key FILE] [--channel NAME]" >&2
 }
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -27,7 +27,8 @@ while [ "$#" -gt 0 ]; do
 done
 [ "$(id -u)" -eq 0 ] || { echo "run as root" >&2; exit 1; }
 [ -d "$ROOT" ] && [ -n "$VERSION" ] && [[ "$SEQUENCE" =~ ^[1-9][0-9]*$ ]] && \
-  [ -n "$OUTPUT" ] && [ -f "$SIGNING_KEY" ] || { usage; exit 2; }
+  [ -n "$OUTPUT" ] || { usage; exit 2; }
+[ -z "$SIGNING_KEY" ] || [ -f "$SIGNING_KEY" ] || { echo "signing key not found: $SIGNING_KEY" >&2; exit 2; }
 [[ "$VERSION" =~ ^[0-9A-Za-z][0-9A-Za-z._-]{0,63}$ ]] || { echo "invalid version" >&2; exit 2; }
 for command in rsync mkfs.ext4 e2fsck resize2fs xz split ssh-keygen jq; do
   command -v "$command" >/dev/null || { echo "missing command: $command" >&2; exit 1; }
@@ -139,5 +140,10 @@ print(json.dumps({
 }, indent=2, sort_keys=True))
 PY
 rm -f "$manifest.sig"
-ssh-keygen -Y sign -q -f "$SIGNING_KEY" -n recovera-upgrade "$manifest"
-echo "signed Recovera $VERSION image assets written to $OUTPUT"
+if [ -n "$SIGNING_KEY" ]; then
+  ssh-keygen -Y sign -q -f "$SIGNING_KEY" -n recovera-upgrade "$manifest"
+  echo "signed Recovera $VERSION image assets written to $OUTPUT"
+else
+  echo "unsigned Recovera $VERSION image assets written to $OUTPUT"
+  echo "sign $manifest on the isolated release workstation before publishing" >&2
+fi
