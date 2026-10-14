@@ -18,7 +18,7 @@ done
 case "$image" in /recovera/images/*.img) ;; *) panic "invalid Recovera image path" ;; esac
 
 host_device=/dev/disk/by-uuid/$host_uuid
-wait-for-root "$host_device" || panic "Recovera image host did not appear"
+wait-for-root "$host_device" 30 || panic "Recovera image host did not appear"
 mkdir -p /run/recovera-host
 mount -o rw "$host_device" /run/recovera-host || panic "could not mount Recovera image host"
 [ -f "/run/recovera-host$image" ] || panic "Recovera root image is missing"

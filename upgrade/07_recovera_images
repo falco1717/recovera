@@ -14,7 +14,7 @@ for image in /host/recovera/images/*.img; do
 menuentry 'Recovera $version' --id 'recovera-$version' {
     search --no-floppy --fs-uuid --set=recovera_host $host_uuid
     loopback recovera_loop (\$recovera_host)/recovera/images/$file
-    linux (recovera_loop)/boot/vmlinuz rw quiet recovera.host_uuid=$host_uuid recovera.image=/recovera/images/$file
+    linux (recovera_loop)/boot/vmlinuz root=LABEL=recovera-root rootfstype=ext4 rw quiet recovera.host_uuid=$host_uuid recovera.image=/recovera/images/$file
     initrd (recovera_loop)/boot/initrd.img
 }
 EOF

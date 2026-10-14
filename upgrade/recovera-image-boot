@@ -11,22 +11,26 @@ mode=$(python3 -c 'import json; print(json.load(open("/etc/recovera/image-layout
 
 valid_version() { [[ "$1" =~ ^[0-9A-Za-z][0-9A-Za-z._-]{0,63}$ ]]; }
 entry() { printf 'recovera-%s' "$1"; }
+clear_transient_boot_state() {
+  grub-editenv /boot/grub/grubenv unset next_entry initrdfail prev_entry prev_saved_entry
+}
 
 case "${1:-}" in
   stage)
     [ "$#" -eq 3 ] && valid_version "$2" && [ -f "$3" ] || exit 2
+    clear_transient_boot_state
     update-grub
     grub-reboot "$(entry "$2")"
     ;;
   commit)
     [ "$#" -eq 3 ] && valid_version "$2" && [ -f "$3" ] || exit 2
     grub-set-default "$(entry "$2")"
-    grub-editenv /boot/grub/grubenv unset next_entry
+    clear_transient_boot_state
     ;;
   rollback)
     [ "$#" -eq 2 ] && valid_version "$2" || exit 2
     grub-set-default "$(entry "$2")"
-    grub-editenv /boot/grub/grubenv unset next_entry
+    clear_transient_boot_state
     ;;
   fallback)
     [ "$#" -eq 1 ] || exit 2
@@ -35,7 +39,7 @@ case "${1:-}" in
       echo "invalid conventional fallback entry" >&2; exit 1;
     }
     grub-set-default "$fallback_entry"
-    grub-editenv /boot/grub/grubenv unset next_entry
+    clear_transient_boot_state
     ;;
   *) echo "usage: $0 {stage VERSION IMAGE|commit VERSION IMAGE|rollback VERSION|fallback}" >&2; exit 2 ;;
 esac

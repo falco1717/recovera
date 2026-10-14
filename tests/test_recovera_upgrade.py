@@ -155,6 +155,14 @@ class RecoveraUpgradeTests(unittest.TestCase):
         self.assertIn("fallback_entry", boot)
         self.assertIn('run([BOOT_HELPER, "fallback"])', updater)
 
+    def test_image_boot_supplies_root_and_wait_timeout(self):
+        grub = (ROOT / "upgrade" / "07_recovera_images").read_text()
+        local_top = (ROOT / "upgrade" / "initramfs-local-top-recovera").read_text()
+        self.assertIn("root=LABEL=recovera-root", grub)
+        self.assertIn('wait-for-root "$host_device" 30', local_top)
+        boot = (ROOT / "upgrade" / "recovera-image-boot").read_text()
+        self.assertIn("unset next_entry initrdfail prev_entry prev_saved_entry", boot)
+
     def test_updater_can_be_installed_without_rerunning_setup(self):
         setup = (ROOT / "setup" / "setup.sh").read_text()
         self.assertIn("install-updater)", setup)
