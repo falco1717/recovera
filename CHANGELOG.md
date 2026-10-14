@@ -13,6 +13,8 @@
   and forced every prepared image to re-arm the one-time initializer.
 - Replaced the vendor ASCII artwork on the local VM console and SSH login
   banner with consistent Recovera branding.
+- Made the global SSH password denial take precedence over Ubuntu cloud-init
+  defaults while retaining the explicit `backup-admin` exception.
 - Documented OVA import, validation, publication, and recovery procedures.
 
 ## v0.5.1 - 2026-10-13

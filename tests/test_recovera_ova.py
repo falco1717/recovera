@@ -60,7 +60,8 @@ class RecoveraOvaTests(unittest.TestCase):
 
     def test_password_ssh_is_scoped_to_backup_admin(self):
         script = (ROOT / "setup" / "setup.sh").read_text()
-        self.assertIn("59-recovera-password-policy.conf", script)
+        self.assertIn("49-recovera-password-policy.conf", script)
+        self.assertIn("rm -f /etc/ssh/sshd_config.d/59-recovera-password-policy.conf", script)
         self.assertIn("92-recovera-backup-admin.conf", script)
         self.assertIn("Match User backup-admin", script)
         self.assertIn("password SSH is enabled only for backup-admin", script)

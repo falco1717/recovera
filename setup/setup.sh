@@ -918,7 +918,10 @@ p76_backup_admin() {
   # cloud-image drop-in disables it globally, while peer transport remains
   # key-only under its own Match block.
   rm -f /etc/ssh/sshd_config.d/60-cloudimg-settings.conf
-  cat > /etc/ssh/sshd_config.d/59-recovera-password-policy.conf <<'EOF'
+  # OpenSSH uses the first obtained value. This file must sort before Ubuntu's
+  # 50-cloud-init.conf, which may otherwise keep password authentication on.
+  rm -f /etc/ssh/sshd_config.d/59-recovera-password-policy.conf
+  cat > /etc/ssh/sshd_config.d/49-recovera-password-policy.conf <<'EOF'
 PasswordAuthentication no
 KbdInteractiveAuthentication no
 EOF
