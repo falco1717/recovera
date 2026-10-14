@@ -153,7 +153,7 @@ class RecoveraUpgradeTests(unittest.TestCase):
     def test_updater_can_be_installed_without_rerunning_setup(self):
         setup = (ROOT / "setup" / "setup.sh").read_text()
         self.assertIn("install-updater)", setup)
-        self.assertIn("p79_image_updater", setup)
+        self.assertIn("p79_image_updater || exit 1", setup)
 
 
 if __name__ == "__main__":

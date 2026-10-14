@@ -1453,7 +1453,7 @@ case "$MODE" in
     echo "peer replication service installed" ;;
   install-updater)
     [ "$(id -u)" -eq 0 ] || { echo "run with sudo"; exit 1; }
-    p79_image_updater
+    p79_image_updater || exit 1
     echo "signed image updater installed" ;;
   apply-branding)
     [ "$(id -u)" -eq 0 ] || { echo "run with sudo"; exit 1; }

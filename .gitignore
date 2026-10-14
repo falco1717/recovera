@@ -18,3 +18,7 @@ vc-session.txt
 
 # built bundles
 dist/
+
+# Local Python test/runtime caches
+__pycache__/
+*.pyc
