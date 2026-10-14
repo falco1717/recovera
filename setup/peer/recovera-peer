@@ -31,7 +31,7 @@ import uuid
 from pathlib import Path
 from typing import Any, BinaryIO
 
-VERSION = "0.5.1"
+VERSION = "0.6.0"
 ETC = Path(os.environ.get("RECOVERA_PEER_ETC", "/etc/recovera-peer"))
 STATE_DIR = Path(os.environ.get("RECOVERA_PEER_STATE", "/var/lib/recovera-peer"))
 CONFIG_PATH = ETC / "config.json"
@@ -52,6 +52,9 @@ STATE_LOCK_PATH = Path(os.environ.get(
 ))
 OFFSITE_PATH = Path(os.environ.get("RECOVERA_PEER_OFFSITE", "/etc/recovera-peer/offsite.json"))
 WEB_TOKEN_PATH = Path(os.environ.get("RECOVERA_PEER_WEB_TOKEN", "/etc/recovera-peer/web.token"))
+BACKUP_ADMIN_CREDENTIAL_PATH = Path(os.environ.get(
+    "RECOVERA_BACKUP_ADMIN_CREDENTIAL", "/etc/recovera/backup-admin.json"
+))
 TX_SPEED_PATH = Path(os.environ.get("RECOVERA_TX_SPEED", "/datto/config/local/txSpeed"))
 AUTHORIZED_KEYS_PATH = Path(os.environ.get(
     "RECOVERA_PEER_AUTHORIZED_KEYS", "/var/lib/recovera-peer/.ssh/authorized_keys"
@@ -75,6 +78,19 @@ MAX_RETENTION_HOURS = 240_000
 
 class PeerError(RuntimeError):
     pass
+
+
+def backup_admin_credential() -> dict[str, str]:
+    """Return the locally managed appliance-access credential to an authenticated admin."""
+    try:
+        value = json.loads(BACKUP_ADMIN_CREDENTIAL_PATH.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError, OSError) as exc:
+        raise PeerError("backup-admin credential is not initialized") from exc
+    username = str(value.get("username", ""))
+    password = str(value.get("password", ""))
+    if username != "backup-admin" or not password:
+        raise PeerError("backup-admin credential is invalid")
+    return {"username": username, "password": password}
 
 
 def run(argv: list[str], *, check: bool = True, input_data: bytes | None = None,
@@ -1405,13 +1421,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if self.path == "/v1/info": self.reply(200, public_info())
             elif self.path == "/":
                 self.reply(404, {"error": "Use /configure/offsite-target on the Recovera WebUI"})
-            elif self.path in ("/v1/admin/status", "/v1/admin/queue-status", "/v1/admin/offsite"):
+            elif self.path in ("/v1/admin/status", "/v1/admin/queue-status", "/v1/admin/offsite",
+                                "/v1/admin/backup-admin-credential"):
                 if not self.admin():
                     return
                 if self.path == "/v1/admin/status":
                     self.reply(200, status_document())
                 elif self.path == "/v1/admin/queue-status":
                     self.reply(200, queue_document())
+                elif self.path == "/v1/admin/backup-admin-credential":
+                    self.reply(200, backup_admin_credential())
                 else:
                     self.reply(200, {"schedules": offsite()["schedules"],
                                      "averages": weekly_averages()})

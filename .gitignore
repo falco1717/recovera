@@ -1,6 +1,7 @@
 # Large package payloads and appliance images live outside the Git repository.
 *.deb
 *.ova
+Recovera-v*/
 scripts/vcenter/ova/SHA256SUMS
 debs/
 Packages

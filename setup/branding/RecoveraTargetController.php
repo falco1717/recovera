@@ -24,6 +24,15 @@ final class RecoveraTargetController extends AbstractController
      * @RequiresFeature("FEATURE_USER_INTERFACE")
      * @RequiresPermission("PERMISSION_OFFSITE_WRITE")
      */
+    public function accessAction(): Response
+    {
+        return $this->render('commonlookandfeel/Configure/RecoveraAccess/index.html.twig');
+    }
+
+    /**
+     * @RequiresFeature("FEATURE_USER_INTERFACE")
+     * @RequiresPermission("PERMISSION_OFFSITE_WRITE")
+     */
     public function apiAction(Request $request, string $operation): JsonResponse
     {
         if ($request->headers->get('X-Requested-With') !== 'XMLHttpRequest') {
@@ -31,6 +40,7 @@ final class RecoveraTargetController extends AbstractController
         }
         $map = [
             'status' => ['GET', '/v1/admin/status'],
+            'backup-admin-credential' => ['GET', '/v1/admin/backup-admin-credential'],
             'pairing-code' => ['POST', '/v1/admin/pairing-code'],
             'discover' => ['POST', '/v1/admin/discover'],
             'peer' => ['POST', '/v1/admin/peer'],
@@ -77,6 +87,14 @@ final class RecoveraTargetController extends AbstractController
         if ($body === false) {
             return new JsonResponse(['error' => 'Recovera peer service is unavailable: ' . $error], 503);
         }
-        return new JsonResponse(json_decode($body, true) ?: ['error' => 'Invalid peer response'], $status ?: 502);
+        $response = new JsonResponse(
+            json_decode($body, true) ?: ['error' => 'Invalid peer response'],
+            $status ?: 502
+        );
+        if ($operation === 'backup-admin-credential') {
+            $response->headers->set('Cache-Control', 'no-store, private');
+            $response->headers->set('Pragma', 'no-cache');
+        }
+        return $response;
     }
 }

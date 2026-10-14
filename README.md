@@ -45,6 +45,27 @@ sign in with the local administrator. Initial setup and local login do not need
 Internet. Legacy vendor enrollment, licensing, updates, and cloud services are not
 emulated.
 
+The installer creates a local `backup-admin` account with `sudo` access. Its
+random password is generated once and does not expire or rotate automatically.
+An authorized administrator can reveal it at **Configure → Appliance Access**,
+or from the appliance console with `sudo recovera-backup-admin show`. The page
+does not cache the credential. Rotate it only when required with
+`sudo recovera-backup-admin reset`; the UI immediately shows the new value.
+
+## Deploy the virtual appliance
+
+The release OVA is the fastest deployment path when a suitable Ubuntu VM does
+not already exist. Import it into vCenter or ESXi, select the destination
+network and datastore, and power it on. The image uses DHCP on first boot and
+then opens the same offline registration wizard at `https://<VM-IP>/`.
+
+Every OVA deployment creates its own machine ID, SSH host keys, browser TLS
+certificate, ZFS pool GUID, Recovera peer identity, device ID, and
+`backup-admin` password before network-facing services start. No builder login
+key, registration, protected system, recovery point, pairing relationship, or
+credential is embedded in the image. See [`docs/ova.md`](docs/ova.md) for import,
+verification, and image-maintainer instructions.
+
 ## Offline appliance replication
 
 The installer also provides SIRIS-Private-style replication between Recovera

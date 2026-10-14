@@ -777,6 +777,32 @@ EOF
   log "default boot: $(awk '/^\tlinux/ {print $2; exit}' /boot/grub/grub.cfg), fips=1 entries: $(grep -c 'fips=1' /boot/grub/grub.cfg)"
 }
 
+purge_pruned_packages() {
+  local list="$INSTALL_DIR/lists/pruned-packages.txt" installed="" removed="" package
+  [ -f "$list" ] || return 0
+  while IFS= read -r package; do
+    case "$package" in ''|'#'*) continue ;; esac
+    dpkg-query -W -f='${db:Status-Abbrev}' "$package" 2>/dev/null | grep -q '^ii' && \
+      installed="$installed $package"
+  done < "$list"
+  [ -n "$installed" ] || return 0
+
+  # A stale pre-sanitization install may still contain these packages. Refuse
+  # the purge if apt proposes removing anything outside the reviewed list.
+  removed=$(apt-get -s "${LOCAL_ONLY[@]}" purge $installed 2>/dev/null | \
+    awk '/^Remv / { print $2 }')
+  for package in $removed; do
+    grep -Fxq "$package" "$list" || {
+      log "refusing pruned-package cleanup because apt would also remove $package"
+      return 1
+    }
+  done
+  offline_run apt-get -y -q "${LOCAL_ONLY[@]}" purge $installed >/dev/null || return 1
+  systemctl daemon-reload
+  systemctl reset-failed >/dev/null 2>&1 || true
+  log "removed stale source-appliance-only packages:$installed"
+}
+
 p60_cleanup() {
   if [ "$REMOVE_SNAPD" = yes ] && dpkg -s snapd >/dev/null 2>&1; then
     offline_run apt-get -y -q "${LOCAL_ONLY[@]}" purge snapd >/dev/null || return 1
@@ -881,6 +907,34 @@ p75_protection_engine() {
   log "libguestfs/KVM disk-inspection engine passed"
 }
 
+p76_backup_admin() {
+  local helper="$INSTALL_DIR/peer/recovera-backup-admin"
+  [ -f "$helper" ] || { log "Recovera backup administrator helper is missing"; return 1; }
+  install -m 0755 "$helper" /usr/local/sbin/recovera-backup-admin || return 1
+  /usr/local/sbin/recovera-backup-admin install || return 1
+  chown root:root /etc/recovera/backup-admin.json || return 1
+  chmod 0600 /etc/recovera/backup-admin.json || return 1
+  # Allow password SSH only for the appliance recovery administrator. Ubuntu's
+  # cloud-image drop-in disables it globally, while peer transport remains
+  # key-only under its own Match block.
+  rm -f /etc/ssh/sshd_config.d/60-cloudimg-settings.conf
+  # OpenSSH uses the first obtained value. This file must sort before Ubuntu's
+  # 50-cloud-init.conf, which may otherwise keep password authentication on.
+  rm -f /etc/ssh/sshd_config.d/59-recovera-password-policy.conf
+  cat > /etc/ssh/sshd_config.d/49-recovera-password-policy.conf <<'EOF'
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+EOF
+  cat > /etc/ssh/sshd_config.d/92-recovera-backup-admin.conf <<'EOF'
+Match User backup-admin
+    PasswordAuthentication yes
+    KbdInteractiveAuthentication no
+EOF
+  sshd -t || return 1
+  systemctl reload ssh || return 1
+  log "backup-admin local appliance account is ready; retrieve it from Appliance Access or with: sudo recovera-backup-admin show"
+}
+
 ensure_recovera_device_id() {
   python3 - <<'PY'
 import hashlib
@@ -917,7 +971,11 @@ PY
 p77_recovera_branding() {
   [ -f "$INSTALL_DIR/branding/apply-branding.py" ] || { log "Recovera branding script is missing"; return 1; }
   [ -f "$INSTALL_DIR/branding/recovera-logo.png" ] || { log "Recovera logo is missing"; return 1; }
+  [ -f "$INSTALL_DIR/branding/recovera-ascii.logo" ] || { log "Recovera console logo is missing"; return 1; }
+  [ -f "$INSTALL_DIR/branding/recovera-motd" ] || { log "Recovera login banner is missing"; return 1; }
   [ -f "$INSTALL_DIR/branding/RecoveraTargetController.php" ] || { log "Recovera off-site target controller is missing"; return 1; }
+  [ -f "$INSTALL_DIR/branding/recovera-access.html.twig" ] || { log "Recovera appliance-access page is missing"; return 1; }
+  [ -f "$INSTALL_DIR/branding/RecoveraAccess.js" ] || { log "Recovera appliance-access script is missing"; return 1; }
   [ -f "$INSTALL_DIR/branding/RecoveraProtectSystem.js" ] || { log "Recovera protection-wizard bridge is missing"; return 1; }
   [ -f "$INSTALL_DIR/branding/RecoveraProtectStatus.js" ] || { log "Recovera native replication-status bridge is missing"; return 1; }
   [ -f "$INSTALL_DIR/branding/apply-peer-ui.py" ] || { log "Recovera native peer-control installer is missing"; return 1; }
@@ -927,8 +985,21 @@ p77_recovera_branding() {
   python3 "$INSTALL_DIR/branding/apply-branding.py" \
     "$INSTALL_DIR/branding/recovera-logo.png" || return 1
   python3 "$INSTALL_DIR/branding/apply-peer-ui.py" || return 1
+  install -d -m 0755 /usr/local/share/recovera || return 1
+  install -m 0644 "$INSTALL_DIR/branding/recovera-ascii.logo" \
+    /usr/local/share/recovera/recovera-ascii.logo || return 1
+  if [ -d /usr/lib/datto/statusshell/logo ]; then
+    rm -f /usr/lib/datto/statusshell/logo/*.logo || return 1
+    install -m 0644 "$INSTALL_DIR/branding/recovera-ascii.logo" \
+      /usr/lib/datto/statusshell/logo/0.logo || return 1
+  fi
+  if [ -e /etc/update-motd.d/25-datto ]; then
+    chmod a-x /etc/update-motd.d/25-datto || return 1
+  fi
+  install -m 0755 "$INSTALL_DIR/branding/recovera-motd" \
+    /etc/update-motd.d/25-recovera || return 1
   systemctl restart php8.1-fpm >/dev/null 2>&1 || return 1
-  log "Recovera branding installed"
+  log "Recovera WebUI, console, and login branding installed"
 }
 
 p78_peer_replication() {
@@ -1199,6 +1270,8 @@ verify() {
   check "no systemd ordering cycles this boot ($cyc)"      "[ $cyc -eq 0 ]"
   check "sshd active, config -> ${sshlink:-regular file}"  "systemctl is-active ssh"
   check "$LOGIN_USER in remote-users"                      "id -nG $LOGIN_USER | grep -qw remote-users"
+  check "backup-admin has persistent appliance access"     "id -nG backup-admin | grep -qw remote-users && id -nG backup-admin | grep -qw sudo && test -s /etc/recovera/backup-admin.json && test \"\$(stat -c %a /etc/recovera/backup-admin.json)\" = 600"
+  check "password SSH is enabled only for backup-admin"     "[ \"\$(sshd -T -C user=backup-admin,host=localhost,addr=127.0.0.1 | awk '/^passwordauthentication /{print \$2}')\" = yes ] && [ \"\$(sshd -T -C user=root,host=localhost,addr=127.0.0.1 | awk '/^passwordauthentication /{print \$2}')\" = no ]"
   check "snapctl works"                                    "snapctl --version"
   check "SpeedSync recognizes the local Recovera device"   "timeout 10 speedsync version"
   check "php8.1-fpm active (/run/php)"                     "systemctl is-active php8.1-fpm"
@@ -1270,11 +1343,13 @@ run_all() {
   phase p20 "dry run"                                         p20_dryrun
   phase p30 "SSH guard (remote-users) and cloud-init network" p30_prep
   phase p40 "install all packages at exact versions"          p40_install
+  phase p42 "remove stale source-appliance-only packages"      purge_pruned_packages
   phase p45 "spf-datto config files (apache, sudoers, audit, ...)" p45_conffiles
   phase p50 "boot config (FIPS off)"                          p50_boot
   phase p60 "remove snapd + cloud-init, restore snapctl"      p60_cleanup
   phase p70 "ZFS $ZFS_POOL"                                   p70_zfs
   phase p75 "libguestfs/KVM protection engine"                 p75_protection_engine
+  phase p76 "persistent backup administrator"                  p76_backup_admin
   phase p77 "Recovera application branding"                    p77_recovera_branding
   phase p78 "offline appliance-to-appliance replication"       p78_peer_replication
   phase p80 "NetworkManager bridge br0"                       p80_network
@@ -1334,7 +1409,7 @@ case "$MODE" in
     echo "offline registration finalizer repaired" ;;
   install-peer)
     [ "$(id -u)" -eq 0 ] || { echo "run with sudo"; exit 1; }
-    load_conf; validate_conf; p77_recovera_branding; p78_peer_replication
+    load_conf; validate_conf; p76_backup_admin; p77_recovera_branding; p78_peer_replication
     echo "peer replication service installed" ;;
   apply-branding)
     [ "$(id -u)" -eq 0 ] || { echo "run with sudo"; exit 1; }

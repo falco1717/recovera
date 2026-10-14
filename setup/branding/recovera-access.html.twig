@@ -1,0 +1,21 @@
+{% extends 'commonlookandfeel/Default/layout.main.html.twig' %}
+{% set title = 'Appliance Access' %}
+{% block scripts %}
+    <script src="{{ asset('commonlookandfeel/js/App/Configure/RecoveraAccess.js') }}"></script>
+{% endblock %}
+{% block content %}
+<div id="recovera-access" data-api="{{ path('recovera_target_api', {'operation':'status'})|replace({'status':''}) }}">
+    <div class="d-flex justify-content-between align-items-center mb-4">
+        <div><h2 class="mb-1">Appliance Access</h2><p class="text-secondary mb-0">Local credentials for SSH and console administration.</p></div>
+    </div>
+    <div id="ra-message" class="alert d-none" role="alert"></div>
+    <div class="card"><div class="card-body">
+        <h3>Backup administrator</h3>
+        <p>The password is generated once during installation and does not rotate automatically. Only signed-in appliance administrators can reveal it.</p>
+        <dl class="row mb-3"><dt class="col-sm-3">Username</dt><dd class="col-sm-9"><code>backup-admin</code></dd><dt class="col-sm-3">Password</dt><dd class="col-sm-9"><code id="ra-password">••••••••••••••••</code></dd></dl>
+        <button id="ra-reveal" class="btn btn-primary" type="button">Reveal password</button>
+        <button id="ra-copy" class="btn btn-secondary d-none" type="button">Copy password</button>
+        <p class="text-secondary mt-3 mb-0">You can also retrieve it locally with <code>sudo recovera-backup-admin show</code>.</p>
+    </div></div>
+</div>
+{% endblock %}

@@ -4,6 +4,7 @@ from pathlib import Path
 
 
 SCRIPT = Path(__file__).parents[1] / "setup" / "branding" / "apply-branding.py"
+ROOT = Path(__file__).parents[1]
 
 
 def load_module():
@@ -14,6 +15,17 @@ def load_module():
 
 
 class RecoveraBrandingTests(unittest.TestCase):
+    def test_console_and_login_branding_are_recovera_owned(self):
+        logo = (ROOT / "setup" / "branding" / "recovera-ascii.logo").read_text()
+        motd = (ROOT / "setup" / "branding" / "recovera-motd").read_text()
+        installer = (ROOT / "setup" / "setup.sh").read_text()
+
+        self.assertNotIn("Datto", logo)
+        self.assertIn("R E C O V E R A", motd)
+        self.assertIn("/usr/lib/datto/statusshell/logo/0.logo", installer)
+        self.assertIn("chmod a-x /etc/update-motd.d/25-datto", installer)
+        self.assertIn("/etc/update-motd.d/25-recovera", installer)
+
     def test_recovery_points_bridge_is_injected_once_after_native_view(self):
         branding = load_module()
         source = """{% block scripts %}
@@ -66,6 +78,17 @@ canOffsite: {{ canOffsite|json_encode|raw }}
         self.assertIn("RecoveraHome.js", patched)
         self.assertIn('id="recovera-offsite-servers"', patched)
         self.assertEqual(branding.patch_home_device_info(patched), patched)
+
+    def test_appliance_access_route_and_menu_are_idempotent(self):
+        branding = load_module()
+        routes = branding.add_routes("existing: true\n")
+        self.assertIn("path: /configure/appliance-access", routes)
+        self.assertEqual(branding.add_routes(routes), routes)
+
+        visibility = "{% set showConfigureOffsiteSync = feature.isSupported('FEATURE_OFFSITE') and is_granted('PERMISSION_OFFSITE_WRITE') %}"
+        visibility = branding.add_target_visibility(visibility)
+        self.assertIn("showRecoveraAccess", visibility)
+        self.assertEqual(branding.add_target_visibility(visibility), visibility)
 
 
 if __name__ == "__main__":

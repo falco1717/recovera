@@ -14,11 +14,17 @@ payload is private and must not be copied into the Git repository.
 
 4. Open a pull request to `main`, obtain review, and merge it without bypassing
    branch protection.
-5. Tag the merge commit (for example `v0.5.0`) and push the tag.
+5. Tag the merge commit (for example `v0.6.0`) and push the tag.
 6. Create a GitHub release for the tag and attach `SHA256SUMS`. The release notes
    must identify the pinned payload tag and link to the upgrade/rollback guide.
 7. On two clean Ubuntu 22.04 VMs, install from the tag, pair the appliances,
    replicate a recovery point, and run `setup.sh verify` on both systems.
+8. Build an unregistered appliance, run `sudo tools/prepare-ova.sh`, power it
+   off without rebooting it, and export the OVA. Import the exported OVA twice
+   and confirm the deployments have different TLS fingerprints, peer appliance
+   IDs, ZFS pool GUIDs, SSH host keys, and `backup-admin` passwords.
+9. Publish the OVA and its SHA-256 digest as release assets when the OVA fits
+   the release host's per-file limit. Never commit the binary image to Git.
 
 Consumers must verify the payload downloaded by `install.sh`; the script checks
 it against `BUNDLE_SHA256` before extraction. `SHA256SUMS` additionally protects
