@@ -4,6 +4,10 @@ The Recovera OVA contains a complete, unregistered Ubuntu 22.04 appliance. It
 is an alternative to running `install.sh` on an existing VM; both deployment
 paths produce the same application and offline registration workflow.
 
+The validated v0.6.0 image is `Recovera-v0.6.0-final.ova` (24,237,242,368
+bytes). Verify it with the digest in
+[`Recovera-v0.6.0-final.sha256`](Recovera-v0.6.0-final.sha256) before import.
+
 ## Import and register
 
 1. Import the OVA into vCenter or ESXi and choose the destination datastore and
