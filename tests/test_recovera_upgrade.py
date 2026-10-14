@@ -122,6 +122,8 @@ class RecoveraUpgradeTests(unittest.TestCase):
         self.assertIn('split -b "$PART_SIZE"', builder)
         self.assertIn("uncompressed_sha256", builder)
         self.assertIn('if [ -n "$SIGNING_KEY" ]', builder)
+        self.assertNotIn('mount --rbind "/$filesystem"', builder)
+        self.assertIn('mount -t sysfs sysfs "$mountpoint/sys"', builder)
 
     def test_configuration_migration_is_allowlisted(self):
         migration = (ROOT / "upgrade" / "recovera-migrate-config").read_text()

@@ -40,11 +40,17 @@ mountpoint=$work/root
 image=$work/recovera-$VERSION.img
 mounted=no
 cleanup() {
+  set +e
   if [ "$mounted" != no ]; then
-    for filesystem in sys proc dev; do umount -R "$mountpoint/$filesystem" 2>/dev/null || true; done
-    umount "$mountpoint" 2>/dev/null || true
+    sync
+    for filesystem in sys proc dev; do umount -l "$mountpoint/$filesystem" 2>/dev/null || true; done
+    umount -l "$mountpoint" 2>/dev/null || true
   fi
-  rm -rf "$work"
+  if mount | awk '{print $3}' | grep -Fxq "$mountpoint"; then
+    echo "refusing to remove build directory while its image is mounted: $work" >&2
+  else
+    rm -rf "$work"
+  fi
 }
 trap cleanup EXIT
 
@@ -98,10 +104,13 @@ fi
 jq -n --arg version "$VERSION" --argjson sequence "$SEQUENCE" \
   '{schema:1,version:$version,sequence:$sequence}' > "$mountpoint/etc/recovera-image-release"
 
-for filesystem in dev proc sys; do mount --rbind "/$filesystem" "$mountpoint/$filesystem"; done
+mount --bind /dev "$mountpoint/dev"
+mount -t proc proc "$mountpoint/proc"
+mount -t sysfs sysfs "$mountpoint/sys"
 chroot "$mountpoint" update-initramfs -u -k all
 chroot "$mountpoint" systemctl enable recovera-upgrade-validate.service >/dev/null
-for filesystem in sys proc dev; do umount -R "$mountpoint/$filesystem"; done
+sync
+for filesystem in sys proc dev; do umount "$mountpoint/$filesystem"; done
 [ -e "$mountpoint/boot/vmlinuz" ] && [ -e "$mountpoint/boot/initrd.img" ] || {
   echo "image has no /boot/vmlinuz and /boot/initrd.img symlinks" >&2; exit 1;
 }
