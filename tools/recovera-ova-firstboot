@@ -27,6 +27,18 @@ fi
 # Every deployment receives a new administrative password and a new peer
 # identity. No credential, pairing, or source/target relationship is cloned.
 /usr/local/sbin/recovera-backup-admin install
+
+# Regenerate the browser certificate before peer initialization.  The peer
+# initializer publishes this certificate's fingerprint and fails when the
+# sanitized image's certificate has not yet been replaced.
+install -d -m 0755 /etc/apache2/ssl
+rm -f /etc/apache2/ssl/www.key /etc/apache2/ssl/www.crt
+openssl req -x509 -nodes -newkey rsa:3072 -sha256 -days 825 \
+  -subj '/CN=recovera' -addext 'subjectAltName=DNS:recovera' \
+  -keyout /etc/apache2/ssl/www.key -out /etc/apache2/ssl/www.crt >/dev/null 2>&1
+chmod 0600 /etc/apache2/ssl/www.key
+chmod 0644 /etc/apache2/ssl/www.crt
+
 rm -rf /etc/recovera-peer /var/lib/recovera-peer
 install -d -m 0700 /etc/recovera-peer
 install -d -o recovera-repl -g recovera-repl -m 0700 /var/lib/recovera-peer
@@ -52,17 +64,13 @@ temporary.chmod(0o644)
 os.replace(temporary, device_id)
 PY
 
-# Regenerate the browser certificate instead of shipping the builder's key.
-install -d -m 0755 /etc/apache2/ssl
-rm -f /etc/apache2/ssl/www.key /etc/apache2/ssl/www.crt
-openssl req -x509 -nodes -newkey rsa:3072 -sha256 -days 825 \
-  -subj '/CN=recovera' -addext 'subjectAltName=DNS:recovera' \
-  -keyout /etc/apache2/ssl/www.key -out /etc/apache2/ssl/www.crt >/dev/null 2>&1
-chmod 0600 /etc/apache2/ssl/www.key
-chmod 0644 /etc/apache2/ssl/www.crt
-
-# ZFS identifies the imported pool and host independently on every deployment.
+# ZFS services run after this pre-network identity unit. Import the local data
+# pool without mounting it so the clone can receive a new pool GUID now; the
+# normal ZFS mount service will mount its datasets later in the boot.
 zgenhostid -f
+if ! zpool list -H homePool >/dev/null 2>&1; then
+  zpool import -N -f homePool
+fi
 zpool reguid homePool
 
 install -d -m 0755 "$(dirname "$MARKER")"

@@ -11,6 +11,8 @@
   ZFS, device, replication, and administrative identity.
 - Made OVA first-boot initialization independent of early-boot D-Bus services
   and forced every prepared image to re-arm the one-time initializer.
+- Made clean-clone first boot create TLS before peer initialization and import
+  the local ZFS pool before assigning its clone-specific GUID.
 - Replaced the vendor ASCII artwork on the local VM console and SSH login
   banner with consistent Recovera branding.
 - Made the global SSH password denial take precedence over Ubuntu cloud-init

@@ -38,6 +38,20 @@ class RecoveraOvaTests(unittest.TestCase):
         self.assertIn("printf 'recovera\\n' > /etc/hostname", script)
         self.assertIn("hostname recovera", script)
 
+    def test_first_boot_creates_tls_certificate_before_peer_identity(self):
+        script = (ROOT / "tools" / "recovera-ova-firstboot").read_text()
+        self.assertLess(
+            script.index("openssl req -x509"),
+            script.index("/usr/local/sbin/recovera-peer init"),
+        )
+
+    def test_first_boot_imports_data_pool_before_assigning_clone_guid(self):
+        script = (ROOT / "tools" / "recovera-ova-firstboot").read_text()
+        self.assertLess(
+            script.index("zpool import -N -f homePool"),
+            script.index("zpool reguid homePool"),
+        )
+
     def test_preparation_always_rearms_first_boot(self):
         script = (ROOT / "tools" / "prepare-ova.sh").read_text()
         self.assertIn("rm -f /var/lib/recovera-ova/first-boot-complete", script)
