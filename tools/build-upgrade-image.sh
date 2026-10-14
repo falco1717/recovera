@@ -10,9 +10,10 @@ CHANNEL=stable
 OUTPUT=
 SIGNING_KEY=
 PART_SIZE=1900M
+COMPRESSION_LEVEL=6
 
 usage() {
-  echo "usage: sudo $0 --root DIR --version VERSION --sequence N --output DIR [--signing-key FILE] [--channel NAME]" >&2
+  echo "usage: sudo $0 --root DIR --version VERSION --sequence N --output DIR [--signing-key FILE] [--channel NAME] [--compression-level 0-9]" >&2
 }
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -22,6 +23,7 @@ while [ "$#" -gt 0 ]; do
     --channel) CHANNEL=$2; shift 2;;
     --output) OUTPUT=$2; shift 2;;
     --signing-key) SIGNING_KEY=$2; shift 2;;
+    --compression-level) COMPRESSION_LEVEL=$2; shift 2;;
     *) usage; exit 2;;
   esac
 done
@@ -30,6 +32,7 @@ done
   [ -n "$OUTPUT" ] || { usage; exit 2; }
 [ -z "$SIGNING_KEY" ] || [ -f "$SIGNING_KEY" ] || { echo "signing key not found: $SIGNING_KEY" >&2; exit 2; }
 [[ "$VERSION" =~ ^[0-9A-Za-z][0-9A-Za-z._-]{0,63}$ ]] || { echo "invalid version" >&2; exit 2; }
+[[ "$COMPRESSION_LEVEL" =~ ^[0-9]$ ]] || { echo "compression level must be 0 through 9" >&2; exit 2; }
 for command in rsync mkfs.ext4 e2fsck resize2fs xz split ssh-keygen jq; do
   command -v "$command" >/dev/null || { echo "missing command: $command" >&2; exit 1; }
 done
@@ -121,7 +124,7 @@ resize2fs -M "$image"
 truncate -s "$(dumpe2fs -h "$image" 2>/dev/null | awk '/Block count:/{c=$3}/Block size:/{s=$3}END{print c*s}')" "$image"
 
 compressed=$OUTPUT/recovera-$VERSION.img.xz
-xz -T0 -9 -c "$image" > "$compressed"
+xz -T0 "-$COMPRESSION_LEVEL" -c "$image" > "$compressed"
 rm -f "$OUTPUT"/recovera-$VERSION.img.xz.part-*
 split -b "$PART_SIZE" -d -a 3 "$compressed" "$OUTPUT/recovera-$VERSION.img.xz.part-"
 

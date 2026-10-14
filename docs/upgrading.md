@@ -82,6 +82,12 @@ sudo tools/build-upgrade-image.sh \
   --signing-key /secure/recovera-upgrade-signing-key
 ```
 
+The builder defaults to XZ level 6. A validation build may use
+`--compression-level 1` to shorten the build without changing the signed
+manifest, hash-verification, staging, or boot workflow; production releases
+should retain the default unless storage and build-time measurements justify a
+different level.
+
 The signing key is optional during the image-build step. Omitting
 `--signing-key` produces the image parts and manifest without a signature so a
 build appliance never needs access to the release private key. Copy only the
