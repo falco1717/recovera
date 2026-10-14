@@ -1,0 +1,9 @@
+#!/bin/sh
+# Carry the already-mounted image host into the real root as /host.
+set -e
+PREREQ=""
+prereqs() { echo "$PREREQ"; }
+[ "${1:-}" != prereqs ] || { prereqs; exit 0; }
+[ -d /run/recovera-host ] || exit 0
+mkdir -p "${rootmnt}/host"
+mount --move /run/recovera-host "${rootmnt}/host"

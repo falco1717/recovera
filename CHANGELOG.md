@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+- Added a signed, image-based appliance upgrade client with GitHub Release
+  channels, split image assets, layered SHA-256 verification, monotonic
+  downgrade protection, one-time GRUB candidate boots, health validation, and
+  automatic fallback.
+- Added root-image build/sign/publish tooling while leaving the stable channel
+  dormant until the final OVA supplies the required image-host layout.
+
 ## v0.6.0 - 2026-10-13
 
 - Added a persistent local `backup-admin` account whose high-entropy password

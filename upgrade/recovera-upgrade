@@ -1,0 +1,513 @@
+#!/usr/bin/env python3
+"""Signed, image-based upgrade client for Recovera appliances."""
+
+import argparse
+import base64
+import hashlib
+import json
+import os
+from pathlib import Path
+import platform
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import urllib.error
+import urllib.request
+import urllib.parse
+
+UPDATER_VERSION = 1
+DEFAULT_CONFIG = Path("/etc/recovera/upgrade.conf")
+DEFAULT_SIGNERS = Path("/usr/local/share/recovera-upgrade/release-signers")
+DEFAULT_STATE = Path("/host/recovera/state.json")
+DEFAULT_LAYOUT = Path("/etc/recovera/image-layout.json")
+DEFAULT_RELEASE = Path("/etc/recovera-image-release")
+BOOT_HELPER = Path("/usr/local/lib/recovera-upgrade/recovera-image-boot")
+MIGRATION_HELPER = Path("/usr/local/lib/recovera-upgrade/recovera-migrate-config")
+PENDING_MARKER = Path("/host/recovera/pending")
+
+
+class UpgradeError(RuntimeError):
+    pass
+
+
+class NoReleaseError(UpgradeError):
+    pass
+
+
+def run(args, *, check=True, input_bytes=None, capture=False):
+    return subprocess.run(
+        [str(value) for value in args], check=check, input=input_bytes,
+        stdout=subprocess.PIPE if capture else None,
+        stderr=subprocess.PIPE if capture else None,
+    )
+
+
+def sha256(path):
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def atomic_json(path, value, mode=0o600):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(path.name + ".tmp")
+    temporary.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n")
+    temporary.chmod(mode)
+    os.replace(temporary, path)
+
+
+def read_json(path, default=None):
+    try:
+        return json.loads(Path(path).read_text())
+    except FileNotFoundError:
+        return {} if default is None else default
+    except json.JSONDecodeError as exc:
+        raise UpgradeError(f"invalid JSON in {path}: {exc}") from exc
+
+
+def read_config(path):
+    config = {}
+    for raw in Path(path).read_text().splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" not in line:
+            raise UpgradeError(f"invalid configuration line: {raw}")
+        key, value = line.split("=", 1)
+        config[key.strip()] = value.strip()
+    for required in ("REPOSITORY", "CHANNEL", "CHANNEL_BRANCH", "HOST_ROOT"):
+        if not config.get(required):
+            raise UpgradeError(f"missing {required} in {path}")
+    return config
+
+
+def token(config):
+    value = os.environ.get("RECOVERA_GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
+    token_file = Path(config.get("TOKEN_FILE", "/etc/recovera/github-token"))
+    if not value and token_file.exists():
+        if token_file.stat().st_mode & 0o077:
+            raise UpgradeError(f"GitHub token file must have mode 0600: {token_file}")
+        value = token_file.read_text().strip()
+    return value
+
+
+class SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Never forward a GitHub API bearer token to an asset-storage host."""
+
+    def redirect_request(self, request_value, fp, code, message, headers, new_url):
+        redirected = super().redirect_request(request_value, fp, code, message, headers, new_url)
+        old_host = urllib.parse.urlsplit(request_value.full_url).hostname
+        new_host = urllib.parse.urlsplit(new_url).hostname
+        if redirected is not None and old_host != new_host:
+            redirected.remove_header("Authorization")
+        return redirected
+
+
+def request(url, config, *, accept="application/vnd.github+json"):
+    headers = {
+        "Accept": accept,
+        "User-Agent": f"recovera-upgrade/{UPDATER_VERSION}",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    credential = token(config)
+    if credential:
+        headers["Authorization"] = f"Bearer {credential}"
+    try:
+        opener = urllib.request.build_opener(SafeRedirectHandler())
+        return opener.open(urllib.request.Request(url, headers=headers), timeout=60)
+    except urllib.error.HTTPError as exc:
+        detail = exc.read(512).decode("utf-8", "replace")
+        raise UpgradeError(f"GitHub request failed ({exc.code}): {detail}") from exc
+    except urllib.error.URLError as exc:
+        raise UpgradeError(f"GitHub is unreachable: {exc.reason}") from exc
+
+
+def github_json(path, config):
+    with request("https://api.github.com" + path, config) as response:
+        return json.load(response)
+
+
+def download(url, target, config, *, api_asset=False):
+    accept = "application/octet-stream" if api_asset else "application/vnd.github+json"
+    target = Path(target)
+    temporary = target.with_name(target.name + ".partial")
+    with request(url, config, accept=accept) as response, temporary.open("wb") as output:
+        shutil.copyfileobj(response, output, 1024 * 1024)
+    os.replace(temporary, target)
+
+
+def fetch_channel(config, local_channel=None):
+    if local_channel:
+        pointer = read_json(local_channel)
+    else:
+        repo = config["REPOSITORY"]
+        channel = config["CHANNEL"]
+        branch = config["CHANNEL_BRANCH"]
+        path = f"/repos/{repo}/contents/upgrade/channels/{channel}.json?ref={branch}"
+        result = github_json(path, config)
+        try:
+            pointer = json.loads(base64.b64decode(result["content"]))
+        except (KeyError, ValueError, json.JSONDecodeError) as exc:
+            raise UpgradeError("invalid GitHub channel response") from exc
+    if pointer.get("schema") != 1 or pointer.get("channel") != config["CHANNEL"]:
+        raise UpgradeError("channel pointer has an unsupported schema or channel")
+    if not pointer.get("release_tag"):
+        raise NoReleaseError(f"the {config['CHANNEL']} channel has no published image")
+    if not re.fullmatch(r"[0-9A-Za-z][0-9A-Za-z._-]{0,127}", str(pointer["release_tag"])):
+        raise UpgradeError("channel pointer contains an invalid release tag")
+    return pointer
+
+
+def release_assets(pointer, config, source_dir=None):
+    if source_dir:
+        root = Path(source_dir)
+        return {item.name: item for item in root.iterdir() if item.is_file()}
+    repo = config["REPOSITORY"]
+    tag = pointer["release_tag"]
+    release = github_json(f"/repos/{repo}/releases/tags/{urllib.parse.quote(tag, safe='')}", config)
+    return {asset["name"]: asset["url"] for asset in release.get("assets", [])}
+
+
+def obtain_asset(name, assets, target, config):
+    if name not in assets:
+        raise UpgradeError(f"release asset is missing: {name}")
+    source = assets[name]
+    if isinstance(source, Path):
+        shutil.copyfile(source, target)
+    else:
+        download(source, target, config, api_asset=True)
+
+
+def verify_signature(manifest_path, signature_path, signers):
+    command = [
+        "ssh-keygen", "-Y", "verify", "-f", str(signers),
+        "-I", "recovera-release", "-n", "recovera-upgrade",
+        "-s", str(signature_path),
+    ]
+    result = run(command, check=False, input_bytes=Path(manifest_path).read_bytes(), capture=True)
+    if result.returncode:
+        raise UpgradeError("release manifest signature verification failed")
+
+
+def validate_manifest(manifest, pointer, config):
+    required = ("schema", "sequence", "version", "channel", "architecture", "image")
+    if any(key not in manifest for key in required) or manifest["schema"] != 1:
+        raise UpgradeError("unsupported or incomplete release manifest")
+    if manifest["channel"] != config["CHANNEL"]:
+        raise UpgradeError("release manifest channel does not match appliance channel")
+    if not re.fullmatch(r"[0-9A-Za-z][0-9A-Za-z._-]{0,63}", str(manifest["version"])):
+        raise UpgradeError("release manifest contains an invalid version")
+    try:
+        sequence = int(manifest["sequence"])
+    except (TypeError, ValueError) as exc:
+        raise UpgradeError("release manifest contains an invalid sequence") from exc
+    if sequence < 1:
+        raise UpgradeError("release sequence must be positive")
+    if manifest["architecture"] != platform.machine() and not (
+        manifest["architecture"] == "amd64" and platform.machine() == "x86_64"
+    ):
+        raise UpgradeError("release image architecture does not match this appliance")
+    if int(manifest.get("minimum_updater", 1)) > UPDATER_VERSION:
+        raise UpgradeError("this release requires a newer Recovera updater")
+    try:
+        pointer_sequence = int(pointer.get("sequence", -1))
+    except (TypeError, ValueError) as exc:
+        raise UpgradeError("channel pointer contains an invalid sequence") from exc
+    if pointer.get("version") != manifest["version"] or pointer_sequence != sequence:
+        raise UpgradeError("signed manifest does not match the channel pointer")
+    image = manifest["image"]
+    if image.get("compression") != "xz" or not image.get("parts"):
+        raise UpgradeError("unsupported image encoding")
+    for part in image["parts"]:
+        if set(part) != {"name", "size", "sha256"} or Path(part["name"]).name != part["name"]:
+            raise UpgradeError("invalid image part metadata")
+        if int(part["size"]) < 1 or not re.fullmatch(r"[0-9a-f]{64}", str(part["sha256"])):
+            raise UpgradeError("invalid image part size or digest")
+    for field in ("sha256", "uncompressed_sha256"):
+        if not re.fullmatch(r"[0-9a-f]{64}", str(image.get(field, ""))):
+            raise UpgradeError(f"invalid image {field}")
+    if int(image.get("size", 0)) < 1 or int(image.get("uncompressed_size", 0)) < 1:
+        raise UpgradeError("invalid image size")
+    return manifest
+
+
+def current_release():
+    return read_json(os.environ.get("RECOVERA_RELEASE_FILE", DEFAULT_RELEASE), {})
+
+
+def state_path():
+    return Path(os.environ.get("RECOVERA_UPGRADE_STATE", DEFAULT_STATE))
+
+
+def layout_path():
+    return Path(os.environ.get("RECOVERA_IMAGE_LAYOUT", DEFAULT_LAYOUT))
+
+
+def get_release(config, args, directory):
+    pointer = fetch_channel(config, args.channel_file)
+    assets = release_assets(pointer, config, args.source_dir)
+    manifest_name = pointer.get("manifest_asset") or "recovera-image-manifest.json"
+    signature_name = pointer.get("signature_asset") or manifest_name + ".sig"
+    for name in (manifest_name, signature_name):
+        if Path(name).name != name or not re.fullmatch(r"[0-9A-Za-z][0-9A-Za-z._-]{0,127}", name):
+            raise UpgradeError("channel pointer contains an invalid asset name")
+    manifest_path = directory / manifest_name
+    signature_path = directory / signature_name
+    obtain_asset(manifest_name, assets, manifest_path, config)
+    obtain_asset(signature_name, assets, signature_path, config)
+    verify_signature(manifest_path, signature_path, args.signers)
+    manifest = validate_manifest(read_json(manifest_path), pointer, config)
+    return pointer, assets, manifest, manifest_path, signature_path
+
+
+def ensure_newer(manifest):
+    current = current_release()
+    state = read_json(state_path(), {})
+    installed_sequence = max(int(current.get("sequence", 0)), int(state.get("installed_sequence", 0)))
+    if int(manifest["sequence"]) < installed_sequence:
+        raise UpgradeError("refusing a signed release older than the installed sequence")
+    if int(manifest["sequence"]) == installed_sequence or current.get("version") == manifest["version"]:
+        raise UpgradeError("this release is already installed")
+
+
+def command_check(config, args):
+    current = current_release()
+    try:
+        with tempfile.TemporaryDirectory(prefix="recovera-upgrade-check-") as temporary:
+            _, _, manifest, _, _ = get_release(config, args, Path(temporary))
+    except NoReleaseError:
+        result = {
+            "available": False,
+            "channel": config["CHANNEL"],
+            "current_version": current.get("version"),
+            "version": None,
+            "sequence": None,
+        }
+        if args.cache:
+            cached = read_json(state_path(), {})
+            cached["available"] = result
+            atomic_json(state_path(), cached)
+        print(json.dumps(result, indent=2, sort_keys=True))
+        return 0
+    available = int(manifest["sequence"]) > int(current.get("sequence", 0))
+    result = {
+        "available": available,
+        "channel": manifest["channel"],
+        "current_version": current.get("version"),
+        "version": manifest["version"],
+        "sequence": manifest["sequence"],
+    }
+    if args.cache:
+        cached = read_json(state_path(), {})
+        cached["available"] = result
+        atomic_json(state_path(), cached)
+    print(json.dumps(result, indent=2, sort_keys=True))
+    return 0 if available else 3
+
+
+def require_root():
+    if os.geteuid() != 0:
+        raise UpgradeError("this command must run as root")
+
+
+def require_layout(config):
+    layout = read_json(layout_path(), {})
+    if layout.get("schema") != 1 or layout.get("mode") != "loop-image-v1":
+        raise UpgradeError(
+            "this appliance has not been prepared for Recovera image boot; "
+            "activation is intentionally disabled until the final OVA provides that layout"
+        )
+    host = Path(config["HOST_ROOT"])
+    if not host.is_mount():
+        raise UpgradeError(f"image host filesystem is not mounted: {host}")
+    if not BOOT_HELPER.is_file():
+        raise UpgradeError("Recovera image boot helper is missing")
+    return layout
+
+
+def assemble_image(config, manifest, assets, work):
+    image = manifest["image"]
+    compressed = work / "recovera-image.img.xz"
+    with compressed.open("wb") as combined:
+        for part in image["parts"]:
+            local = work / part["name"]
+            obtain_asset(part["name"], assets, local, config)
+            if local.stat().st_size != int(part["size"]) or sha256(local) != part["sha256"]:
+                raise UpgradeError(f"image part verification failed: {part['name']}")
+            with local.open("rb") as source:
+                shutil.copyfileobj(source, combined, 1024 * 1024)
+    if compressed.stat().st_size != int(image["size"]) or sha256(compressed) != image["sha256"]:
+        raise UpgradeError("combined compressed image verification failed")
+    return compressed
+
+
+def inspect_image(image_path, manifest):
+    if Path(image_path).stat().st_size != int(manifest["image"]["uncompressed_size"]):
+        raise UpgradeError("uncompressed image size does not match manifest")
+    if sha256(image_path) != manifest["image"]["uncompressed_sha256"]:
+        raise UpgradeError("uncompressed image digest does not match manifest")
+    result = run(["e2fsck", "-fn", str(image_path)], check=False)
+    if result.returncode != 0:
+        raise UpgradeError(f"image filesystem check failed with status {result.returncode}")
+    with tempfile.TemporaryDirectory(prefix="recovera-image-mount-") as mount:
+        run(["mount", "-o", "loop,ro", str(image_path), mount])
+        try:
+            embedded = read_json(Path(mount) / "etc/recovera-image-release")
+            if embedded.get("version") != manifest["version"] or int(embedded.get("sequence", -1)) != int(manifest["sequence"]):
+                raise UpgradeError("release identity inside the image does not match its manifest")
+            for required in ("boot/vmlinuz", "boot/initrd.img", "usr/local/sbin/recovera-upgrade"):
+                if not (Path(mount) / required).exists():
+                    raise UpgradeError(f"image is missing required file: /{required}")
+        finally:
+            run(["umount", mount], check=False)
+
+
+def migrate_appliance_config(image_path):
+    if not MIGRATION_HELPER.is_file():
+        raise UpgradeError("Recovera configuration migration helper is missing")
+    with tempfile.TemporaryDirectory(prefix="recovera-image-config-") as mount:
+        run(["mount", "-o", "loop,rw", str(image_path), mount])
+        try:
+            run([MIGRATION_HELPER, mount])
+        finally:
+            run(["umount", mount], check=False)
+    if run(["e2fsck", "-fn", str(image_path)], check=False).returncode != 0:
+        raise UpgradeError("candidate filesystem is inconsistent after configuration migration")
+
+
+def command_install(config, args):
+    require_root()
+    require_layout(config)
+    host = Path(config["HOST_ROOT"])
+    images = host / "recovera/images"
+    downloads = host / "recovera/downloads"
+    images.mkdir(parents=True, exist_ok=True)
+    downloads.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="release-", dir=downloads) as temporary:
+        work = Path(temporary)
+        pointer, assets, manifest, manifest_path, signature_path = get_release(config, args, work)
+        ensure_newer(manifest)
+        compressed = assemble_image(config, manifest, assets, work)
+        filename = f"{manifest['version']}.img"
+        target = images / filename
+        pending = images / (filename + ".pending")
+        with pending.open("wb") as output:
+            process = subprocess.Popen(["xz", "-d", "-c", str(compressed)], stdout=output)
+            if process.wait() != 0:
+                raise UpgradeError("xz image decompression failed")
+        inspect_image(pending, manifest)
+        migrate_appliance_config(pending)
+        os.replace(pending, target)
+        shutil.copyfile(manifest_path, images / f"{manifest['version']}.manifest.json")
+        shutil.copyfile(signature_path, images / f"{manifest['version']}.manifest.sig")
+        current = current_release()
+        state = read_json(state_path(), {})
+        state.update({
+            "pending": {"version": manifest["version"], "sequence": manifest["sequence"], "image": str(target)},
+            "previous": current,
+            "release_tag": pointer["release_tag"],
+        })
+        atomic_json(state_path(), state)
+        PENDING_MARKER.touch(mode=0o600, exist_ok=True)
+        try:
+            run([BOOT_HELPER, "stage", manifest["version"], target])
+        except subprocess.SubprocessError:
+            PENDING_MARKER.unlink(missing_ok=True)
+            state["pending"] = None
+            atomic_json(state_path(), state)
+            raise
+    print(f"Recovera {manifest['version']} is verified and staged for one-time boot.")
+    if args.reboot:
+        run(["systemctl", "reboot"])
+    else:
+        print("Reboot when ready: sudo systemctl reboot")
+
+
+def command_mark_success(config, args):
+    require_root()
+    state = read_json(state_path(), {})
+    pending = state.get("pending")
+    current = current_release()
+    if not pending or pending.get("version") != current.get("version"):
+        raise UpgradeError("the running image is not the pending upgrade")
+    for service in config.get("REQUIRED_SERVICES", "").split():
+        if run(["systemctl", "is-active", "--quiet", service], check=False).returncode:
+            raise UpgradeError(f"required service is not active: {service}")
+    run([BOOT_HELPER, "commit", current["version"], pending["image"]])
+    state["installed_sequence"] = int(current["sequence"])
+    state["installed"] = current
+    state["pending"] = None
+    atomic_json(state_path(), state)
+    PENDING_MARKER.unlink(missing_ok=True)
+    print(f"Recovera {current['version']} passed validation and is now the default image.")
+
+
+def command_validation_failed(config, args):
+    require_root()
+    state = read_json(state_path(), {})
+    previous = state.get("previous", {})
+    if not previous.get("version"):
+        raise UpgradeError("no previous image is recorded")
+    run([BOOT_HELPER, "rollback", previous["version"]])
+    state["last_failure"] = {"version": current_release().get("version"), "reason": args.reason}
+    atomic_json(state_path(), state)
+    PENDING_MARKER.unlink(missing_ok=True)
+    if args.reboot:
+        run(["systemctl", "reboot"])
+
+
+def command_status(config, args):
+    value = {
+        "updater_version": UPDATER_VERSION,
+        "current": current_release(),
+        "state": read_json(state_path(), {}),
+        "image_layout": read_json(layout_path(), None),
+        "activation_supported": layout_path().exists() and BOOT_HELPER.exists(),
+    }
+    print(json.dumps(value, indent=2, sort_keys=True))
+
+
+def parser():
+    value = argparse.ArgumentParser(prog="recovera-upgrade")
+    value.add_argument("--config", type=Path, default=Path(os.environ.get("RECOVERA_UPGRADE_CONFIG", DEFAULT_CONFIG)))
+    value.add_argument("--signers", type=Path, default=Path(os.environ.get("RECOVERA_UPGRADE_SIGNERS", DEFAULT_SIGNERS)))
+    sub = value.add_subparsers(dest="command", required=True)
+    for name in ("check", "install"):
+        command = sub.add_parser(name)
+        command.add_argument("--channel-file", type=Path)
+        command.add_argument("--source-dir", type=Path)
+        if name == "check":
+            command.add_argument("--cache", action="store_true")
+        else:
+            command.add_argument("--reboot", action="store_true")
+    sub.add_parser("status")
+    sub.add_parser("mark-success")
+    failed = sub.add_parser("validation-failed")
+    failed.add_argument("--reason", default="post-boot validation failed")
+    failed.add_argument("--reboot", action="store_true")
+    return value
+
+
+def main():
+    args = parser().parse_args()
+    try:
+        config = read_config(args.config)
+        return {
+            "check": command_check,
+            "install": command_install,
+            "status": command_status,
+            "mark-success": command_mark_success,
+            "validation-failed": command_validation_failed,
+        }[args.command](config, args) or 0
+    except (UpgradeError, FileNotFoundError, ValueError, subprocess.SubprocessError) as exc:
+        print(f"recovera-upgrade: {exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,8 @@
+#!/bin/sh
+set -e
+PREREQ=""
+prereqs() { echo "$PREREQ"; }
+[ "${1:-}" != prereqs ] || { prereqs; exit 0; }
+. /usr/share/initramfs-tools/hook-functions
+copy_exec /sbin/losetup
+copy_exec /sbin/blkid

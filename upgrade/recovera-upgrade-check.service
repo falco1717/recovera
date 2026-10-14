@@ -1,0 +1,13 @@
+[Unit]
+Description=Check for a signed Recovera image update
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=/etc/recovera/upgrade.conf
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/recovera-upgrade check --cache
+SuccessExitStatus=3
+PrivateTmp=yes
+ProtectSystem=strict
+ReadWritePaths=-/host/recovera

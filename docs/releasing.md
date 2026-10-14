@@ -26,6 +26,24 @@ payload is private and must not be copied into the Git repository.
 9. Publish the OVA and its SHA-256 digest as release assets when the OVA fits
    the release host's per-file limit. Never commit the binary image to Git.
 
+## Appliance image release
+
+Image updates are a separate release artifact from the installation payload and
+OVA. Follow [Image upgrades and rollback](upgrading.md), then:
+
+1. Increment both the human version and the monotonic image sequence.
+2. Build from a clean root tree and keep all appliance identity, protected
+   systems, recovery points, peer credentials, TLS keys, and GitHub tokens out
+   of the image.
+3. Verify the manifest signature and every digest on a second machine.
+4. Boot the image as a one-time candidate on two disposable appliances.
+5. Test successful commit and forced validation failure/automatic rollback.
+6. Publish immutable split assets under `image-v<version>`.
+7. Merge the reviewed channel pointer only after those tests pass.
+
+The signing private key must never be copied into the repository, release
+assets, installation payload, root image, or OVA.
+
 Consumers must verify the payload downloaded by `install.sh`; the script checks
 it against `BUNDLE_SHA256` before extraction. `SHA256SUMS` additionally protects
 the bootstrap script and release metadata copied outside Git.

@@ -132,6 +132,8 @@ rm -rf "$payload/peer"
 cp -a "$ROOT/setup/peer" "$payload/peer"
 rm -rf "$payload/branding"
 cp -a "$ROOT/setup/branding" "$payload/branding"
+rm -rf "$payload/upgrade"
+cp -a "$ROOT/upgrade" "$payload/upgrade"
 
 echo "starting Recovera setup on $(hostname) ..."
 "$payload/setup.sh" "$MODE"

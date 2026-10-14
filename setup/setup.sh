@@ -192,6 +192,7 @@ stage_bundle() {   # copy the bundle to /opt/spf-datto so nothing depends on /ho
   [ -d "$BUNDLE/wheels" ] || die "missing wheels/ in bundle: $BUNDLE"
   [ -d "$BUNDLE/branding" ] || die "missing branding/ in bundle: $BUNDLE"
   [ -d "$BUNDLE/peer" ] || die "missing peer/ in bundle: $BUNDLE"
+  [ -d "$BUNDLE/upgrade" ] || die "missing upgrade/ in bundle: $BUNDLE"
   need_kb=$(( $(du -sk "$BUNDLE" | cut -f1) + 6*1024*1024 ))   # bundle + ~6 GB for the install itself
   free_kb=$(df -Pk / | awk 'NR==2{print $4}')
   [ "$free_kb" -ge "$need_kb" ] || { echo "not enough space on /: need ~$((need_kb/1024/1024)) GB, have $((free_kb/1024/1024)) GB"; exit 1; }
@@ -203,6 +204,7 @@ stage_bundle() {   # copy the bundle to /opt/spf-datto so nothing depends on /ho
   rm -rf "$INSTALL_DIR/lists"; cp -a "$BUNDLE/lists" "$INSTALL_DIR/"
   rm -rf "$INSTALL_DIR/branding"; cp -a "$BUNDLE/branding" "$INSTALL_DIR/"
   rm -rf "$INSTALL_DIR/peer"; cp -a "$BUNDLE/peer" "$INSTALL_DIR/"
+  rm -rf "$INSTALL_DIR/upgrade"; cp -a "$BUNDLE/upgrade" "$INSTALL_DIR/"
   if [ -d "$BUNDLE/conffiles" ]; then rm -rf "$INSTALL_DIR/conffiles"; cp -a "$BUNDLE/conffiles" "$INSTALL_DIR/"; fi
   if [ ! -f "$INSTALL_DIR/debs/.verified" ]; then
     rm -rf "$INSTALL_DIR/debs"; cp -a "$BUNDLE/debs" "$INSTALL_DIR/"
@@ -1106,6 +1108,42 @@ PY
   log "Recovera pairing is available through HTTPS 443; replication uses restricted SSH and the internal API uses a Unix socket"
 }
 
+p79_image_updater() {
+  local source="$INSTALL_DIR/upgrade"
+  [ -x "$source/recovera-upgrade" ] || { log "Recovera image updater is missing"; return 1; }
+  [ -f "$source/keys/recovera-release-signers" ] || { log "Recovera release signer list is missing"; return 1; }
+  install -d -m 0755 /etc/recovera /usr/local/lib/recovera-upgrade \
+    /usr/local/share/recovera-upgrade /host/recovera || return 1
+  install -m 0755 "$source/recovera-upgrade" /usr/local/sbin/recovera-upgrade || return 1
+  install -m 0755 "$source/recovera-image-boot" \
+    /usr/local/lib/recovera-upgrade/recovera-image-boot || return 1
+  install -m 0755 "$source/recovera-migrate-config" \
+    /usr/local/lib/recovera-upgrade/recovera-migrate-config || return 1
+  install -m 0644 "$source/keys/recovera-release-signers" \
+    /usr/local/share/recovera-upgrade/release-signers || return 1
+  if [ ! -f /etc/recovera/upgrade.conf ]; then
+    install -m 0600 "$source/recovera-upgrade.conf" /etc/recovera/upgrade.conf || return 1
+  fi
+  install -m 0644 "$source/recovera-upgrade-check.service" \
+    /etc/systemd/system/recovera-upgrade-check.service || return 1
+  install -m 0644 "$source/recovera-upgrade-check.timer" \
+    /etc/systemd/system/recovera-upgrade-check.timer || return 1
+  install -m 0644 "$source/recovera-upgrade-validate.service" \
+    /etc/systemd/system/recovera-upgrade-validate.service || return 1
+  if [ -f /etc/recovera/image-layout.json ]; then
+    install -m 0755 "$source/07_recovera_images" /etc/grub.d/07_recovera_images || return 1
+    install -m 0644 "$source/99_recovera_images.cfg" /etc/default/grub.d/99_recovera_images.cfg || return 1
+    install -m 0755 "$source/initramfs-hook-recovera" /etc/initramfs-tools/hooks/recovera-image || return 1
+    install -m 0755 "$source/initramfs-local-top-recovera" /etc/initramfs-tools/scripts/local-top/recovera-image || return 1
+    install -m 0755 "$source/initramfs-local-bottom-recovera" /etc/initramfs-tools/scripts/local-bottom/recovera-image || return 1
+    update-initramfs -u || return 1
+    update-grub || return 1
+  fi
+  systemctl daemon-reload || return 1
+  systemctl enable recovera-upgrade-check.timer recovera-upgrade-validate.service >/dev/null || return 1
+  log "signed Recovera image updater installed; image activation remains disabled until an image-layout marker is provisioned"
+}
+
 net_revert() {
   rm -f /etc/NetworkManager/system-connections/br0.nmconnection \
         "/etc/NetworkManager/system-connections/$1.nmconnection"
@@ -1352,6 +1390,7 @@ run_all() {
   phase p76 "persistent backup administrator"                  p76_backup_admin
   phase p77 "Recovera application branding"                    p77_recovera_branding
   phase p78 "offline appliance-to-appliance replication"       p78_peer_replication
+  phase p79 "signed image upgrade client"                       p79_image_updater
   phase p80 "NetworkManager bridge br0"                       p80_network
   phase p85 "apt sources"                                     p85_apt
   log "== p90: post-boot verification timer (re-armed every run)"

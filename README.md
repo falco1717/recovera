@@ -98,6 +98,8 @@ dependencies, so installation and registration do not require Internet access.
 - Re-running the installer safely resumes an interrupted setup and skips
   completed phases.
 - Review [upgrades and rollback](docs/upgrading.md) before updating an appliance.
+- Recovera image releases use signed manifests, SHA-256 verified split GitHub
+  assets, one-time candidate boots, health validation, and automatic rollback.
 - Maintainers should follow the [release checklist](docs/releasing.md).
 
 ## Security

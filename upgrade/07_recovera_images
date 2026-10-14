@@ -1,0 +1,21 @@
+#!/bin/sh
+# GRUB menu entries for verified Recovera loop-root images.
+set -e
+[ -f /etc/recovera/image-layout.json ] || exit 0
+[ -d /host/recovera/images ] || exit 0
+host_uuid=$(grub-probe --target=fs_uuid /host 2>/dev/null) || exit 0
+
+for image in /host/recovera/images/*.img; do
+    [ -f "$image" ] || continue
+    file=$(basename "$image")
+    version=${file%.img}
+    case "$version" in *[!0-9A-Za-z._-]*|'') continue ;; esac
+    cat <<EOF
+menuentry 'Recovera $version' --id 'recovera-$version' {
+    search --no-floppy --fs-uuid --set=recovera_host $host_uuid
+    loopback recovera_loop (\$recovera_host)/recovera/images/$file
+    linux (recovera_loop)/boot/vmlinuz rw quiet recovera.host_uuid=$host_uuid recovera.image=/recovera/images/$file
+    initrd (recovera_loop)/boot/initrd.img
+}
+EOF
+done

@@ -1,0 +1,27 @@
+#!/bin/sh
+# Attach the host-side immutable image as the root block device.
+set -e
+PREREQ="udev"
+prereqs() { echo "$PREREQ"; }
+[ "${1:-}" != prereqs ] || { prereqs; exit 0; }
+. /scripts/functions
+
+host_uuid=
+image=
+for value in $(cat /proc/cmdline); do
+    case "$value" in
+        recovera.host_uuid=*) host_uuid=${value#*=} ;;
+        recovera.image=*) image=${value#*=} ;;
+    esac
+done
+[ -n "$host_uuid" ] && [ -n "$image" ] || exit 0
+case "$image" in /recovera/images/*.img) ;; *) panic "invalid Recovera image path" ;; esac
+
+host_device=/dev/disk/by-uuid/$host_uuid
+wait-for-root "$host_device" || panic "Recovera image host did not appear"
+mkdir -p /run/recovera-host
+mount -o rw "$host_device" /run/recovera-host || panic "could not mount Recovera image host"
+[ -f "/run/recovera-host$image" ] || panic "Recovera root image is missing"
+loop_device=$(losetup --find --show "/run/recovera-host$image") || panic "could not attach Recovera root image"
+echo "ROOT=$loop_device" >> /conf/param.conf
+export ROOT="$loop_device"

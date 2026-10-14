@@ -1,0 +1,80 @@
+#!/bin/bash
+# Copy appliance identity/configuration into a verified, inactive root image.
+set -euo pipefail
+[ "$(id -u)" -eq 0 ] || { echo "run as root" >&2; exit 1; }
+[ "$#" -eq 1 ] || { echo "usage: $0 TARGET_ROOT" >&2; exit 2; }
+target=$(readlink -f "$1")
+[ -d "$target" ] && mountpoint -q "$target" || { echo "target is not a mountpoint" >&2; exit 1; }
+[ -f "$target/etc/recovera-image-release" ] || { echo "target is not a Recovera image" >&2; exit 1; }
+
+copy_path() {
+  local path=$1
+  [ -e "$path" ] || return 0
+  rsync -aHAX --numeric-ids --relative "$path" "$target/"
+}
+
+# Explicitly scoped persistent state. Never copy recovery points, transient
+# runtime state, logs, caches, package databases, or a complete /etc tree.
+for path in \
+  /datto/config \
+  /etc/recovera \
+  /etc/recovera-peer \
+  /var/lib/recovera-peer \
+  /etc/apache2/ssl \
+  /etc/NetworkManager/system-connections \
+  /etc/machine-id \
+  /etc/hostname \
+  /etc/hostid \
+  /opt/spf-datto/setup.conf; do
+  copy_path "$path"
+done
+for path in /etc/ssh/ssh_host_*; do copy_path "$path"; done
+
+# Preserve human/login accounts without replacing service accounts introduced
+# by the new image. Group memberships for those users are carried forward.
+python3 - "$target" <<'PY'
+from pathlib import Path
+import sys
+
+target = Path(sys.argv[1])
+source = Path('/')
+
+def rows(path):
+    return [line for line in path.read_text().splitlines() if line]
+
+passwd_rows = rows(source / 'etc/passwd')
+selected = {'backup-admin'}
+for row in passwd_rows:
+    fields = row.split(':')
+    if len(fields) >= 4 and fields[0] != 'nobody' and int(fields[2]) >= 1000:
+        selected.add(fields[0])
+
+def merge_accounts(name, wanted):
+    source_rows = rows(source / 'etc' / name)
+    target_path = target / 'etc' / name
+    target_rows = rows(target_path)
+    replacements = {row.split(':', 1)[0]: row for row in source_rows if row.split(':', 1)[0] in wanted}
+    output = []
+    seen = set()
+    for row in target_rows:
+        key = row.split(':', 1)[0]
+        output.append(replacements.get(key, row))
+        seen.add(key)
+    output.extend(row for key, row in replacements.items() if key not in seen)
+    target_path.write_text('\n'.join(output) + '\n')
+
+merge_accounts('passwd', selected)
+merge_accounts('shadow', selected)
+
+source_groups = rows(source / 'etc/group')
+group_names = set()
+for row in source_groups:
+    fields = row.split(':')
+    members = set(fields[3].split(',')) if len(fields) > 3 else set()
+    if members & selected or fields[0] in selected or fields[0] in {'sudo', 'remote-users'}:
+        group_names.add(fields[0])
+merge_accounts('group', group_names)
+merge_accounts('gshadow', group_names)
+PY
+
+echo "Recovera appliance configuration migrated into candidate image"

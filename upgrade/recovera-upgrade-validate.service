@@ -1,0 +1,13 @@
+[Unit]
+Description=Validate a newly booted Recovera image
+After=apache2.service php8.1-fpm.service recovera-peer.service
+ConditionPathExists=/host/recovera/pending
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/recovera-upgrade mark-success
+ExecStopPost=/bin/sh -c 'test "$SERVICE_RESULT" = success || /usr/local/sbin/recovera-upgrade validation-failed --reason "$SERVICE_RESULT" --reboot'
+TimeoutStartSec=10min
+
+[Install]
+WantedBy=multi-user.target

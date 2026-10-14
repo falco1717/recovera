@@ -1,0 +1,32 @@
+#!/bin/bash
+# Narrow GRUB interface used by recovera-upgrade. The image layout marker is
+# created only by the final OVA build; conventional installations fail closed.
+set -euo pipefail
+
+layout=/etc/recovera/image-layout.json
+[ "$(id -u)" -eq 0 ] || { echo "run as root" >&2; exit 1; }
+[ -f "$layout" ] || { echo "Recovera image layout is not configured" >&2; exit 1; }
+mode=$(python3 -c 'import json; print(json.load(open("/etc/recovera/image-layout.json"))["mode"])')
+[ "$mode" = loop-image-v1 ] || { echo "unsupported image layout: $mode" >&2; exit 1; }
+
+valid_version() { [[ "$1" =~ ^[0-9A-Za-z][0-9A-Za-z._-]{0,63}$ ]]; }
+entry() { printf 'recovera-%s' "$1"; }
+
+case "${1:-}" in
+  stage)
+    [ "$#" -eq 3 ] && valid_version "$2" && [ -f "$3" ] || exit 2
+    update-grub
+    grub-reboot "$(entry "$2")"
+    ;;
+  commit)
+    [ "$#" -eq 3 ] && valid_version "$2" && [ -f "$3" ] || exit 2
+    grub-set-default "$(entry "$2")"
+    grub-editenv /boot/grub/grubenv unset next_entry
+    ;;
+  rollback)
+    [ "$#" -eq 2 ] && valid_version "$2" || exit 2
+    grub-set-default "$(entry "$2")"
+    grub-editenv /boot/grub/grubenv unset next_entry
+    ;;
+  *) echo "usage: $0 {stage VERSION IMAGE|commit VERSION IMAGE|rollback VERSION}" >&2; exit 2 ;;
+esac
