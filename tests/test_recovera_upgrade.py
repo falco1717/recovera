@@ -127,6 +127,7 @@ class RecoveraUpgradeTests(unittest.TestCase):
         self.assertIn("/datto/config", migration)
         self.assertIn("/etc/recovera-peer", migration)
         self.assertIn("/etc/NetworkManager/system-connections", migration)
+        self.assertIn("/etc/fstab", migration)
         self.assertNotIn("copy_path /etc\n", migration)
         self.assertNotIn("/home/agents", migration)
 
@@ -148,6 +149,11 @@ class RecoveraUpgradeTests(unittest.TestCase):
         updater = UPDATER.read_text()
         self.assertIn("fallback_entry", boot)
         self.assertIn('run([BOOT_HELPER, "fallback"])', updater)
+
+    def test_updater_can_be_installed_without_rerunning_setup(self):
+        setup = (ROOT / "setup" / "setup.sh").read_text()
+        self.assertIn("install-updater)", setup)
+        self.assertIn("p79_image_updater", setup)
 
 
 if __name__ == "__main__":

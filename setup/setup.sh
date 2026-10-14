@@ -12,6 +12,7 @@
 #   sudo ./setup.sh status     show progress / follow the log of a running setup
 #   sudo ./setup.sh verify     health check of a finished replica
 #   sudo ./setup.sh install-peer install/update only the peer-replication service
+#   sudo ./setup.sh install-updater install/update only the signed image updater
 #   sudo ./setup.sh apply-branding apply/update only the Recovera WebUI branding
 #
 # Resumable: finished phases are recorded in /var/lib/spf-datto-setup; just run it again.
@@ -1450,6 +1451,10 @@ case "$MODE" in
     [ "$(id -u)" -eq 0 ] || { echo "run with sudo"; exit 1; }
     load_conf; validate_conf; p76_backup_admin; p77_recovera_branding; p78_peer_replication
     echo "peer replication service installed" ;;
+  install-updater)
+    [ "$(id -u)" -eq 0 ] || { echo "run with sudo"; exit 1; }
+    p79_image_updater
+    echo "signed image updater installed" ;;
   apply-branding)
     [ "$(id -u)" -eq 0 ] || { echo "run with sudo"; exit 1; }
     p77_recovera_branding

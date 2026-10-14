@@ -25,6 +25,7 @@ for path in \
   /etc/machine-id \
   /etc/hostname \
   /etc/hostid \
+  /etc/fstab \
   /opt/spf-datto/setup.conf; do
   copy_path "$path"
 done
