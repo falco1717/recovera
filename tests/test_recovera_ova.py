@@ -34,6 +34,13 @@ class RecoveraOvaTests(unittest.TestCase):
             "first-boot-complete",
         ):
             self.assertIn(required, script)
+        self.assertNotIn("hostnamectl set-hostname", script)
+        self.assertIn("printf 'recovera\\n' > /etc/hostname", script)
+        self.assertIn("hostname recovera", script)
+
+    def test_preparation_always_rearms_first_boot(self):
+        script = (ROOT / "tools" / "prepare-ova.sh").read_text()
+        self.assertIn("rm -f /var/lib/recovera-ova/first-boot-complete", script)
 
     def test_first_boot_precedes_network_facing_services(self):
         script = (ROOT / "tools" / "prepare-ova.sh").read_text()

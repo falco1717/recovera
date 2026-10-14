@@ -5,7 +5,11 @@ set -euo pipefail
 MARKER=/var/lib/recovera-ova/first-boot-complete
 [ ! -e "$MARKER" ] || exit 0
 
-hostnamectl set-hostname recovera
+# This unit deliberately runs before network-facing services and without normal
+# systemd dependencies. Do not use hostnamectl here: it requires D-Bus and
+# systemd-hostnamed, which are not guaranteed to be available this early.
+printf 'recovera\n' > /etc/hostname
+hostname recovera
 if grep -qE '^127\.0\.1\.1[[:space:]]' /etc/hosts; then
   sed -Ei 's/^127\.0\.1\.1[[:space:]].*/127.0.1.1 recovera/' /etc/hosts
 else

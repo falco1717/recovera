@@ -27,6 +27,7 @@ if config.is_file():
 PY
 
 systemctl stop recovera-peer.service recovera-peer-sync.timer apache2.service ssh.service || true
+rm -f /var/lib/recovera-ova/first-boot-complete
 install -m 0755 "$SOURCE" /usr/local/sbin/recovera-ova-firstboot
 cat > /etc/systemd/system/recovera-ova-firstboot.service <<'EOF'
 [Unit]
