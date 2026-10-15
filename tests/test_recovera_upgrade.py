@@ -126,6 +126,7 @@ class RecoveraUpgradeTests(unittest.TestCase):
         self.assertIn('mount -t sysfs sysfs "$mountpoint/sys"', builder)
         self.assertIn('--compression-level)', builder)
         self.assertIn('xz -T0 "-$COMPRESSION_LEVEL"', builder)
+        self.assertIn("minimum_bytes + 2 * 1024 * 1024 * 1024", builder)
 
     def test_configuration_migration_is_allowlisted(self):
         migration = (ROOT / "upgrade" / "recovera-migrate-config").read_text()

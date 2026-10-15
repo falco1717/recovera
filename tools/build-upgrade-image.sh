@@ -121,7 +121,13 @@ umount "$mountpoint"
 mounted=no
 e2fsck -fy "$image"
 resize2fs -M "$image"
-truncate -s "$(dumpe2fs -h "$image" 2>/dev/null | awk '/Block count:/{c=$3}/Block size:/{s=$3}END{print c*s}')" "$image"
+minimum_bytes=$(dumpe2fs -h "$image" 2>/dev/null | awk '/Block count:/{c=$3}/Block size:/{s=$3}END{print c*s}')
+# Keep enough writable space for appliance-specific configuration migration,
+# initramfs regeneration, package metadata, and a small future update. Empty
+# ext4 blocks add negligible size to the compressed release asset.
+truncate -s "$((minimum_bytes + 2 * 1024 * 1024 * 1024))" "$image"
+resize2fs "$image"
+e2fsck -fy "$image"
 
 compressed=$OUTPUT/recovera-$VERSION.img.xz
 xz -T0 "-$COMPRESSION_LEVEL" -c "$image" > "$compressed"

@@ -88,6 +88,11 @@ manifest, hash-verification, staging, or boot workflow; production releases
 should retain the default unless storage and build-time measurements justify a
 different level.
 
+After minimizing the ext4 filesystem, the builder expands it with 2 GiB of
+writable headroom. This is required for appliance-specific configuration
+migration, initramfs regeneration, package metadata, and a small future update;
+the empty blocks compress to almost nothing in the release asset.
+
 The signing key is optional during the image-build step. Omitting
 `--signing-key` produces the image parts and manifest without a signature so a
 build appliance never needs access to the release private key. Copy only the
