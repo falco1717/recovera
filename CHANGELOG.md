@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Added signed schema-2 package repositories as the default appliance update
+  path, with installed-version filtering, changed-package-only downloads, offline APT transactions, strict
+  platform-package separation, cached rollback packages, service validation,
+  monotonic channels, and optional post-reboot commit/rollback.
+- Added package release build and GitHub publication tooling. Full root images
+  remain available for kernel, bootloader, base-OS, ZFS, and recovery upgrades.
 - Added a signed, image-based appliance upgrade client with GitHub Release
   channels, split image assets, layered SHA-256 verification, monotonic
   downgrade protection, one-time GRUB candidate boots, health validation, and

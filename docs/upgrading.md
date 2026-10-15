@@ -1,4 +1,60 @@
-# Image upgrades and rollback
+# Recovera package and image upgrades
+
+Recovera uses two signed release formats. **Package releases are the normal
+update path** and contain only changed application `.deb` files. **Image
+releases are reserved for Ubuntu base, kernel, bootloader, ZFS, and other major
+platform transitions.** Both use the same reviewed channel, monotonic sequence,
+Ed25519 trust root, and GitHub Release storage.
+
+## Routine package releases
+
+Schema-2 package releases are offline-complete and transactional. The signed
+manifest describes the channel's current application package set, like an APT
+repository snapshot. An appliance compares that index with installed versions
+and downloads only packages that differ, so it may safely skip intermediate
+releases without downloading unchanged packages.
+
+- APT receives only the verified local release files; repository access and
+  downloads are disabled.
+- The transaction is simulated first, and any proposed package removal aborts.
+- Package name, version, architecture, size, and SHA-256 are compared with the
+  signed manifest and the `.deb` control data.
+- Kernel, GRUB, shim, initramfs, systemd, libc, and ZFS packages are rejected;
+  those changes must use an image release.
+- Exact prior packages are copied from the original installer or Recovera
+  cache before any change. Missing rollback material aborts safely.
+- Installed versions, Apache configuration, and required services are checked.
+  Failure reinstalls the prior packages automatically.
+- A reboot-required package release stays pending until post-boot validation.
+
+Build from a directory containing the channel's complete current application
+package set and all offline dependencies. Release storage contains that package
+snapshot, while each appliance downloads only its changed subset:
+
+```bash
+tools/build-package-release.sh \
+  --packages /srv/recovera-current-debs \
+  --version 0.7.1 --sequence 2 --channel stable \
+  --output /srv/recovera-release-0.7.1 \
+  --signing-key /secure/recovera-upgrade-signing-key
+
+tools/publish-package-release.sh /srv/recovera-release-0.7.1 0.7.1 2 stable
+```
+
+Use `--reboot-required` only when necessary. Review the publisher's JSON and
+merge it into `upgrade/channels/stable.json`; uploading assets alone does not
+expose a release. Successful packages are retained in
+`/var/cache/recovera-upgrade/packages`, transactions in
+`/var/lib/recovera-upgrade/transactions`, and the original baseline remains in
+`/opt/spf-datto/debs`.
+
+Fresh installer bundles include `recovera-appliance` as a versioned package so
+its files have a rollback baseline from the beginning. An older development
+appliance must install the matching baseline package through
+`setup.sh install-updater` before its package channel is enabled; the updater
+refuses to treat the control plane as an untracked new package.
+
+## Platform image releases
 
 Recovera uses signed, versioned root images published as GitHub Release assets.
 The data pool and appliance-specific configuration stay outside the root image.
@@ -23,6 +79,7 @@ sudo recovera-upgrade status
 sudo recovera-upgrade check
 sudo recovera-upgrade install
 sudo recovera-upgrade install --reboot
+sudo recovera-upgrade rollback
 ```
 
 The daily timer only checks for availability. It never downloads, installs, or

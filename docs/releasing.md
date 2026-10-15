@@ -26,10 +26,30 @@ payload is private and must not be copied into the Git repository.
 9. Publish the OVA and its SHA-256 digest as release assets when the OVA fits
    the release host's per-file limit. Never commit the binary image to Git.
 
+## Routine appliance package release
+
+Normal releases expose a current application package index and appliances
+download only entries whose installed versions differ. Follow
+[Recovera package and image upgrades](upgrading.md), then:
+
+1. Put the channel's complete current application `.deb` set and every offline
+   dependency in a clean directory. The appliance will skip unchanged files.
+2. Increment the human version and the global monotonic release sequence.
+3. Build the schema-2 manifest with `tools/build-package-release.sh`.
+4. Sign the manifest on the isolated release workstation and verify every
+   digest on a second machine.
+5. Test installation and forced rollback on both disposable appliances.
+6. Create the immutable Git tag and publish with
+   `tools/publish-package-release.sh`.
+7. Merge the reviewed stable-channel pointer only after the tests pass.
+
+Platform, boot, kernel, libc, systemd, and ZFS packages are not valid routine
+updates. Ship those through the image path.
+
 ## Appliance image release
 
-Image updates are a separate release artifact from the installation payload and
-OVA. Follow [Image upgrades and rollback](upgrading.md), then:
+Image updates are a separate release artifact from the installation payload,
+package releases, and OVA. Follow [Recovera package and image upgrades](upgrading.md), then:
 
 1. Increment both the human version and the monotonic image sequence.
 2. Build from a clean root tree and keep all appliance identity, protected

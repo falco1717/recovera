@@ -43,6 +43,13 @@ while IFS= read -r package; do
   rm -f "$B/debs/${package}_"*.deb
 done < "$PRUNE"
 
+# Make Recovera-owned files a real versioned package. Fresh installations then
+# establish the exact rollback baseline required by routine package updates.
+recovera_version=$(tr -d '[:space:]' < "$REPO/VERSION")
+[ -n "$recovera_version" ] || { echo "VERSION is empty"; exit 1; }
+bash "$REPO/tools/build-recovera-appliance-deb.sh" \
+  --version "${recovera_version}-1" --output "$B/debs" >/dev/null
+
 datto_deb=$(find "$B/debs" -maxdepth 1 -name 'datto-siris-os-2_*.deb' -print -quit)
 [ -n "$datto_deb" ] || { echo "datto-siris-os-2 package not found"; exit 1; }
 tmp=$(mktemp -d)

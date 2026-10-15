@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Signed, image-based upgrade client for Recovera appliances."""
+"""Signed package and image upgrade client for Recovera appliances."""
 
 import argparse
 import base64
@@ -17,7 +17,12 @@ import urllib.error
 import urllib.request
 import urllib.parse
 
-UPDATER_VERSION = 1
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - production appliances run Linux
+    fcntl = None
+
+UPDATER_VERSION = 2
 DEFAULT_CONFIG = Path("/etc/recovera/upgrade.conf")
 DEFAULT_SIGNERS = Path("/usr/local/share/recovera-upgrade/release-signers")
 DEFAULT_STATE = Path("/host/recovera/state.json")
@@ -26,6 +31,13 @@ DEFAULT_RELEASE = Path("/etc/recovera-image-release")
 BOOT_HELPER = Path("/usr/local/lib/recovera-upgrade/recovera-image-boot")
 MIGRATION_HELPER = Path("/usr/local/lib/recovera-upgrade/recovera-migrate-config")
 PENDING_MARKER = Path("/host/recovera/pending")
+DEFAULT_PACKAGE_CACHE = Path("/var/cache/recovera-upgrade/packages")
+DEFAULT_TRANSACTION_ROOT = Path("/var/lib/recovera-upgrade/transactions")
+DEFAULT_LOCK = Path("/run/lock/recovera-upgrade.lock")
+FORBIDDEN_PACKAGE_RE = re.compile(
+    r"^(?:linux-(?:image|headers|modules|tools)|grub|shim|initramfs-tools|"
+    r"systemd|libc6|zfs(?:utils|initramfs|dkms|modules)?)(?:[-:].*)?$"
+)
 
 
 class UpgradeError(RuntimeError):
@@ -84,6 +96,31 @@ def read_config(path):
         if not config.get(required):
             raise UpgradeError(f"missing {required} in {path}")
     return config
+
+
+def config_path(config, name, default):
+    return Path(os.environ.get(name, config.get(name, str(default))))
+
+
+class UpgradeLock:
+    def __init__(self):
+        self.stream = None
+
+    def __enter__(self):
+        if fcntl is None:
+            raise UpgradeError("upgrade locking is unavailable on this operating system")
+        path = Path(os.environ.get("RECOVERA_UPGRADE_LOCK", DEFAULT_LOCK))
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self.stream = path.open("a+")
+        try:
+            fcntl.flock(self.stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise UpgradeError("another Recovera upgrade operation is already running") from exc
+        return self
+
+    def __exit__(self, *_):
+        if self.stream:
+            self.stream.close()
 
 
 def token(config):
@@ -157,7 +194,7 @@ def fetch_channel(config, local_channel=None):
     if pointer.get("schema") != 1 or pointer.get("channel") != config["CHANNEL"]:
         raise UpgradeError("channel pointer has an unsupported schema or channel")
     if not pointer.get("release_tag"):
-        raise NoReleaseError(f"the {config['CHANNEL']} channel has no published image")
+        raise NoReleaseError(f"the {config['CHANNEL']} channel has no published release")
     if not re.fullmatch(r"[0-9A-Za-z][0-9A-Za-z._-]{0,127}", str(pointer["release_tag"])):
         raise UpgradeError("channel pointer contains an invalid release tag")
     return pointer
@@ -194,9 +231,9 @@ def verify_signature(manifest_path, signature_path, signers):
         raise UpgradeError("release manifest signature verification failed")
 
 
-def validate_manifest(manifest, pointer, config):
-    required = ("schema", "sequence", "version", "channel", "architecture", "image")
-    if any(key not in manifest for key in required) or manifest["schema"] != 1:
+def validate_release_identity(manifest, pointer, config):
+    required = ("schema", "sequence", "version", "channel", "architecture")
+    if any(key not in manifest for key in required) or manifest["schema"] not in (1, 2):
         raise UpgradeError("unsupported or incomplete release manifest")
     if manifest["channel"] != config["CHANNEL"]:
         raise UpgradeError("release manifest channel does not match appliance channel")
@@ -220,6 +257,12 @@ def validate_manifest(manifest, pointer, config):
         raise UpgradeError("channel pointer contains an invalid sequence") from exc
     if pointer.get("version") != manifest["version"] or pointer_sequence != sequence:
         raise UpgradeError("signed manifest does not match the channel pointer")
+    return sequence
+
+
+def validate_image_manifest(manifest):
+    if manifest.get("schema") != 1 or "image" not in manifest:
+        raise UpgradeError("unsupported or incomplete image manifest")
     image = manifest["image"]
     if image.get("compression") != "xz" or not image.get("parts"):
         raise UpgradeError("unsupported image encoding")
@@ -233,11 +276,70 @@ def validate_manifest(manifest, pointer, config):
             raise UpgradeError(f"invalid image {field}")
     if int(image.get("size", 0)) < 1 or int(image.get("uncompressed_size", 0)) < 1:
         raise UpgradeError("invalid image size")
+
+
+def safe_asset_name(name):
+    return (
+        isinstance(name, str)
+        and Path(name).name == name
+        and re.fullmatch(r"[0-9A-Za-z][0-9A-Za-z.+_~-]{0,191}", name)
+    )
+
+
+def validate_package_manifest(manifest):
+    if manifest.get("schema") != 2 or manifest.get("type") != "package":
+        raise UpgradeError("unsupported or incomplete package manifest")
+    packages = manifest.get("packages")
+    if not isinstance(packages, list) or not packages:
+        raise UpgradeError("package release contains no packages")
+    seen_names = set()
+    seen_files = set()
+    total = 0
+    for package in packages:
+        if not isinstance(package, dict):
+            raise UpgradeError("invalid package metadata")
+        if set(package) != {"name", "version", "architecture", "asset", "size", "sha256"}:
+            raise UpgradeError("invalid package metadata")
+        name = str(package["name"])
+        architecture = str(package["architecture"])
+        if not re.fullmatch(r"[a-z0-9][a-z0-9+.-]{0,127}", name) or FORBIDDEN_PACKAGE_RE.match(name):
+            raise UpgradeError(f"package is not eligible for an application update: {name}")
+        if name in seen_names or package["asset"] in seen_files:
+            raise UpgradeError("package release contains duplicate packages or assets")
+        if not re.fullmatch(r"[0-9A-Za-z][0-9A-Za-z.+:~_-]{0,127}", str(package["version"])):
+            raise UpgradeError("invalid package version")
+        if architecture not in ("all", "amd64") or not safe_asset_name(package["asset"]):
+            raise UpgradeError("invalid package architecture or asset name")
+        if int(package["size"]) < 1 or not re.fullmatch(r"[0-9a-f]{64}", str(package["sha256"])):
+            raise UpgradeError("invalid package size or digest")
+        seen_names.add(name)
+        seen_files.add(package["asset"])
+        total += int(package["size"])
+    if int(manifest.get("download_size", -1)) != total:
+        raise UpgradeError("package release download size does not match its assets")
+    if not isinstance(manifest.get("reboot_required", False), bool):
+        raise UpgradeError("invalid reboot requirement")
+
+
+def validate_manifest(manifest, pointer, config):
+    validate_release_identity(manifest, pointer, config)
+    release_type = manifest.get("type", "image" if manifest.get("schema") == 1 else None)
+    if release_type == "image":
+        validate_image_manifest(manifest)
+    elif release_type == "package":
+        validate_package_manifest(manifest)
+    else:
+        raise UpgradeError("unknown release type")
     return manifest
 
 
 def current_release():
-    return read_json(os.environ.get("RECOVERA_RELEASE_FILE", DEFAULT_RELEASE), {})
+    image = read_json(os.environ.get("RECOVERA_RELEASE_FILE", DEFAULT_RELEASE), {})
+    installed = read_json(state_path(), {}).get("installed", {})
+    try:
+        return installed if int(installed.get("sequence", 0)) > int(image.get("sequence", 0)) else image
+    except (TypeError, ValueError):
+        raise UpgradeError("installed release state contains an invalid sequence")
 
 
 def state_path():
@@ -295,12 +397,24 @@ def command_check(config, args):
         print(json.dumps(result, indent=2, sort_keys=True))
         return 0
     available = int(manifest["sequence"]) > int(current.get("sequence", 0))
+    release_type = manifest.get("type", "image")
+    if release_type == "package":
+        required_download = sum(
+            int(package["size"]) for package in manifest["packages"]
+            if installed_version(package["name"]) != package["version"]
+        )
+    else:
+        required_download = int(manifest.get("image", {}).get("size", 0))
     result = {
         "available": available,
         "channel": manifest["channel"],
         "current_version": current.get("version"),
         "version": manifest["version"],
         "sequence": manifest["sequence"],
+        "type": release_type,
+        "download_size": required_download,
+        "repository_size": int(manifest.get("download_size", required_download)),
+        "reboot_required": bool(manifest.get("reboot_required", True)),
     }
     if args.cache:
         cached = read_json(state_path(), {})
@@ -384,9 +498,10 @@ def migrate_appliance_config(image_path):
         raise UpgradeError("candidate filesystem is inconsistent after configuration migration")
 
 
-def command_install(config, args):
+def command_install_image(config, args, release):
     require_root()
     require_layout(config)
+    pointer, assets, manifest, manifest_path, signature_path = release
     host = Path(config["HOST_ROOT"])
     images = host / "recovera/images"
     downloads = host / "recovera/downloads"
@@ -394,8 +509,6 @@ def command_install(config, args):
     downloads.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="release-", dir=downloads) as temporary:
         work = Path(temporary)
-        pointer, assets, manifest, manifest_path, signature_path = get_release(config, args, work)
-        ensure_newer(manifest)
         compressed = assemble_image(config, manifest, assets, work)
         filename = f"{manifest['version']}.img"
         target = images / filename
@@ -432,38 +545,311 @@ def command_install(config, args):
         print("Reboot when ready: sudo systemctl reboot")
 
 
-def command_mark_success(config, args):
-    require_root()
-    state = read_json(state_path(), {})
-    pending = state.get("pending")
-    current = current_release()
-    if not pending or pending.get("version") != current.get("version"):
-        raise UpgradeError("the running image is not the pending upgrade")
-    for service in config.get("REQUIRED_SERVICES", "").split():
+def dpkg_field(path, field):
+    result = run(["dpkg-deb", "-f", path, field], capture=True)
+    return result.stdout.decode("utf-8", "replace").strip()
+
+
+def installed_version(package):
+    result = run(["dpkg-query", "-W", "-f=${db:Status-Abbrev}\t${Version}", package], check=False, capture=True)
+    if result.returncode:
+        return None
+    status, _, version = result.stdout.decode("utf-8", "replace").partition("\t")
+    return version if status.startswith("ii") else None
+
+
+def verify_deb(path, package):
+    path = Path(path)
+    if path.stat().st_size != int(package["size"]) or sha256(path) != package["sha256"]:
+        raise UpgradeError(f"package verification failed: {package['asset']}")
+    values = {field: dpkg_field(path, field) for field in ("Package", "Version", "Architecture")}
+    for field, key in (("Package", "name"), ("Version", "version"), ("Architecture", "architecture")):
+        if values[field] != str(package[key]):
+            raise UpgradeError(f"package control metadata does not match manifest: {package['asset']}")
+
+
+def find_cached_deb(config, name, version):
+    roots = [
+        config_path(config, "PACKAGE_CACHE", DEFAULT_PACKAGE_CACHE),
+        Path("/opt/spf-datto/debs"),
+        Path("/var/cache/apt/archives"),
+    ]
+    for root in roots:
+        if not root.is_dir():
+            continue
+        for candidate in root.glob(f"{name}_*.deb"):
+            try:
+                if dpkg_field(candidate, "Package") == name and dpkg_field(candidate, "Version") == version:
+                    return candidate
+            except (OSError, subprocess.SubprocessError):
+                continue
+    return None
+
+
+def package_apt_command(action, debs):
+    return [
+        "apt-get", "-y" if action == "install" else "-s", "--no-download",
+        "--allow-downgrades", "--allow-change-held-packages",
+        "-o", "Dir::Etc::sourcelist=/dev/null",
+        "-o", "Dir::Etc::sourceparts=/dev/null",
+        "-o", "APT::Get::List-Cleanup=0",
+        "-o", "DPkg::Lock::Timeout=900",
+        "install", *[str(Path(item).resolve()) for item in debs],
+    ]
+
+
+def verify_package_plan(debs):
+    result = run(package_apt_command("simulate", debs), check=False, capture=True)
+    output = (result.stdout + result.stderr).decode("utf-8", "replace")
+    if result.returncode:
+        raise UpgradeError("package dependency preflight failed:\n" + output[-4000:])
+    removals = re.findall(r"^Remv\s+(\S+)", output, re.MULTILINE)
+    if removals:
+        raise UpgradeError("package release would remove installed packages: " + " ".join(removals))
+    allowed = {dpkg_field(item, "Package") for item in debs}
+    additions = {name.split(":", 1)[0] for name in re.findall(r"^Inst\s+(\S+)", output, re.MULTILINE)}
+    unexpected = sorted(additions - allowed)
+    if unexpected:
+        raise UpgradeError("package plan contains unsigned or unlisted packages: " + " ".join(unexpected))
+
+
+def required_services(config):
+    return config.get("REQUIRED_SERVICES", "").split()
+
+
+def validate_services(config):
+    run(["systemctl", "daemon-reload"])
+    for service in required_services(config):
         if run(["systemctl", "is-active", "--quiet", service], check=False).returncode:
             raise UpgradeError(f"required service is not active: {service}")
-    run([BOOT_HELPER, "commit", current["version"], pending["image"]])
-    state["installed_sequence"] = int(current["sequence"])
-    state["installed"] = current
+    if shutil.which("apache2ctl") and run(["apache2ctl", "configtest"], check=False, capture=True).returncode:
+        raise UpgradeError("Apache configuration validation failed")
+
+
+def rollback_package_transaction(config, transaction):
+    rollback_debs = [entry["path"] for entry in transaction.get("rollback", []) if entry.get("path")]
+    if rollback_debs:
+        result = run(package_apt_command("install", rollback_debs), check=False, capture=True)
+        if result.returncode:
+            detail = (result.stdout + result.stderr).decode("utf-8", "replace")[-4000:]
+            raise UpgradeError("automatic package rollback failed:\n" + detail)
+    new_packages = list(reversed(transaction.get("new_packages", [])))
+    if new_packages:
+        result = run(["dpkg", "--purge", *new_packages], check=False, capture=True)
+        if result.returncode:
+            detail = (result.stdout + result.stderr).decode("utf-8", "replace")[-4000:]
+            raise UpgradeError("automatic removal of newly introduced packages failed:\n" + detail)
+    run(["systemctl", "daemon-reload"], check=False)
+    for service in required_services(config):
+        run(["systemctl", "restart", service], check=False)
+
+
+def commit_package_transaction(config, state):
+    pending = state["pending"]
+    cache = config_path(config, "PACKAGE_CACHE", DEFAULT_PACKAGE_CACHE)
+    cache.mkdir(parents=True, exist_ok=True)
+    for source in pending.get("packages", []):
+        source_path = Path(source)
+        shutil.copyfile(source_path, cache / source_path.name)
+    installed = {
+        "schema": 1, "type": "package", "version": pending["version"],
+        "sequence": int(pending["sequence"]), "channel": config["CHANNEL"],
+    }
+    state["installed_sequence"] = int(pending["sequence"])
+    state["installed"] = installed
+    state["last_transaction"] = pending
     state["pending"] = None
     atomic_json(state_path(), state)
     PENDING_MARKER.unlink(missing_ok=True)
-    print(f"Recovera {current['version']} passed validation and is now the default image.")
+    print(f"Recovera {installed['version']} package update passed validation.")
+
+
+def command_install_packages(config, args, release):
+    require_root()
+    pointer, assets, manifest, manifest_path, signature_path = release
+    root = config_path(config, "TRANSACTION_ROOT", DEFAULT_TRANSACTION_ROOT)
+    transaction_dir = root / f"{int(manifest['sequence']):08d}-{manifest['version']}"
+    downloads = transaction_dir / "packages"
+    rollback_dir = transaction_dir / "rollback"
+    if transaction_dir.exists():
+        shutil.rmtree(transaction_dir)
+    downloads.mkdir(parents=True)
+    rollback_dir.mkdir()
+    shutil.copyfile(manifest_path, transaction_dir / manifest_path.name)
+    shutil.copyfile(signature_path, transaction_dir / signature_path.name)
+
+    package_paths = []
+    rollback = []
+    new_packages = []
+    changes = []
+    for package in manifest["packages"]:
+        old_version = installed_version(package["name"])
+        if old_version != package["version"]:
+            changes.append((package, old_version))
+    required_bytes = sum(int(package["size"]) for package, _ in changes) * 2 + 128 * 1024 * 1024
+    if shutil.disk_usage(transaction_dir).free < required_bytes:
+        raise UpgradeError(
+            f"insufficient free space for package transaction; need at least {required_bytes} bytes"
+        )
+    for package, old_version in changes:
+        if old_version is None and package["name"] in config.get("REQUIRE_BASELINE_PACKAGES", "").split():
+            raise UpgradeError(
+                f"{package['name']} has no installed rollback baseline; install the matching "
+                "baseline package with setup.sh install-updater before enabling this channel"
+            )
+        local = downloads / package["asset"]
+        obtain_asset(package["asset"], assets, local, config)
+        verify_deb(local, package)
+        package_paths.append(local)
+        if old_version is None:
+            new_packages.append(package["name"])
+        elif old_version != package["version"]:
+            old_deb = find_cached_deb(config, package["name"], old_version)
+            if old_deb is None:
+                raise UpgradeError(
+                    f"cannot safely update {package['name']}: the installed {old_version} package "
+                    "is not in the Recovera or installer cache for rollback"
+                )
+            destination = rollback_dir / old_deb.name
+            shutil.copyfile(old_deb, destination)
+            rollback.append({"name": package["name"], "version": old_version, "path": str(destination)})
+
+    if package_paths:
+        verify_package_plan(package_paths)
+    transaction = {
+        "type": "package", "version": manifest["version"], "sequence": int(manifest["sequence"]),
+        "packages": [str(item) for item in package_paths], "rollback": rollback,
+        "new_packages": new_packages, "reboot_required": bool(manifest.get("reboot_required", False)),
+    }
+    state = read_json(state_path(), {})
+    state.update({"pending": transaction, "previous": current_release(), "release_tag": pointer["release_tag"]})
+    atomic_json(state_path(), state)
+    PENDING_MARKER.parent.mkdir(parents=True, exist_ok=True)
+    PENDING_MARKER.touch(mode=0o600, exist_ok=True)
+    result = run(package_apt_command("install", package_paths), check=False, capture=True) if package_paths else None
+    if result is not None and result.returncode:
+        try:
+            rollback_package_transaction(config, transaction)
+        finally:
+            state["last_failure"] = {"version": manifest["version"], "reason": "package installation failed"}
+            state["pending"] = None
+            atomic_json(state_path(), state)
+            PENDING_MARKER.unlink(missing_ok=True)
+        detail = (result.stdout + result.stderr).decode("utf-8", "replace")[-4000:]
+        raise UpgradeError("package installation failed and was rolled back:\n" + detail)
+    try:
+        for package in manifest["packages"]:
+            if installed_version(package["name"]) != package["version"]:
+                raise UpgradeError(f"installed package version does not match the release: {package['name']}")
+        validate_services(config)
+    except UpgradeError as exc:
+        rollback_package_transaction(config, transaction)
+        state["last_failure"] = {"version": manifest["version"], "reason": str(exc)}
+        state["pending"] = None
+        atomic_json(state_path(), state)
+        PENDING_MARKER.unlink(missing_ok=True)
+        raise
+    if manifest.get("reboot_required", False):
+        print(f"Recovera {manifest['version']} package update is installed and awaiting reboot validation.")
+        if args.reboot:
+            run(["systemctl", "reboot"])
+        else:
+            print("Reboot when ready: sudo systemctl reboot")
+    else:
+        commit_package_transaction(config, state)
+
+
+def command_install(config, args):
+    require_root()
+    with UpgradeLock():
+        root = config_path(config, "TRANSACTION_ROOT", DEFAULT_TRANSACTION_ROOT)
+        root.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="metadata-", dir=root) as temporary:
+            release = get_release(config, args, Path(temporary))
+            manifest = release[2]
+            ensure_newer(manifest)
+            if manifest.get("type", "image") == "package":
+                return command_install_packages(config, args, release)
+            return command_install_image(config, args, release)
+
+
+def command_mark_success(config, args):
+    require_root()
+    with UpgradeLock():
+        state = read_json(state_path(), {})
+        pending = state.get("pending")
+        if not pending:
+            raise UpgradeError("there is no pending upgrade")
+        validate_services(config)
+        if pending.get("type") == "package":
+            for source in pending.get("packages", []):
+                name = dpkg_field(source, "Package")
+                version = dpkg_field(source, "Version")
+                if installed_version(name) != version:
+                    raise UpgradeError(f"pending package is not installed at the expected version: {name}")
+            commit_package_transaction(config, state)
+            return
+        current = current_release()
+        if pending.get("version") != current.get("version"):
+            raise UpgradeError("the running image is not the pending upgrade")
+        run([BOOT_HELPER, "commit", current["version"], pending["image"]])
+        state["installed_sequence"] = int(current["sequence"])
+        state["installed"] = current
+        state["pending"] = None
+        atomic_json(state_path(), state)
+        PENDING_MARKER.unlink(missing_ok=True)
+        print(f"Recovera {current['version']} passed validation and is now the default image.")
 
 
 def command_validation_failed(config, args):
     require_root()
-    state = read_json(state_path(), {})
-    previous = state.get("previous", {})
-    if previous.get("version"):
-        run([BOOT_HELPER, "rollback", previous["version"]])
-    else:
-        run([BOOT_HELPER, "fallback"])
-    state["last_failure"] = {"version": current_release().get("version"), "reason": args.reason}
-    atomic_json(state_path(), state)
-    PENDING_MARKER.unlink(missing_ok=True)
-    if args.reboot:
-        run(["systemctl", "reboot"])
+    with UpgradeLock():
+        state = read_json(state_path(), {})
+        pending = state.get("pending") or {}
+        if pending.get("type") == "package":
+            rollback_package_transaction(config, pending)
+            failed_version = pending.get("version")
+            state["pending"] = None
+        else:
+            previous = state.get("previous", {})
+            if previous.get("version"):
+                run([BOOT_HELPER, "rollback", previous["version"]])
+            else:
+                run([BOOT_HELPER, "fallback"])
+            failed_version = current_release().get("version")
+        state["last_failure"] = {"version": failed_version, "reason": args.reason}
+        atomic_json(state_path(), state)
+        PENDING_MARKER.unlink(missing_ok=True)
+        if args.reboot:
+            run(["systemctl", "reboot"])
+
+
+def command_rollback(config, args):
+    require_root()
+    with UpgradeLock():
+        state = read_json(state_path(), {})
+        transaction = state.get("pending") or state.get("last_transaction") or {}
+        previous = state.get("previous", {})
+        if transaction.get("type") == "package":
+            rollback_package_transaction(config, transaction)
+            validate_services(config)
+            state["installed"] = previous
+            state["installed_sequence"] = int(previous.get("sequence", 0))
+            state["pending"] = None
+            state["last_transaction"] = None
+            state["last_rollback"] = {
+                "version": transaction.get("version"), "reason": "operator requested rollback"
+            }
+            atomic_json(state_path(), state)
+            PENDING_MARKER.unlink(missing_ok=True)
+            print(f"Rolled back Recovera package release {transaction.get('version')}.")
+        elif previous.get("version") and BOOT_HELPER.exists():
+            run([BOOT_HELPER, "rollback", previous["version"]])
+            print(f"Selected Recovera image {previous['version']} for rollback.")
+        else:
+            raise UpgradeError("there is no rollback transaction available")
+        if args.reboot:
+            run(["systemctl", "reboot"])
 
 
 def command_status(config, args):
@@ -473,6 +859,7 @@ def command_status(config, args):
         "state": read_json(state_path(), {}),
         "image_layout": read_json(layout_path(), None),
         "activation_supported": layout_path().exists() and BOOT_HELPER.exists(),
+        "package_updates_supported": shutil.which("apt-get") is not None and shutil.which("dpkg-deb") is not None,
     }
     print(json.dumps(value, indent=2, sort_keys=True))
 
@@ -492,6 +879,8 @@ def parser():
             command.add_argument("--reboot", action="store_true")
     sub.add_parser("status")
     sub.add_parser("mark-success")
+    rollback = sub.add_parser("rollback")
+    rollback.add_argument("--reboot", action="store_true")
     failed = sub.add_parser("validation-failed")
     failed.add_argument("--reason", default="post-boot validation failed")
     failed.add_argument("--reboot", action="store_true")
@@ -508,6 +897,7 @@ def main():
             "status": command_status,
             "mark-success": command_mark_success,
             "validation-failed": command_validation_failed,
+            "rollback": command_rollback,
         }[args.command](config, args) or 0
     except (UpgradeError, FileNotFoundError, ValueError, subprocess.SubprocessError) as exc:
         print(f"recovera-upgrade: {exc}", file=sys.stderr)

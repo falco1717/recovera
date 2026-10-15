@@ -15,9 +15,21 @@ jobs:
       - uses: actions/checkout@v4
       - name: Validate scripts
         run: |
-          bash -n install.sh setup/setup.sh tests/e2e-recovera-peer.sh
+          bash -n install.sh setup/setup.sh tests/e2e-recovera-peer.sh \
+            tools/build-package-release.sh tools/build-recovera-appliance-deb.sh \
+            tools/publish-package-release.sh tools/make-bundle.sh
           php -l setup/branding/RecoveraTargetController.php
           php -l tests/integration_recovera_auth.php
-          python3 -m py_compile setup/peer/recovera-peer setup/branding/apply-branding.py
+          python3 -m py_compile setup/peer/recovera-peer setup/branding/apply-branding.py \
+            upgrade/recovera-upgrade
+      - name: Build package update fixtures
+        run: |
+          bash tools/build-recovera-appliance-deb.sh \
+            --version "$(tr -d '[:space:]' < VERSION)-1" --output /tmp/recovera-debs
+          test "$(dpkg-deb -f /tmp/recovera-debs/recovera-appliance_*_all.deb Package)" = recovera-appliance
+          bash tools/build-package-release.sh \
+            --packages /tmp/recovera-debs --version 0.6.1 --sequence 1 \
+            --output /tmp/recovera-package-release
+          python3 -c 'import json; p=json.load(open("/tmp/recovera-package-release/recovera-package-manifest.json")); assert p["schema"] == 2 and p["type"] == "package" and len(p["packages"]) == 1'
       - name: Run unit tests
         run: python3 -m unittest discover -s tests -p 'test_*.py'

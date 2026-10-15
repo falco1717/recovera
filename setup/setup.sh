@@ -12,7 +12,7 @@
 #   sudo ./setup.sh status     show progress / follow the log of a running setup
 #   sudo ./setup.sh verify     health check of a finished replica
 #   sudo ./setup.sh install-peer install/update only the peer-replication service
-#   sudo ./setup.sh install-updater install/update only the signed image updater
+#   sudo ./setup.sh install-updater install/update only the signed updater
 #   sudo ./setup.sh apply-branding apply/update only the Recovera WebUI branding
 #
 # Resumable: finished phases are recorded in /var/lib/spf-datto-setup; just run it again.
@@ -1110,8 +1110,8 @@ PY
 }
 
 p79_image_updater() {
-  local source="$INSTALL_DIR/upgrade"
-  [ -x "$source/recovera-upgrade" ] || { log "Recovera image updater is missing"; return 1; }
+  local source="$INSTALL_DIR/upgrade" baseline
+  [ -x "$source/recovera-upgrade" ] || { log "Recovera updater is missing"; return 1; }
   [ -f "$source/keys/recovera-release-signers" ] || { log "Recovera release signer list is missing"; return 1; }
   install -d -m 0755 /etc/recovera /usr/local/lib/recovera-upgrade \
     /usr/local/share/recovera-upgrade /host/recovera || return 1
@@ -1142,7 +1142,12 @@ p79_image_updater() {
   fi
   systemctl daemon-reload || return 1
   systemctl enable recovera-upgrade-check.timer recovera-upgrade-validate.service >/dev/null || return 1
-  log "signed Recovera image updater installed; image activation remains disabled until an image-layout marker is provisioned"
+  baseline=$(find "$INSTALL_DIR/debs" -maxdepth 1 -type f -name 'recovera-appliance_*.deb' -print -quit 2>/dev/null)
+  if [ -n "$baseline" ] && ! dpkg-query -W -f='${db:Status-Abbrev}' recovera-appliance 2>/dev/null | grep -q '^ii'; then
+    dpkg -i "$baseline" >/dev/null || return 1
+    log "installed Recovera application package rollback baseline"
+  fi
+  log "signed Recovera package updater installed; full-image activation remains disabled until an image-layout marker is provisioned"
 }
 
 net_revert() {
@@ -1391,7 +1396,7 @@ run_all() {
   phase p76 "persistent backup administrator"                  p76_backup_admin
   phase p77 "Recovera application branding"                    p77_recovera_branding
   phase p78 "offline appliance-to-appliance replication"       p78_peer_replication
-  phase p79 "signed image upgrade client"                       p79_image_updater
+  phase p79 "signed package and image upgrade client"           p79_image_updater
   phase p80 "NetworkManager bridge br0"                       p80_network
   phase p85 "apt sources"                                     p85_apt
   log "== p90: post-boot verification timer (re-armed every run)"

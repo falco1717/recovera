@@ -1,5 +1,5 @@
 [Unit]
-Description=Check for a signed Recovera image update
+Description=Check for a signed Recovera update
 After=network-online.target
 Wants=network-online.target
 ConditionPathExists=/etc/recovera/upgrade.conf

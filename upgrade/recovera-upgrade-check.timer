@@ -1,5 +1,5 @@
 [Unit]
-Description=Daily Recovera image-update discovery
+Description=Daily Recovera update discovery
 
 [Timer]
 OnBootSec=15min

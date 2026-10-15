@@ -42,6 +42,27 @@ class RecoveraUpgradeTests(unittest.TestCase):
             },
         }
 
+    def package_manifest(self):
+        return {
+            "schema": 2,
+            "type": "package",
+            "version": "0.7.1",
+            "sequence": 8,
+            "channel": "stable",
+            "architecture": "amd64",
+            "minimum_updater": 2,
+            "download_size": 1234,
+            "reboot_required": False,
+            "packages": [{
+                "name": "recovera-peer",
+                "version": "0.7.1-1",
+                "architecture": "all",
+                "asset": "recovera-peer_0.7.1-1_all.deb",
+                "size": 1234,
+                "sha256": "d" * 64,
+            }],
+        }
+
     def test_manifest_requires_channel_pointer_agreement(self):
         pointer = {"version": "0.7.0", "sequence": 7}
         config = {"CHANNEL": "stable"}
@@ -59,6 +80,56 @@ class RecoveraUpgradeTests(unittest.TestCase):
                 self.module.validate_manifest(
                     manifest, {"version": "0.7.0", "sequence": 7}, {"CHANNEL": "stable"}
                 )
+
+    def test_package_manifest_accepts_small_application_release(self):
+        manifest = self.package_manifest()
+        pointer = {"version": "0.7.1", "sequence": 8}
+        with mock.patch.object(self.module.platform, "machine", return_value="x86_64"):
+            result = self.module.validate_manifest(manifest, pointer, {"CHANNEL": "stable"})
+        self.assertEqual(result["download_size"], 1234)
+        self.assertEqual(result["type"], "package")
+
+    def test_package_manifest_rejects_boot_and_platform_packages(self):
+        pointer = {"version": "0.7.1", "sequence": 8}
+        for name in ("linux-image-6.8.0-94-generic", "grub-pc", "systemd", "zfsutils-linux"):
+            with self.subTest(name=name):
+                manifest = self.package_manifest()
+                manifest["packages"][0]["name"] = name
+                with mock.patch.object(self.module.platform, "machine", return_value="x86_64"):
+                    with self.assertRaises(self.module.UpgradeError):
+                        self.module.validate_manifest(manifest, pointer, {"CHANNEL": "stable"})
+
+    def test_package_manifest_rejects_bad_size_and_traversal(self):
+        pointer = {"version": "0.7.1", "sequence": 8}
+        for mutation in ("size", "path"):
+            manifest = self.package_manifest()
+            if mutation == "size":
+                manifest["download_size"] += 1
+            else:
+                manifest["packages"][0]["asset"] = "../recovera.deb"
+            with mock.patch.object(self.module.platform, "machine", return_value="x86_64"):
+                with self.assertRaises(self.module.UpgradeError):
+                    self.module.validate_manifest(manifest, pointer, {"CHANNEL": "stable"})
+
+    def test_package_install_is_offline_and_allows_no_removals(self):
+        command = self.module.package_apt_command("install", [Path("/tmp/recovera.deb")])
+        self.assertIn("--no-download", command)
+        self.assertIn("Dir::Etc::sourcelist=/dev/null", command)
+        self.assertIn("Dir::Etc::sourceparts=/dev/null", command)
+        with mock.patch.object(self.module, "run") as runner:
+            runner.return_value = mock.Mock(returncode=0, stdout=b"Remv openssh-server [1]\n", stderr=b"")
+            with self.assertRaises(self.module.UpgradeError):
+                self.module.verify_package_plan([Path("/tmp/recovera.deb")])
+        with mock.patch.object(self.module, "run") as runner, \
+             mock.patch.object(self.module, "dpkg_field", return_value="recovera-appliance"):
+            runner.return_value = mock.Mock(returncode=0, stdout=b"Inst unsigned-helper (1 local)\n", stderr=b"")
+            with self.assertRaises(self.module.UpgradeError):
+                self.module.verify_package_plan([Path("/tmp/recovera.deb")])
+
+    def test_operator_can_request_package_rollback(self):
+        arguments = self.module.parser().parse_args(["rollback", "--reboot"])
+        self.assertEqual(arguments.command, "rollback")
+        self.assertTrue(arguments.reboot)
 
     def test_pointer_rejects_path_traversal_before_asset_download(self):
         arguments = mock.Mock(
@@ -112,7 +183,7 @@ class RecoveraUpgradeTests(unittest.TestCase):
 
     def test_setup_installs_but_does_not_enable_image_layout(self):
         setup = (ROOT / "setup" / "setup.sh").read_text()
-        self.assertIn('phase p79 "signed image upgrade client"', setup)
+        self.assertIn('phase p79 "signed package and image upgrade client"', setup)
         self.assertIn("p79_image_updater()", setup)
         self.assertNotIn("image-layout.json <<", setup)
 
@@ -128,6 +199,25 @@ class RecoveraUpgradeTests(unittest.TestCase):
         self.assertIn('xz -T0 "-$COMPRESSION_LEVEL"', builder)
         self.assertIn("minimum_bytes + 2 * 1024 * 1024 * 1024", builder)
         self.assertIn("RECOVERA_IMAGE_WORK_ROOT", builder)
+
+    def test_package_release_is_signed_small_and_blocks_platform_changes(self):
+        builder = (ROOT / "tools" / "build-package-release.sh").read_text()
+        publisher = (ROOT / "tools" / "publish-package-release.sh").read_text()
+        self.assertIn("recovera-package-manifest.json", builder)
+        self.assertIn("minimum_updater': 2", builder)
+        self.assertIn("platform package", builder)
+        self.assertIn("-n recovera-upgrade", builder)
+        self.assertIn("package-v$VERSION", publisher)
+        self.assertIn(".packages[].asset", publisher)
+
+    def test_fresh_bundle_builds_control_plane_rollback_baseline(self):
+        bundle = (ROOT / "tools" / "make-bundle.sh").read_text()
+        control = (ROOT / "tools" / "build-recovera-appliance-deb.sh").read_text()
+        self.assertIn("build-recovera-appliance-deb.sh", bundle)
+        self.assertIn("Package: recovera-appliance", control)
+        self.assertIn("recovera-upgrade-check.timer", control)
+        self.assertIn("apply-branding.py", control)
+        self.assertIn("REQUIRE_BASELINE_PACKAGES=recovera-appliance", (ROOT / "upgrade" / "recovera-upgrade.conf").read_text())
 
     def test_assembler_reclaims_verified_parts_before_decompression(self):
         self.assertIn("local.unlink()", UPDATER.read_text())
