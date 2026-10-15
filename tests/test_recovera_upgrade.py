@@ -127,6 +127,10 @@ class RecoveraUpgradeTests(unittest.TestCase):
         self.assertIn('--compression-level)', builder)
         self.assertIn('xz -T0 "-$COMPRESSION_LEVEL"', builder)
         self.assertIn("minimum_bytes + 2 * 1024 * 1024 * 1024", builder)
+        self.assertIn("RECOVERA_IMAGE_WORK_ROOT", builder)
+
+    def test_assembler_reclaims_verified_parts_before_decompression(self):
+        self.assertIn("local.unlink()", UPDATER.read_text())
 
     def test_configuration_migration_is_allowlisted(self):
         migration = (ROOT / "upgrade" / "recovera-migrate-config").read_text()
@@ -134,6 +138,7 @@ class RecoveraUpgradeTests(unittest.TestCase):
         self.assertIn("/etc/recovera-peer", migration)
         self.assertIn("/etc/NetworkManager/system-connections", migration)
         self.assertIn("/etc/fstab", migration)
+        self.assertIn("/etc/hosts", migration)
         self.assertNotIn("copy_path /etc\n", migration)
         self.assertNotIn("/home/agents", migration)
 
@@ -142,6 +147,7 @@ class RecoveraUpgradeTests(unittest.TestCase):
         for value in (
             "github-token", "backup-admin.json", "ssh_host_*", "deviceID",
             "/etc/machine-id", "/etc/recovera-peer", "/var/lib/recovera-peer",
+            "recovera.localdomain recovera",
         ):
             self.assertIn(value, builder)
 
@@ -160,9 +166,12 @@ class RecoveraUpgradeTests(unittest.TestCase):
         grub = (ROOT / "upgrade" / "07_recovera_images").read_text()
         local_top = (ROOT / "upgrade" / "initramfs-local-top-recovera").read_text()
         self.assertIn("root=LABEL=recovera-root", grub)
-        self.assertIn('wait-for-root "$host_device" 30', local_top)
+        self.assertIn('remaining=30', local_top)
+        self.assertIn('[ -e "$host_device" ] || panic', local_top)
         boot = (ROOT / "upgrade" / "recovera-image-boot").read_text()
         self.assertIn("unset next_entry initrdfail prev_entry prev_saved_entry", boot)
+        self.assertIn("boot_root_uuid", boot)
+        self.assertIn('chroot "$boot_root"', boot)
 
     def test_updater_can_be_installed_without_rerunning_setup(self):
         setup = (ROOT / "setup" / "setup.sh").read_text()

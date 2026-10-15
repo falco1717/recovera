@@ -8,28 +8,66 @@ layout=/etc/recovera/image-layout.json
 [ -f "$layout" ] || { echo "Recovera image layout is not configured" >&2; exit 1; }
 mode=$(python3 -c 'import json; print(json.load(open("/etc/recovera/image-layout.json"))["mode"])')
 [ "$mode" = loop-image-v1 ] || { echo "unsupported image layout: $mode" >&2; exit 1; }
+boot_root_uuid=$(python3 -c 'import json; print(json.load(open("/etc/recovera/image-layout.json")).get("boot_root_uuid", ""))')
+[[ -z "$boot_root_uuid" || "$boot_root_uuid" =~ ^[0-9A-Fa-f-]{4,64}$ ]] || {
+  echo "invalid boot-root UUID" >&2; exit 1;
+}
+
+boot_root=
+cleanup() {
+  set +e
+  [ -n "$boot_root" ] || return 0
+  for path in host sys proc dev; do umount "$boot_root/$path" 2>/dev/null || true; done
+  umount "$boot_root" 2>/dev/null || true
+}
+trap cleanup EXIT
+
+prepare_boot_root() {
+  [ -n "$boot_root_uuid" ] || return 0
+  current_source=$(findmnt -n -o SOURCE /)
+  current_uuid=$(blkid -s UUID -o value "$current_source" 2>/dev/null || true)
+  [ "$current_uuid" != "$boot_root_uuid" ] || return 0
+
+  boot_root=/run/recovera-boot-root
+  mkdir -p "$boot_root"
+  mount "/dev/disk/by-uuid/$boot_root_uuid" "$boot_root"
+  mkdir -p "$boot_root"/{dev,proc,sys,host,etc/recovera,etc/grub.d,etc/default/grub.d}
+  mount --bind /dev "$boot_root/dev"
+  mount -t proc proc "$boot_root/proc"
+  mount -t sysfs sysfs "$boot_root/sys"
+  mount --bind /host "$boot_root/host"
+  install -m 0644 "$layout" "$boot_root$layout"
+  install -m 0755 /etc/grub.d/07_recovera_images "$boot_root/etc/grub.d/07_recovera_images"
+  install -m 0644 /etc/default/grub.d/99_recovera_images.cfg "$boot_root/etc/default/grub.d/99_recovera_images.cfg"
+}
+
+on_boot_root() {
+  if [ -n "$boot_root" ]; then chroot "$boot_root" "$@"; else "$@"; fi
+}
+
+prepare_boot_root
 
 valid_version() { [[ "$1" =~ ^[0-9A-Za-z][0-9A-Za-z._-]{0,63}$ ]]; }
 entry() { printf 'recovera-%s' "$1"; }
 clear_transient_boot_state() {
-  grub-editenv /boot/grub/grubenv unset next_entry initrdfail prev_entry prev_saved_entry
+  on_boot_root grub-editenv /boot/grub/grubenv unset next_entry initrdfail prev_entry prev_saved_entry
 }
 
 case "${1:-}" in
   stage)
     [ "$#" -eq 3 ] && valid_version "$2" && [ -f "$3" ] || exit 2
     clear_transient_boot_state
-    update-grub
-    grub-reboot "$(entry "$2")"
+    on_boot_root update-grub
+    on_boot_root grub-reboot "$(entry "$2")"
     ;;
   commit)
     [ "$#" -eq 3 ] && valid_version "$2" && [ -f "$3" ] || exit 2
-    grub-set-default "$(entry "$2")"
+    on_boot_root grub-set-default "$(entry "$2")"
     clear_transient_boot_state
     ;;
   rollback)
     [ "$#" -eq 2 ] && valid_version "$2" || exit 2
-    grub-set-default "$(entry "$2")"
+    on_boot_root grub-set-default "$(entry "$2")"
     clear_transient_boot_state
     ;;
   fallback)
@@ -38,7 +76,7 @@ case "${1:-}" in
     [[ "$fallback_entry" =~ ^[0-9A-Za-z][0-9A-Za-z._-]{0,127}$ ]] || {
       echo "invalid conventional fallback entry" >&2; exit 1;
     }
-    grub-set-default "$fallback_entry"
+    on_boot_root grub-set-default "$fallback_entry"
     clear_transient_boot_state
     ;;
   *) echo "usage: $0 {stage VERSION IMAGE|commit VERSION IMAGE|rollback VERSION|fallback}" >&2; exit 2 ;;

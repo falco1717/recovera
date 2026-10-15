@@ -11,6 +11,7 @@ OUTPUT=
 SIGNING_KEY=
 PART_SIZE=1900M
 COMPRESSION_LEVEL=6
+WORK_ROOT=${RECOVERA_IMAGE_WORK_ROOT:-/var/tmp}
 
 usage() {
   echo "usage: sudo $0 --root DIR --version VERSION --sequence N --output DIR [--signing-key FILE] [--channel NAME] [--compression-level 0-9]" >&2
@@ -37,8 +38,8 @@ for command in rsync mkfs.ext4 e2fsck resize2fs xz split ssh-keygen jq; do
   command -v "$command" >/dev/null || { echo "missing command: $command" >&2; exit 1; }
 done
 
-mkdir -p "$OUTPUT"
-work=$(mktemp -d /var/tmp/recovera-image-build.XXXXXX)
+mkdir -p "$OUTPUT" "$WORK_ROOT"
+work=$(mktemp -d "$WORK_ROOT/recovera-image-build.XXXXXX")
 mountpoint=$work/root
 image=$work/recovera-$VERSION.img
 mounted=no
@@ -80,6 +81,14 @@ rm -f "$mountpoint/etc/recovera/github-token" \
   "$mountpoint/etc/ssh"/ssh_host_* "$mountpoint/datto/config/deviceID"
 : > "$mountpoint/etc/machine-id"
 printf 'recovera\n' > "$mountpoint/etc/hostname"
+cat > "$mountpoint/etc/hosts" <<'EOF'
+127.0.0.1 localhost
+127.0.1.1 recovera.localdomain recovera
+
+::1 localhost ip6-localhost ip6-loopback
+ff02::1 ip6-allnodes
+ff02::2 ip6-allrouters
+EOF
 chroot "$mountpoint" passwd -l backup-admin >/dev/null 2>&1 || true
 mkdir -p "$mountpoint"/{dev,proc,sys,run,tmp,host,mnt,media,var/tmp} \
   "$mountpoint/usr/local/lib/recovera-upgrade" \

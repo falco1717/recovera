@@ -24,6 +24,7 @@ for path in \
   /etc/NetworkManager/system-connections \
   /etc/machine-id \
   /etc/hostname \
+  /etc/hosts \
   /etc/hostid \
   /etc/fstab \
   /opt/spf-datto/setup.conf; do

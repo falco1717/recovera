@@ -341,6 +341,10 @@ def assemble_image(config, manifest, assets, work):
                 raise UpgradeError(f"image part verification failed: {part['name']}")
             with local.open("rb") as source:
                 shutil.copyfileobj(source, combined, 1024 * 1024)
+            # The combined stream is independently verified below. Reclaim each
+            # split part immediately so a 40 GB image host can hold the current
+            # image, compressed candidate, and uncompressed candidate together.
+            local.unlink()
     if compressed.stat().st_size != int(image["size"]) or sha256(compressed) != image["sha256"]:
         raise UpgradeError("combined compressed image verification failed")
     return compressed

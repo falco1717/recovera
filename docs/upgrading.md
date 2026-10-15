@@ -11,6 +11,11 @@ provision `/host`, the GRUB loop-image integration, and
 `/etc/recovera/image-layout.json`. Until that marker exists, `install` fails
 before downloading or changing boot state.
 
+The layout marker also records `boot_root_uuid`, the UUID of the conventional
+root containing the GRUB configuration and environment. When an appliance is
+running from a loop image, staging, commit, and rollback mount that boot root
+explicitly so all three operations update the files firmware actually reads.
+
 ## Appliance commands
 
 ```bash
