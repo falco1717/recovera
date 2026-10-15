@@ -4,9 +4,11 @@ The Recovera OVA contains a complete, unregistered Ubuntu 22.04 appliance. It
 is an alternative to running `install.sh` on an existing VM; both deployment
 paths produce the same application and offline registration workflow.
 
-The validated v0.6.0 image is `Recovera-v0.6.0-final.ova` (24,237,242,368
-bytes). Verify it with the digest in
-[`Recovera-v0.6.0-final.sha256`](Recovera-v0.6.0-final.sha256) before import.
+Release OVAs must be no larger than 3,000,000,000 bytes (3 GB). The validated
+v0.6.0 artifact is `Recovera-Virtual-Appliance-v0.6.0.ova`, 2,462,407,168 bytes
+(2.2933 GiB), with SHA-256
+`CB44937826F960CDD2824EFD88D9CF570162AB5E942D6FEB601D92E379644785`.
+Verify the downloaded image against its published digest before import.
 
 ## Import and register
 
@@ -64,10 +66,29 @@ sudo tools/prepare-ova.sh
 ```
 
 The script refuses unsafe source state, stops network-facing services, removes
-clone-sensitive data and logs, installs the one-time initializer, and tells you
-when preparation is complete. Power the VM off immediately and export it
-without booting it again. Booting the prepared builder consumes its one-time
-initializer and makes it unsuitable for export until it is prepared again.
+clone-sensitive data and logs, rebuilds the empty ZFS data pool, zeroes and
+trims unused system-disk space, installs the one-time initializer, and tells
+you when preparation is complete. Power the VM off immediately and export it
+as stream-optimized VMDKs without booting it again. Booting the prepared
+builder consumes its one-time initializer and makes it unsuitable for export
+until it is prepared again.
+
+If the builder's system disk is thick-provisioned, make a powered-off thin
+clone after preparation and export that clone. Zero filling makes the clone
+sparse; exporting the original thick disk can still force vCenter to read the
+entire provisioned capacity even though the resulting VMDK is compressed.
+
+Validate the exported artifact before publication. The check rejects images
+over 3 GB, unexpected archive members, an incorrect disk count, and disks
+that were not exported in VMware stream-optimized format:
+
+```bash
+tools/check-ova.sh /path/to/Recovera-VERSION.ova
+```
+
+Build from the clean Ubuntu base image. Do not use a vendor appliance image as
+the redistributable base: it can contain third-party proprietary packages,
+identities, or licensing state that Recovera is not authorized to publish.
 
 Always import the resulting OVA twice and verify that the two instances report
 different peer appliance IDs and TLS fingerprints. Complete registration on a

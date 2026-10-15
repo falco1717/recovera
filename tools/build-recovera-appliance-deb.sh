@@ -25,7 +25,9 @@ mkdir -p "$stage/DEBIAN" "$stage/usr/local/sbin" "$stage/usr/local/lib/recovera"
   "$stage/usr/local/share/recovera" "$stage/usr/lib/recovera/branding" \
   "$stage/usr/share/recovera/defaults" "$stage/etc/systemd/system" \
   "$stage/etc/apache2/conf-available" "$stage/etc/ssh/sshd_config.d" \
-  "$stage/etc/sudoers.d" "$stage/etc/update-motd.d"
+  "$stage/etc/sudoers.d" "$stage/etc/update-motd.d" \
+  "$stage/etc/systemd/system/datto-sshd-configure.service.d" \
+  "$stage/etc/systemd/system/datto-firewall-share-sync.service.d"
 
 cat > "$stage/DEBIAN/control" <<EOF
 Package: recovera-appliance
@@ -33,6 +35,7 @@ Version: $VERSION
 Section: admin
 Priority: optional
 Architecture: all
+Maintainer: Recovera Project <noreply@recovera.local>
 Depends: python3, openssh-client, openssh-server, sudo, apache2, php8.1-fpm, xz-utils
 Description: Recovera appliance control plane
  Recovera branding, private replication, administrator integration, and signed
@@ -41,6 +44,7 @@ EOF
 
 install -m 0755 "$ROOT/setup/peer/recovera-peer" "$stage/usr/local/sbin/recovera-peer"
 install -m 0755 "$ROOT/setup/peer/recovera-backup-admin" "$stage/usr/local/sbin/recovera-backup-admin"
+install -m 0755 "$ROOT/setup/peer/recovera-sshd-policy" "$stage/usr/local/sbin/recovera-sshd-policy"
 install -m 0644 "$ROOT/setup/peer/recovera-auth.php" "$stage/usr/local/lib/recovera/authenticate.php"
 install -m 0644 "$ROOT/setup/peer/recovera-peer.service" "$stage/etc/systemd/system/"
 install -m 0644 "$ROOT/setup/peer/recovera-peer-sync.service" "$stage/etc/systemd/system/"
@@ -48,6 +52,10 @@ install -m 0644 "$ROOT/setup/peer/recovera-peer-sync.timer" "$stage/etc/systemd/
 install -m 0644 "$ROOT/setup/peer/recovera-peer-gateway.conf" "$stage/etc/apache2/conf-available/"
 install -m 0644 "$ROOT/setup/peer/sshd-recovera-peer.conf" "$stage/etc/ssh/sshd_config.d/91-recovera-peer.conf"
 install -m 0440 "$ROOT/setup/peer/sudoers-recovera-peer" "$stage/etc/sudoers.d/recovera-peer"
+install -m 0644 "$ROOT/setup/peer/datto-sshd-configure-recovera.conf" \
+  "$stage/etc/systemd/system/datto-sshd-configure.service.d/recovera.conf"
+install -m 0644 "$ROOT/setup/peer/datto-firewall-share-sync-recovera.conf" \
+  "$stage/etc/systemd/system/datto-firewall-share-sync.service.d/recovera.conf"
 
 cp -a "$ROOT/setup/branding/." "$stage/usr/lib/recovera/branding/"
 install -m 0644 "$ROOT/setup/branding/recovera-logo.png" "$stage/usr/local/share/recovera/recovera-logo.png"

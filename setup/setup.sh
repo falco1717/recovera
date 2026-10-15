@@ -907,33 +907,40 @@ p75_protection_engine() {
     tail -n 40 "$test_log"
     return 1
   }
+  install -d -m 0755 /var/lib/recovera
+  touch /var/lib/recovera/libguestfs-self-test-passed
   log "libguestfs/KVM disk-inspection engine passed"
 }
 
 p76_backup_admin() {
-  local helper="$INSTALL_DIR/peer/recovera-backup-admin"
+  local helper="$INSTALL_DIR/peer/recovera-backup-admin" policy dropin firewall_dropin
   [ -f "$helper" ] || { log "Recovera backup administrator helper is missing"; return 1; }
+  policy="$INSTALL_DIR/peer/recovera-sshd-policy"
+  dropin="$INSTALL_DIR/peer/datto-sshd-configure-recovera.conf"
+  firewall_dropin="$INSTALL_DIR/peer/datto-firewall-share-sync-recovera.conf"
+  [ -f "$policy" ] && [ -f "$dropin" ] && [ -f "$firewall_dropin" ] || {
+    log "Recovera service policy hook is missing"
+    return 1
+  }
   install -m 0755 "$helper" /usr/local/sbin/recovera-backup-admin || return 1
+  install -m 0755 "$policy" /usr/local/sbin/recovera-sshd-policy || return 1
+  install -d -m 0755 /etc/systemd/system/datto-sshd-configure.service.d || return 1
+  install -m 0644 "$dropin" \
+    /etc/systemd/system/datto-sshd-configure.service.d/recovera.conf || return 1
+  install -d -m 0755 /etc/systemd/system/datto-firewall-share-sync.service.d || return 1
+  install -m 0644 "$firewall_dropin" \
+    /etc/systemd/system/datto-firewall-share-sync.service.d/recovera.conf || return 1
   /usr/local/sbin/recovera-backup-admin install || return 1
   chown root:root /etc/recovera/backup-admin.json || return 1
   chmod 0600 /etc/recovera/backup-admin.json || return 1
   # Allow password SSH only for the appliance recovery administrator. Ubuntu's
   # cloud-image drop-in disables it globally, while peer transport remains
   # key-only under its own Match block.
-  rm -f /etc/ssh/sshd_config.d/60-cloudimg-settings.conf
-  # OpenSSH uses the first obtained value. This file must sort before Ubuntu's
-  # 50-cloud-init.conf, which may otherwise keep password authentication on.
-  rm -f /etc/ssh/sshd_config.d/59-recovera-password-policy.conf
-  cat > /etc/ssh/sshd_config.d/49-recovera-password-policy.conf <<'EOF'
-PasswordAuthentication no
-KbdInteractiveAuthentication no
-EOF
-  cat > /etc/ssh/sshd_config.d/92-recovera-backup-admin.conf <<'EOF'
-Match User backup-admin
-    PasswordAuthentication yes
-    KbdInteractiveAuthentication no
-EOF
-  sshd -t || return 1
+  # The appliance package may replace sshd_config with a file that has no
+  # Include directive at all. In that case every policy below would be ignored,
+  # leaving OpenSSH's default PasswordAuthentication=yes in effect globally.
+  systemctl daemon-reload || return 1
+  /usr/local/sbin/recovera-sshd-policy --validate || return 1
   systemctl reload ssh || return 1
   log "backup-admin local appliance account is ready; retrieve it from Appliance Access or with: sudo recovera-backup-admin show"
 }
@@ -1325,7 +1332,7 @@ verify() {
                                                             "[ $mem_gb -ge $MIN_RAM_GB ]"
   if [ "$REQUIRE_KVM" = yes ]; then
     check "hardware virtualization available (/dev/kvm)"  "kvm_ready"
-    check "libguestfs/KVM self-test passed"                "grep -q 'TEST FINISHED OK' /var/log/spf-datto-libguestfs-test.log"
+    check "libguestfs/KVM self-test passed"                "test -f /var/lib/recovera/libguestfs-self-test-passed || grep -q 'TEST FINISHED OK' /var/log/spf-datto-libguestfs-test.log"
   fi
   if [ "$ZFS_CONFIGURE" != no ] && zpool list -H "$ZFS_POOL" >/dev/null 2>&1; then
     check "$ZFS_POOL ONLINE"                               "[ \"\$(zpool list -H -o health $ZFS_POOL)\" = ONLINE ]"

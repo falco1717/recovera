@@ -24,6 +24,17 @@ if [ -f /etc/NetworkManager/system-connections/br0.nmconnection ]; then
     /etc/NetworkManager/system-connections/br0.nmconnection
 fi
 
+# ZFS services normally run later in boot, but backup-admin's home must be
+# created on the appliance data pool rather than in the root filesystem hidden
+# beneath /home. Import, assign the clone a new pool GUID, and mount the empty
+# datasets before creating any local appliance account.
+zgenhostid -f
+if ! zpool list -H homePool >/dev/null 2>&1; then
+  zpool import -N -f homePool
+fi
+zpool reguid homePool
+zfs mount -a
+
 # Every deployment receives a new administrative password and a new peer
 # identity. No credential, pairing, or source/target relationship is cloned.
 /usr/local/sbin/recovera-backup-admin install
@@ -63,15 +74,6 @@ temporary.write_text(str(int(config['numeric_id'])) + '\n')
 temporary.chmod(0o644)
 os.replace(temporary, device_id)
 PY
-
-# ZFS services run after this pre-network identity unit. Import the local data
-# pool without mounting it so the clone can receive a new pool GUID now; the
-# normal ZFS mount service will mount its datasets later in the boot.
-zgenhostid -f
-if ! zpool list -H homePool >/dev/null 2>&1; then
-  zpool import -N -f homePool
-fi
-zpool reguid homePool
 
 install -d -m 0755 "$(dirname "$MARKER")"
 date -u +'%FT%TZ' > "$MARKER"
