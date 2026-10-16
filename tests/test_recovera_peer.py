@@ -51,6 +51,7 @@ def load_module(root: Path):
     os.environ["RECOVERA_UPGRADE_COMMAND"] = str(root / "recovera-upgrade")
     os.environ["RECOVERA_UPGRADE_CONFIG"] = str(root / "upgrade.conf")
     os.environ["RECOVERA_UPGRADE_TOKEN"] = str(root / "github-token")
+    os.environ["RECOVERA_UPGRADE_POLICY"] = str(root / "update-policy.json")
     loader = importlib.machinery.SourceFileLoader("recovera_peer_test", str(SCRIPT))
     spec = importlib.util.spec_from_loader(loader.name, loader)
     module = importlib.util.module_from_spec(spec)
@@ -128,6 +129,21 @@ class RecoveraPeerTests(unittest.TestCase):
         self.assertIn("'update-status' => ['GET'", controller)
         self.assertIn("'update-check' => ['GET'", controller)
         self.assertIn("'update-install' => ['POST'", controller)
+        self.assertIn("'update-policy' =>", controller)
+
+    def test_update_policy_controls_native_channel_and_window(self):
+        self.assertEqual(self.peer.upgrade_policy(), {
+            "channel": "stable", "window": {"start": 21, "end": 5}
+        })
+        value = self.peer.set_upgrade_policy({
+            "channel": "none", "window": {"start": 22, "end": 6}
+        })
+        self.assertEqual(value["policy"]["channel"], "none")
+        self.assertEqual(self.peer.upgrade_policy()["window"], {"start": 22, "end": 6})
+        with self.assertRaises(self.peer.PeerError):
+            self.peer.set_upgrade_policy({
+                "channel": "stable", "window": {"start": 1, "end": 3}
+            })
 
     def test_web_update_defers_service_restart_until_transaction_finishes(self):
         self.peer.UPGRADE_COMMAND.parent.mkdir(parents=True, exist_ok=True)

@@ -239,6 +239,7 @@ class RecoveraUpgradeTests(unittest.TestCase):
         self.assertIn("build-recovera-appliance-deb.sh", bundle)
         self.assertIn("Package: recovera-appliance", control)
         self.assertIn("recovera-upgrade-check.timer", control)
+        self.assertIn("recovera-upgrade-schedule", control)
         self.assertIn("apply-branding.py", control)
         self.assertIn("REQUIRE_BASELINE_PACKAGES=recovera-appliance", (ROOT / "upgrade" / "recovera-upgrade.conf").read_text())
         self.assertIn("RECOVERA_DEFER_SERVICE_RESTART", control)
@@ -247,6 +248,11 @@ class RecoveraUpgradeTests(unittest.TestCase):
         self.assertIn("/etc/systemd/system/datto-firewall-share-sync.service.d", control)
         self.assertIn("/usr/share/recovera/defaults", control)
         self.assertIn("/usr/local/lib/recovera-upgrade", control)
+        schedule = (ROOT / "upgrade" / "recovera-upgrade-schedule").read_text()
+        self.assertIn('channel == "none"', schedule)
+        self.assertIn('UPDATER, "check", "--cache"', schedule)
+        timer = (ROOT / "upgrade" / "recovera-upgrade-check.timer").read_text()
+        self.assertIn("OnCalendar=hourly", timer)
 
     def test_assembler_reclaims_verified_parts_before_decompression(self):
         self.assertIn("local.unlink()", UPDATER.read_text())

@@ -1,13 +1,14 @@
 [Unit]
-Description=Check for a signed Recovera update
+Description=Check for a signed Recovera update during the configured window
 After=network-online.target
 Wants=network-online.target
 ConditionPathExists=/etc/recovera/upgrade.conf
 
 [Service]
 Type=oneshot
-ExecStart=/usr/local/sbin/recovera-upgrade check --cache
+ExecStart=/usr/local/sbin/recovera-upgrade-schedule
 SuccessExitStatus=3
 PrivateTmp=yes
 ProtectSystem=strict
-ReadWritePaths=-/host/recovera
+ReadOnlyPaths=-/etc/recovera/update-policy.json
+ReadWritePaths=-/host/recovera -/var/lib/recovera-upgrade

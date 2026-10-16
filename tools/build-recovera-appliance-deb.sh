@@ -63,6 +63,7 @@ install -m 0644 "$ROOT/setup/branding/recovera-ascii.logo" "$stage/usr/local/sha
 install -m 0755 "$ROOT/setup/branding/recovera-motd" "$stage/etc/update-motd.d/25-recovera"
 
 install -m 0755 "$ROOT/upgrade/recovera-upgrade" "$stage/usr/local/sbin/recovera-upgrade"
+install -m 0755 "$ROOT/upgrade/recovera-upgrade-schedule" "$stage/usr/local/sbin/recovera-upgrade-schedule"
 install -m 0755 "$ROOT/upgrade/recovera-image-boot" "$stage/usr/local/lib/recovera-upgrade/"
 install -m 0755 "$ROOT/upgrade/recovera-migrate-config" "$stage/usr/local/lib/recovera-upgrade/"
 install -m 0644 "$ROOT/upgrade/keys/recovera-release-signers" "$stage/usr/local/share/recovera-upgrade/release-signers"

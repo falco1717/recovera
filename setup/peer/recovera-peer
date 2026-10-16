@@ -31,7 +31,7 @@ import uuid
 from pathlib import Path
 from typing import Any, BinaryIO
 
-VERSION = "0.6.2"
+VERSION = "0.6.4"
 ETC = Path(os.environ.get("RECOVERA_PEER_ETC", "/etc/recovera-peer"))
 STATE_DIR = Path(os.environ.get("RECOVERA_PEER_STATE", "/var/lib/recovera-peer"))
 CONFIG_PATH = ETC / "config.json"
@@ -70,6 +70,9 @@ UPGRADE_CONFIG_PATH = Path(os.environ.get(
 ))
 UPGRADE_TOKEN_PATH = Path(os.environ.get(
     "RECOVERA_UPGRADE_TOKEN", "/etc/recovera/github-token"
+))
+UPGRADE_POLICY_PATH = Path(os.environ.get(
+    "RECOVERA_UPGRADE_POLICY", "/etc/recovera/update-policy.json"
 ))
 ASSET_RE = re.compile(r"^[0-9a-fA-F]{32}$")
 SNAPSHOT_RE = re.compile(r"^[0-9]{1,20}$")
@@ -1379,6 +1382,49 @@ def upgrade_output(command: str, *, timeout: int) -> subprocess.CompletedProcess
     return result
 
 
+def default_upgrade_policy() -> dict[str, Any]:
+    return {"channel": "stable", "window": {"start": 21, "end": 5}}
+
+
+def upgrade_policy() -> dict[str, Any]:
+    value = load_json(UPGRADE_POLICY_PATH, default_upgrade_policy())
+    if not isinstance(value, dict) or value.get("channel") not in ("stable", "none"):
+        raise PeerError("Recovera update policy is invalid")
+    window = value.get("window")
+    if not isinstance(window, dict):
+        raise PeerError("Recovera update window is invalid")
+    try:
+        start, end = int(window["start"]), int(window["end"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise PeerError("Recovera update window is invalid") from exc
+    duration = (end - start) % 24
+    if not 0 <= start <= 23 or not 0 <= end <= 23 or not 4 <= duration <= 23:
+        raise PeerError("Recovera update window must be between 4 and 23 hours")
+    return {"channel": value["channel"], "window": {"start": start, "end": end}}
+
+
+def set_upgrade_policy(value: dict[str, Any]) -> dict[str, Any]:
+    require_root()
+    channel = str(value.get("channel", "")).lower()
+    window = value.get("window")
+    if not isinstance(window, dict):
+        raise PeerError("Recovera update window is required")
+    candidate = {"channel": channel, "window": {
+        "start": int(window.get("start", -1)), "end": int(window.get("end", -1)),
+    }}
+    previous = load_json(UPGRADE_POLICY_PATH, None)
+    atomic_json(UPGRADE_POLICY_PATH, candidate)
+    try:
+        result = upgrade_policy()
+    except Exception:
+        if previous is None:
+            UPGRADE_POLICY_PATH.unlink(missing_ok=True)
+        else:
+            atomic_json(UPGRADE_POLICY_PATH, previous)
+        raise
+    return {"ok": True, "policy": result}
+
+
 def upgrade_status(*, check: bool = False) -> dict[str, Any]:
     require_root()
     status_result = upgrade_output("status", timeout=30)
@@ -1392,7 +1438,8 @@ def upgrade_status(*, check: bool = False) -> dict[str, Any]:
         timeout=10,
     )
     value: dict[str, Any] = {
-        "channel": "stable",
+        "channel": upgrade_policy()["channel"],
+        "policy": upgrade_policy(),
         "credential_configured": UPGRADE_TOKEN_PATH.is_file()
             and UPGRADE_TOKEN_PATH.stat().st_size > 0,
         "installed_version": package.stdout.decode("utf-8", "replace").strip()
@@ -1499,7 +1546,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.reply(404, {"error": "Use /configure/offsite-target on the Recovera WebUI"})
             elif self.path in ("/v1/admin/status", "/v1/admin/queue-status", "/v1/admin/offsite",
                                 "/v1/admin/backup-admin-credential", "/v1/admin/update/status",
-                                "/v1/admin/update/check"):
+                                "/v1/admin/update/check", "/v1/admin/update/policy"):
                 if not self.admin():
                     return
                 if self.path == "/v1/admin/status":
@@ -1512,6 +1559,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     self.reply(200, upgrade_status())
                 elif self.path == "/v1/admin/update/check":
                     self.reply(200, upgrade_status(check=True))
+                elif self.path == "/v1/admin/update/policy":
+                    self.reply(200, {"policy": upgrade_policy()})
                 else:
                     self.reply(200, {"schedules": offsite()["schedules"],
                                      "averages": weekly_averages()})
@@ -1571,6 +1620,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.reply(200, {"ok": True, "maxSyncs": count})
             elif self.path == "/v1/admin/update/install":
                 self.reply(200, upgrade_install())
+            elif self.path == "/v1/admin/update/policy":
+                self.reply(200, set_upgrade_policy(body))
             else: self.reply(404, {"error": "not found"})
         except Exception as exc: self.reply(400, {"error": str(exc)})
 

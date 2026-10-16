@@ -82,8 +82,10 @@ sudo recovera-upgrade install --reboot
 sudo recovera-upgrade rollback
 ```
 
-The daily timer only checks for availability. It never downloads, installs, or
-reboots automatically. For a private repository, place a fine-grained,
+The hourly timer checks for availability only while the configured Update
+Window is open and the Update Channel is set to Stable. It never installs or
+reboots automatically; use the WebUI's Update Now section for installation.
+For a private repository, place a fine-grained,
 read-only GitHub token in `/etc/recovera/github-token`, owned by root with mode
 `0600`. The token needs only repository Contents and Releases read access.
 

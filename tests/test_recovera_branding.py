@@ -27,7 +27,11 @@ class RecoveraBrandingTests(unittest.TestCase):
         cleanup = (ROOT / "setup" / "branding" / "RecoveraDeviceSettings.js").read_text()
         self.assertIn("recovera relay forced login", cleanup)
         self.assertIn(r"configure\/device", cleanup)
-        self.assertIn("Recovera Updates", cleanup)
+        self.assertIn("Update Now", cleanup)
+        self.assertIn("settingUpgradeChannel", cleanup)
+        self.assertIn("settingUpdateWindow", cleanup)
+        self.assertIn("settingRecoveraUpdateNow", cleanup)
+        self.assertIn("update-policy", cleanup)
         self.assertIn("update-install", cleanup)
         self.assertIn("input[name=\"csrf\"]", cleanup)
 

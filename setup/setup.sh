@@ -1123,6 +1123,8 @@ p79_image_updater() {
   install -d -m 0755 /etc/recovera /usr/local/lib/recovera-upgrade \
     /usr/local/share/recovera-upgrade /host/recovera || return 1
   install -m 0755 "$source/recovera-upgrade" /usr/local/sbin/recovera-upgrade || return 1
+  install -m 0755 "$source/recovera-upgrade-schedule" \
+    /usr/local/sbin/recovera-upgrade-schedule || return 1
   install -m 0755 "$source/recovera-image-boot" \
     /usr/local/lib/recovera-upgrade/recovera-image-boot || return 1
   install -m 0755 "$source/recovera-migrate-config" \

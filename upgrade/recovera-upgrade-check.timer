@@ -1,10 +1,10 @@
 [Unit]
-Description=Daily Recovera update discovery
+Description=Hourly Recovera update-window check
 
 [Timer]
 OnBootSec=15min
-OnCalendar=daily
-RandomizedDelaySec=2h
+OnCalendar=hourly
+RandomizedDelaySec=10min
 Persistent=true
 
 [Install]

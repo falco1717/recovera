@@ -1,0 +1,41 @@
+#!/usr/bin/env python3
+"""Run signed update discovery only inside the configured Recovera window."""
+from __future__ import annotations
+
+import datetime
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+POLICY = Path(os.environ.get("RECOVERA_UPGRADE_POLICY", "/etc/recovera/update-policy.json"))
+UPDATER = os.environ.get("RECOVERA_UPGRADE_COMMAND", "/usr/local/sbin/recovera-upgrade")
+
+
+def main() -> int:
+    value = {"channel": "stable", "window": {"start": 21, "end": 5}}
+    try:
+        if POLICY.is_file():
+            value = json.loads(POLICY.read_text(encoding="utf-8"))
+        channel = value["channel"]
+        start = int(value["window"]["start"])
+        end = int(value["window"]["end"])
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError, OSError) as exc:
+        print(f"recovera-upgrade-schedule: invalid policy: {exc}", file=sys.stderr)
+        return 1
+    if channel == "none":
+        return 0
+    if channel != "stable" or not 0 <= start <= 23 or not 0 <= end <= 23:
+        print("recovera-upgrade-schedule: unsupported policy", file=sys.stderr)
+        return 1
+    hour = datetime.datetime.now().hour
+    inside = start <= hour < end if start < end else hour >= start or hour < end
+    if not inside:
+        return 0
+    result = subprocess.run([UPDATER, "check", "--cache"], check=False)
+    return 0 if result.returncode in (0, 3) else result.returncode
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
