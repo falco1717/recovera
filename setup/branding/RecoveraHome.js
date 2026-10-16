@@ -1,6 +1,9 @@
 (function () {
     'use strict';
 
+    var replicationStatus = null;
+    var replicationObserver = null;
+
     function renderTargets(status) {
         var cell = document.getElementById('recovera-offsite-servers');
         if (!cell) {
@@ -27,24 +30,26 @@
     }
 
     function renderReplication(status) {
-        document.querySelectorAll('table').forEach(function (table) {
-            var headers = Array.from(table.querySelectorAll('th')).map(function (header) {
-                return (header.textContent || '').replace(/\s+/g, ' ').trim().toLowerCase();
-            });
-            var syncedIndex = headers.indexOf('last synced');
-            if (syncedIndex < 0) return;
-            table.querySelectorAll('tbody tr').forEach(function (row) {
-                var link = row.querySelector('a[href*="/agents/"]');
-                var match = link && link.getAttribute('href').match(/[0-9a-f]{32}/i);
-                var cells = row.querySelectorAll('td');
-                if (!match || !cells[syncedIndex]) return;
-                var timestamp = latestSuccess(status, match[0].toLowerCase());
-                if (timestamp) {
-                    cells[syncedIndex].textContent = new Date(timestamp * 1000).toLocaleString();
-                    cells[syncedIndex].dataset.recoveraLastSynced = String(timestamp);
-                }
-            });
+        var table = document.getElementById('replicationStatusTable');
+        if (!table) return;
+        table.querySelectorAll('tbody tr[data-asset]').forEach(function (row) {
+            var asset = (row.dataset.asset || '').toLowerCase();
+            var cell = row.querySelectorAll('td')[1];
+            var timestamp = latestSuccess(status, asset);
+            if (cell && timestamp && cell.dataset.recoveraLastSynced !== String(timestamp)) {
+                cell.textContent = new Date(timestamp * 1000).toLocaleString();
+                cell.dataset.recoveraLastSynced = String(timestamp);
+            }
         });
+    }
+
+    function observeReplication() {
+        var body = document.querySelector('#replicationStatusTable tbody');
+        if (!body || replicationObserver) return;
+        replicationObserver = new MutationObserver(function () {
+            if (replicationStatus) renderReplication(replicationStatus);
+        });
+        replicationObserver.observe(body, {childList: true});
     }
 
     function loadStatus() {
@@ -57,7 +62,9 @@
             }
             return response.json();
         }).then(function (status) {
+            replicationStatus = status;
             renderTargets(status);
+            observeReplication();
             renderReplication(status);
         }).catch(function () {
             // Leave the native value in place if this user cannot read the

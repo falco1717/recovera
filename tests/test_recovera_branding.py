@@ -42,6 +42,9 @@ class RecoveraBrandingTests(unittest.TestCase):
         self.assertIn("replication-success", home)
         self.assertIn("last_success", home)
         self.assertIn("recoveraLastSynced", home)
+        self.assertIn("MutationObserver", home)
+        self.assertIn("replicationStatusTable", home)
+        self.assertIn("tbody tr[data-asset]", home)
 
     def test_console_and_login_branding_are_recovera_owned(self):
         logo = (ROOT / "setup" / "branding" / "recovera-ascii.logo").read_text()
