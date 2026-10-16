@@ -110,6 +110,13 @@ canOffsite: {{ canOffsite|json_encode|raw }}
         self.assertIn("showRecoveraAccess", visibility)
         self.assertEqual(branding.add_target_visibility(visibility), visibility)
 
+    def test_appliance_access_copy_supports_self_signed_local_pages(self):
+        access = (ROOT / "setup" / "branding" / "RecoveraAccess.js").read_text()
+        self.assertIn("navigator.clipboard.writeText", access)
+        self.assertIn("document.execCommand('copy')", access)
+        self.assertIn("document.createElement('textarea')", access)
+        self.assertIn("selectDisplayedPassword", access)
+
 
 if __name__ == "__main__":
     unittest.main()
