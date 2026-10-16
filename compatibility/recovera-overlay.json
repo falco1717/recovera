@@ -1,0 +1,68 @@
+{
+  "schema": 1,
+  "name": "Recovera appliance overlay",
+  "version_source": "VERSION",
+  "ownership": {
+    "owned": "Recovera owns the installed path and may replace it during an update.",
+    "drop_in": "Recovera supplies only its named service or application extension.",
+    "patched": "Recovera modifies a native application surface and must revalidate it after a reference change."
+  },
+  "entries": [
+    {
+      "component": "peer-replication",
+      "source_glob": "setup/peer/recovera-*",
+      "installed_globs": [
+        "/usr/local/sbin/recovera-*",
+        "/usr/local/lib/recovera/*",
+        "/etc/systemd/system/recovera-peer*"
+      ],
+      "strategy": "owned",
+      "contracts": ["python3", "openssh-client", "openssh-server", "sudo", "zfs"]
+    },
+    {
+      "component": "web-integration",
+      "source_glob": "setup/branding/*",
+      "installed_globs": [
+        "/usr/lib/recovera/branding/*",
+        "/usr/local/share/recovera/*"
+      ],
+      "strategy": "patched",
+      "contracts": [
+        "local authenticated session",
+        "home replication status table",
+        "protected-system workflow",
+        "device configuration navigation"
+      ]
+    },
+    {
+      "component": "service-policy",
+      "source_glob": "setup/peer/*-recovera.conf",
+      "installed_globs": [
+        "/etc/systemd/system/*-sshd-configure.service.d/recovera.conf",
+        "/etc/systemd/system/*-firewall-share-sync.service.d/recovera.conf"
+      ],
+      "strategy": "drop_in",
+      "contracts": ["systemd drop-in loading", "TCP 22 replication transport"]
+    },
+    {
+      "component": "signed-updater",
+      "source_glob": "upgrade/recovera-*",
+      "installed_globs": [
+        "/usr/local/sbin/recovera-upgrade*",
+        "/usr/local/lib/recovera-upgrade/*",
+        "/usr/local/share/recovera-upgrade/*",
+        "/etc/systemd/system/recovera-upgrade-*"
+      ],
+      "strategy": "owned",
+      "contracts": ["dpkg", "systemd", "minisign-compatible Ed25519 verification"]
+    }
+  ],
+  "acceptance_tests": [
+    "offline registration and local administrator login",
+    "protect-system page and agentless protection workflow",
+    "local backup and recovery-point verification",
+    "full and incremental appliance replication",
+    "restore and virtualization workflow",
+    "signed update check, installation, health validation, and rollback"
+  ]
+}

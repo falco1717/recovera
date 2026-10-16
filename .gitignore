@@ -20,6 +20,9 @@ vc-session.txt
 dist/
 .release-work/
 
+# Compatibility reports describe installed appliance internals and stay local.
+compatibility/reports/
+
 # Local Python test/runtime caches
 __pycache__/
 *.pyc

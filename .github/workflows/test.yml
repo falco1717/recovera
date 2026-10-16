@@ -22,7 +22,9 @@ jobs:
           php -l tests/integration_recovera_auth.php
           python3 -m py_compile setup/peer/recovera-peer setup/branding/apply-branding.py \
             setup/branding/apply-peer-ui.py \
-            upgrade/recovera-upgrade
+            upgrade/recovera-upgrade \
+            tools/compatibility/collect-baseline.py \
+            tools/compatibility/compare-baselines.py
       - name: Build package update fixtures
         run: |
           bash tools/build-recovera-appliance-deb.sh \

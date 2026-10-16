@@ -1,0 +1,54 @@
+{
+  "schema": 1,
+  "max_file_size": 16777216,
+  "rules": [
+    {
+      "path": "/etc/systemd/system",
+      "recursive": true,
+      "extensions": [".service", ".timer", ".socket", ".path", ".mount", ".conf"],
+      "hash": true
+    },
+    {
+      "path": "/lib/systemd/system",
+      "recursive": true,
+      "extensions": [".service", ".timer", ".socket", ".path", ".mount"],
+      "hash": true
+    },
+    {
+      "path": "/usr/lib/systemd/system",
+      "recursive": true,
+      "extensions": [".service", ".timer", ".socket", ".path", ".mount"],
+      "hash": true
+    },
+    {
+      "path": "/var/www",
+      "recursive": true,
+      "extensions": [".php", ".twig", ".js", ".css", ".json", ".xml", ".yaml", ".yml"],
+      "hash": true
+    },
+    {
+      "path": "/usr/local/sbin",
+      "recursive": false,
+      "extensions": [],
+      "hash": true
+    },
+    {
+      "path": "/usr/local/lib/recovera",
+      "recursive": true,
+      "extensions": [],
+      "hash": true
+    },
+    {
+      "path": "/usr/lib/recovera",
+      "recursive": true,
+      "extensions": [],
+      "hash": true
+    },
+    {
+      "path": "/usr/share/recovera",
+      "recursive": true,
+      "extensions": [],
+      "hash": true
+    }
+  ]
+}
