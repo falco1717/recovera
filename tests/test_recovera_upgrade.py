@@ -114,7 +114,9 @@ class RecoveraUpgradeTests(unittest.TestCase):
 
     def test_package_install_is_offline_and_allows_no_removals(self):
         command = self.module.package_apt_command("install", [Path("/tmp/recovera.deb")])
-        self.assertIn("--no-download", command)
+        self.assertNotIn("--no-download", command)
+        self.assertIn("Dir::Etc::sourcelist=/dev/null", command)
+        self.assertIn("Dir::Etc::sourceparts=/dev/null", command)
         self.assertIn("Dir::Etc::sourcelist=/dev/null", command)
         self.assertIn("Dir::Etc::sourceparts=/dev/null", command)
         with mock.patch.object(self.module, "run") as runner:

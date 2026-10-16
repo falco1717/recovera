@@ -594,7 +594,7 @@ def find_cached_deb(config, name, version):
 
 def package_apt_command(action, debs):
     return [
-        "apt-get", "-y" if action == "install" else "-s", "--no-download",
+        "apt-get", "-y" if action == "install" else "-s",
         "--allow-downgrades", "--allow-change-held-packages",
         "-o", "Dir::Etc::sourcelist=/dev/null",
         "-o", "Dir::Etc::sourceparts=/dev/null",
