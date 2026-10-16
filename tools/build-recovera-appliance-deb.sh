@@ -71,6 +71,19 @@ install -m 0644 "$ROOT/upgrade/recovera-upgrade-check.service" "$stage/etc/syste
 install -m 0644 "$ROOT/upgrade/recovera-upgrade-check.timer" "$stage/etc/systemd/system/"
 install -m 0644 "$ROOT/upgrade/recovera-upgrade-validate.service" "$stage/etc/systemd/system/"
 
+cat > "$stage/DEBIAN/preinst" <<'PREINST'
+#!/bin/sh
+set -e
+# dpkg unpacks payload files before postinst runs.  Some source appliances do
+# not retain these vendor service drop-in directories, so ensure their parents
+# exist before dpkg creates the new conffiles within them.
+install -d -m 0755 \
+  /etc/systemd/system/datto-sshd-configure.service.d \
+  /etc/systemd/system/datto-firewall-share-sync.service.d
+exit 0
+PREINST
+chmod 0755 "$stage/DEBIAN/preinst"
+
 cat > "$stage/DEBIAN/postinst" <<'POSTINST'
 #!/bin/sh
 set -e

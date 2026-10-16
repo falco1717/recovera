@@ -242,6 +242,9 @@ class RecoveraUpgradeTests(unittest.TestCase):
         self.assertIn("apply-branding.py", control)
         self.assertIn("REQUIRE_BASELINE_PACKAGES=recovera-appliance", (ROOT / "upgrade" / "recovera-upgrade.conf").read_text())
         self.assertIn("RECOVERA_DEFER_SERVICE_RESTART", control)
+        self.assertIn('cat > "$stage/DEBIAN/preinst"', control)
+        self.assertIn("/etc/systemd/system/datto-sshd-configure.service.d", control)
+        self.assertIn("/etc/systemd/system/datto-firewall-share-sync.service.d", control)
 
     def test_assembler_reclaims_verified_parts_before_decompression(self):
         self.assertIn("local.unlink()", UPDATER.read_text())
