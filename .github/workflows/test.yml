@@ -31,5 +31,13 @@ jobs:
             --packages /tmp/recovera-debs --version 0.6.1 --sequence 1 \
             --output /tmp/recovera-package-release
           python3 -c 'import json; p=json.load(open("/tmp/recovera-package-release/recovera-package-manifest.json")); assert p["schema"] == 2 and p["type"] == "package" and len(p["packages"]) == 1'
+      - name: Preserve tested appliance package
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: actions/upload-artifact@v4
+        with:
+          name: recovera-appliance-${{ github.sha }}
+          path: /tmp/recovera-debs/recovera-appliance_*_all.deb
+          if-no-files-found: error
+          retention-days: 7
       - name: Run unit tests
         run: python3 -m unittest discover -s tests -p 'test_*.py'
