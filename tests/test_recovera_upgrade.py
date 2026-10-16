@@ -148,6 +148,42 @@ class RecoveraUpgradeTests(unittest.TestCase):
                 "TOKEN_FILE": "/etc/recovera/github-token",
             })
 
+    def test_public_channel_and_assets_do_not_use_github_api(self):
+        pointer = {
+            "schema": 1, "channel": "stable", "release_tag": "package-v0.7.0",
+            "manifest_asset": "manifest.json", "signature_asset": "manifest.json.sig",
+            "sequence": 7, "version": "0.7.0",
+        }
+        response = io.BytesIO(json.dumps(pointer).encode())
+        config = {
+            "REPOSITORY": "falco1717/recovera", "CHANNEL": "stable",
+            "CHANNEL_BRANCH": "main", "HOST_ROOT": "/host",
+        }
+        with mock.patch.object(self.module, "token", return_value=None), \
+             mock.patch.object(self.module, "request", return_value=response) as requester, \
+             mock.patch.object(self.module, "github_json") as github_api:
+            self.assertEqual(self.module.fetch_channel(config), pointer)
+            url = requester.call_args.args[0]
+            self.assertTrue(url.startswith("https://raw.githubusercontent.com/"))
+            assets = self.module.release_assets(pointer, config)
+            github_api.assert_not_called()
+        self.assertEqual(
+            assets["__release_base_url__"],
+            "https://github.com/falco1717/recovera/releases/download/package-v0.7.0",
+        )
+
+    def test_authenticated_private_channel_retains_api_support(self):
+        config = {
+            "REPOSITORY": "falco1717/recovera", "CHANNEL": "stable",
+            "CHANNEL_BRANCH": "main", "HOST_ROOT": "/host",
+        }
+        release = {"assets": [{"name": "manifest.json", "url": "https://api.github.test/1"}]}
+        with mock.patch.object(self.module, "token", return_value="read-only-token"), \
+             mock.patch.object(self.module, "github_json", return_value=release) as github_api:
+            assets = self.module.release_assets({"release_tag": "package-v0.7.0"}, config)
+        self.assertEqual(assets["manifest.json"], "https://api.github.test/1")
+        github_api.assert_called_once()
+
     def test_pointer_rejects_path_traversal_before_asset_download(self):
         arguments = mock.Mock(
             channel_file=ROOT / "upgrade" / "channels" / "stable.json",

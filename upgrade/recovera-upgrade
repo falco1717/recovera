@@ -175,6 +175,17 @@ def github_json(path, config):
         return json.load(response)
 
 
+def use_github_api(config):
+    return bool(token(config)) or config.get("USE_GITHUB_API", "no").lower() in ("1", "yes", "true")
+
+
+def validated_repository(config):
+    repository = config["REPOSITORY"]
+    if not re.fullmatch(r"[0-9A-Za-z_.-]+/[0-9A-Za-z_.-]+", repository):
+        raise UpgradeError("invalid GitHub repository in upgrade configuration")
+    return repository
+
+
 def download(url, target, config, *, api_asset=False):
     accept = "application/octet-stream" if api_asset else "application/vnd.github+json"
     target = Path(target)
@@ -188,15 +199,26 @@ def fetch_channel(config, local_channel=None):
     if local_channel:
         pointer = read_json(local_channel)
     else:
-        repo = config["REPOSITORY"]
+        repo = validated_repository(config)
         channel = config["CHANNEL"]
         branch = config["CHANNEL_BRANCH"]
-        path = f"/repos/{repo}/contents/upgrade/channels/{channel}.json?ref={branch}"
-        result = github_json(path, config)
-        try:
-            pointer = json.loads(base64.b64decode(result["content"]))
-        except (KeyError, ValueError, json.JSONDecodeError) as exc:
-            raise UpgradeError("invalid GitHub channel response") from exc
+        if use_github_api(config):
+            path = f"/repos/{repo}/contents/upgrade/channels/{channel}.json?ref={branch}"
+            result = github_json(path, config)
+            try:
+                pointer = json.loads(base64.b64decode(result["content"]))
+            except (KeyError, ValueError, json.JSONDecodeError) as exc:
+                raise UpgradeError("invalid GitHub channel response") from exc
+        else:
+            branch_path = urllib.parse.quote(branch, safe="/")
+            channel_name = urllib.parse.quote(channel, safe="")
+            url = (config.get("CHANNEL_URL") or
+                   f"https://raw.githubusercontent.com/{repo}/{branch_path}/upgrade/channels/{channel_name}.json")
+            try:
+                with request(url, config, accept="application/json") as response:
+                    pointer = json.load(response)
+            except (ValueError, json.JSONDecodeError) as exc:
+                raise UpgradeError("invalid GitHub channel response") from exc
     if pointer.get("schema") != 1 or pointer.get("channel") != config["CHANNEL"]:
         raise UpgradeError("channel pointer has an unsupported schema or channel")
     if not pointer.get("release_tag"):
@@ -210,16 +232,22 @@ def release_assets(pointer, config, source_dir=None):
     if source_dir:
         root = Path(source_dir)
         return {item.name: item for item in root.iterdir() if item.is_file()}
-    repo = config["REPOSITORY"]
+    repo = validated_repository(config)
     tag = pointer["release_tag"]
-    release = github_json(f"/repos/{repo}/releases/tags/{urllib.parse.quote(tag, safe='')}", config)
-    return {asset["name"]: asset["url"] for asset in release.get("assets", [])}
+    tag_path = urllib.parse.quote(tag, safe="")
+    if use_github_api(config):
+        release = github_json(f"/repos/{repo}/releases/tags/{tag_path}", config)
+        return {asset["name"]: asset["url"] for asset in release.get("assets", [])}
+    return {"__release_base_url__": f"https://github.com/{repo}/releases/download/{tag_path}"}
 
 
 def obtain_asset(name, assets, target, config):
-    if name not in assets:
+    if name in assets:
+        source = assets[name]
+    elif "__release_base_url__" in assets and safe_asset_name(name):
+        source = assets["__release_base_url__"] + "/" + urllib.parse.quote(name, safe="")
+    else:
         raise UpgradeError(f"release asset is missing: {name}")
-    source = assets[name]
     if isinstance(source, Path):
         shutil.copyfile(source, target)
     else:
