@@ -97,8 +97,10 @@ if id recovera-repl >/dev/null 2>&1 && [ -f /etc/recovera-peer/config.json ]; th
   a2enconf recovera-peer-gateway >/dev/null
   apache2ctl configtest >/dev/null
   systemctl enable recovera-peer.service recovera-peer-sync.timer >/dev/null
-  systemctl restart php8.1-fpm recovera-peer.service recovera-peer-sync.timer
-  systemctl reload apache2
+  if [ "${RECOVERA_DEFER_SERVICE_RESTART:-0}" != 1 ]; then
+    systemctl restart php8.1-fpm recovera-peer.service recovera-peer-sync.timer
+    systemctl reload apache2
+  fi
 fi
 exit 0
 POSTINST

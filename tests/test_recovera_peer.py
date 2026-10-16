@@ -48,6 +48,9 @@ def load_module(root: Path):
     os.environ["RECOVERA_PEER_AUTHORIZED_KEYS"] = str(root / "authorized_keys")
     os.environ["RECOVERA_PEER_SOCKET"] = str(root / "peer.sock")
     os.environ["RECOVERA_APACHE_TLS_CERT"] = str(root / "apache.crt")
+    os.environ["RECOVERA_UPGRADE_COMMAND"] = str(root / "recovera-upgrade")
+    os.environ["RECOVERA_UPGRADE_CONFIG"] = str(root / "upgrade.conf")
+    os.environ["RECOVERA_UPGRADE_TOKEN"] = str(root / "github-token")
     loader = importlib.machinery.SourceFileLoader("recovera_peer_test", str(SCRIPT))
     spec = importlib.util.spec_from_loader(loader.name, loader)
     module = importlib.util.module_from_spec(spec)
@@ -105,6 +108,38 @@ class RecoveraPeerTests(unittest.TestCase):
         self.assertIn("'backup-admin-credential' => ['GET'", controller)
         gateway = GATEWAY.read_text(encoding="utf-8")
         self.assertNotIn("backup-admin-credential", gateway)
+
+    def test_update_api_uses_only_fixed_root_updater_commands(self):
+        self.peer.UPGRADE_COMMAND.parent.mkdir(parents=True, exist_ok=True)
+        self.peer.UPGRADE_COMMAND.write_text("#!/bin/sh\n")
+        status = {
+            "current": {"version": "0.6.1", "sequence": 1},
+            "updater_version": 2,
+        }
+        completed = mock.Mock(returncode=0, stdout=json.dumps(status).encode(), stderr=b"")
+        with mock.patch.object(self.peer, "run", return_value=completed) as execute:
+            value = self.peer.upgrade_status()
+        self.assertEqual(value["channel"], "stable")
+        command = execute.call_args_list[0].args[0]
+        self.assertEqual(command[-1], "status")
+        self.assertNotIn("shell", execute.call_args_list[0].kwargs)
+
+        controller = CONTROLLER.read_text(encoding="utf-8")
+        self.assertIn("'update-status' => ['GET'", controller)
+        self.assertIn("'update-check' => ['GET'", controller)
+        self.assertIn("'update-install' => ['POST'", controller)
+
+    def test_web_update_defers_service_restart_until_transaction_finishes(self):
+        self.peer.UPGRADE_COMMAND.parent.mkdir(parents=True, exist_ok=True)
+        self.peer.UPGRADE_COMMAND.write_text("#!/bin/sh\n")
+        completed = mock.Mock(returncode=0, stdout=b"Recovera 0.6.2 installed\n", stderr=b"")
+        with mock.patch.object(self.peer, "run", return_value=completed) as execute:
+            result = self.peer.upgrade_install()
+        self.assertTrue(result["restart_scheduled"])
+        install_call = execute.call_args_list[0]
+        self.assertEqual(install_call.args[0][-1], "install")
+        self.assertEqual(install_call.kwargs["env"]["RECOVERA_DEFER_SERVICE_RESTART"], "1")
+        self.assertEqual(execute.call_args_list[1].args[0][0], "systemd-run")
 
     @unittest.skipUnless(os.name == "posix", "Unix sockets are exercised on Linux CI")
     def test_unix_socket_serves_http_without_tcp(self):

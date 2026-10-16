@@ -31,7 +31,7 @@ import uuid
 from pathlib import Path
 from typing import Any, BinaryIO
 
-VERSION = "0.6.1"
+VERSION = "0.6.2"
 ETC = Path(os.environ.get("RECOVERA_PEER_ETC", "/etc/recovera-peer"))
 STATE_DIR = Path(os.environ.get("RECOVERA_PEER_STATE", "/var/lib/recovera-peer"))
 CONFIG_PATH = ETC / "config.json"
@@ -61,6 +61,15 @@ AUTHORIZED_KEYS_PATH = Path(os.environ.get(
 ))
 AUTH_HELPER_PATH = Path(os.environ.get(
     "RECOVERA_AUTH_HELPER", "/usr/local/lib/recovera/authenticate.php"
+))
+UPGRADE_COMMAND = Path(os.environ.get(
+    "RECOVERA_UPGRADE_COMMAND", "/usr/local/sbin/recovera-upgrade"
+))
+UPGRADE_CONFIG_PATH = Path(os.environ.get(
+    "RECOVERA_UPGRADE_CONFIG", "/etc/recovera/upgrade.conf"
+))
+UPGRADE_TOKEN_PATH = Path(os.environ.get(
+    "RECOVERA_UPGRADE_TOKEN", "/etc/recovera/github-token"
 ))
 ASSET_RE = re.compile(r"^[0-9a-fA-F]{32}$")
 SNAPSHOT_RE = re.compile(r"^[0-9]{1,20}$")
@@ -94,10 +103,12 @@ def backup_admin_credential() -> dict[str, str]:
 
 
 def run(argv: list[str], *, check: bool = True, input_data: bytes | None = None,
-        timeout: int | None = None) -> subprocess.CompletedProcess[bytes]:
+        timeout: int | None = None,
+        env: dict[str, str] | None = None) -> subprocess.CompletedProcess[bytes]:
     try:
         return subprocess.run(argv, input=input_data, stdout=subprocess.PIPE,
-                              stderr=subprocess.PIPE, check=check, timeout=timeout)
+                              stderr=subprocess.PIPE, check=check, timeout=timeout,
+                              env=env)
     except FileNotFoundError as exc:
         raise PeerError(f"required command is missing: {argv[0]}") from exc
     except subprocess.CalledProcessError as exc:
@@ -1348,6 +1359,71 @@ def status_document() -> dict[str, Any]:
             "tls_fingerprint": gateway_tls_fingerprint()}
 
 
+def upgrade_output(command: str, *, timeout: int) -> subprocess.CompletedProcess[bytes]:
+    if command not in ("status", "check", "install"):
+        raise PeerError("invalid upgrade operation")
+    if not UPGRADE_COMMAND.is_file():
+        raise PeerError("Recovera updater is not installed")
+    environment = os.environ.copy()
+    if command == "install":
+        environment["RECOVERA_DEFER_SERVICE_RESTART"] = "1"
+    result = run(
+        [str(UPGRADE_COMMAND), "--config", str(UPGRADE_CONFIG_PATH), command],
+        check=False,
+        timeout=timeout,
+        env=environment,
+    )
+    if result.returncode not in ((0, 3) if command == "check" else (0,)):
+        detail = result.stderr.decode("utf-8", "replace").strip()
+        raise PeerError(detail.removeprefix("recovera-upgrade: ") or "update command failed")
+    return result
+
+
+def upgrade_status(*, check: bool = False) -> dict[str, Any]:
+    require_root()
+    status_result = upgrade_output("status", timeout=30)
+    try:
+        status = json.loads(status_result.stdout)
+    except json.JSONDecodeError as exc:
+        raise PeerError("Recovera updater returned invalid status") from exc
+    package = run(
+        ["dpkg-query", "-W", "-f=${Version}", "recovera-appliance"],
+        check=False,
+        timeout=10,
+    )
+    value: dict[str, Any] = {
+        "channel": "stable",
+        "credential_configured": UPGRADE_TOKEN_PATH.is_file()
+            and UPGRADE_TOKEN_PATH.stat().st_size > 0,
+        "installed_version": package.stdout.decode("utf-8", "replace").strip()
+            if package.returncode == 0 else status.get("current", {}).get("version"),
+        "updater": status,
+    }
+    if check:
+        result = upgrade_output("check", timeout=120)
+        try:
+            value["release"] = json.loads(result.stdout)
+        except json.JSONDecodeError as exc:
+            raise PeerError("Recovera updater returned an invalid update check") from exc
+    return value
+
+
+def upgrade_install() -> dict[str, Any]:
+    require_root()
+    result = upgrade_output("install", timeout=1800)
+    # The package post-install hook deliberately defers these restarts when the
+    # update originates inside recovera-peer. Schedule them after this HTTP
+    # response so the updater can commit its transaction first.
+    run([
+        "systemd-run", "--quiet", "--collect", "--unit=recovera-post-update-restart",
+        "--on-active=5s", "/bin/systemctl", "restart", "php8.1-fpm.service",
+        "recovera-peer.service", "recovera-peer-sync.timer",
+    ], check=False, timeout=15)
+    message = result.stdout.decode("utf-8", "replace").strip()
+    return {"ok": True, "message": message or "Recovera update installed",
+            "restart_scheduled": True}
+
+
 def authenticate_local_admin(username: str, password: str) -> bool:
     """Use the appliance's registered local administrator credential store."""
     if (not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_-]{0,31}", username)
@@ -1422,7 +1498,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             elif self.path == "/":
                 self.reply(404, {"error": "Use /configure/offsite-target on the Recovera WebUI"})
             elif self.path in ("/v1/admin/status", "/v1/admin/queue-status", "/v1/admin/offsite",
-                                "/v1/admin/backup-admin-credential"):
+                                "/v1/admin/backup-admin-credential", "/v1/admin/update/status",
+                                "/v1/admin/update/check"):
                 if not self.admin():
                     return
                 if self.path == "/v1/admin/status":
@@ -1431,6 +1508,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     self.reply(200, queue_document())
                 elif self.path == "/v1/admin/backup-admin-credential":
                     self.reply(200, backup_admin_credential())
+                elif self.path == "/v1/admin/update/status":
+                    self.reply(200, upgrade_status())
+                elif self.path == "/v1/admin/update/check":
+                    self.reply(200, upgrade_status(check=True))
                 else:
                     self.reply(200, {"schedules": offsite()["schedules"],
                                      "averages": weekly_averages()})
@@ -1488,6 +1569,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 settings = offsite(); settings["max_syncs"] = count; save_offsite(settings)
                 run(["speedsync", "setMaxSyncs", str(count)], check=False, timeout=10)
                 self.reply(200, {"ok": True, "maxSyncs": count})
+            elif self.path == "/v1/admin/update/install":
+                self.reply(200, upgrade_install())
             else: self.reply(404, {"error": "not found"})
         except Exception as exc: self.reply(400, {"error": str(exc)})
 

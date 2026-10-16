@@ -1,5 +1,6 @@
 import importlib.machinery
 import importlib.util
+import io
 import json
 from pathlib import Path
 import tempfile
@@ -131,6 +132,20 @@ class RecoveraUpgradeTests(unittest.TestCase):
         self.assertEqual(arguments.command, "rollback")
         self.assertTrue(arguments.reboot)
 
+    def test_private_channel_error_explains_token_requirement(self):
+        response = self.module.urllib.error.HTTPError(
+            "https://api.github.com/repos/falco1717/recovera", 404,
+            "Not Found", {}, io.BytesIO(b'{"message":"Not Found"}'),
+        )
+        opener = mock.Mock()
+        opener.open.side_effect = response
+        with mock.patch.object(self.module, "token", return_value=None), \
+             mock.patch.object(self.module.urllib.request, "build_opener", return_value=opener), \
+             self.assertRaisesRegex(self.module.UpgradeError, "read-only token"):
+            self.module.request("https://api.github.com/repos/falco1717/recovera", {
+                "TOKEN_FILE": "/etc/recovera/github-token",
+            })
+
     def test_pointer_rejects_path_traversal_before_asset_download(self):
         arguments = mock.Mock(
             channel_file=ROOT / "upgrade" / "channels" / "stable.json",
@@ -162,9 +177,9 @@ class RecoveraUpgradeTests(unittest.TestCase):
     def test_channel_points_to_first_package_release(self):
         channel = json.loads((ROOT / "upgrade" / "channels" / "stable.json").read_text())
         self.assertEqual(channel["type"], "package")
-        self.assertEqual(channel["release_tag"], "package-v0.6.1")
-        self.assertEqual(channel["version"], "0.6.1")
-        self.assertEqual(channel["sequence"], 1)
+        self.assertEqual(channel["release_tag"], "package-v0.6.2")
+        self.assertEqual(channel["version"], "0.6.2")
+        self.assertEqual(channel["sequence"], 2)
 
     def test_empty_channel_is_a_successful_no_update_check(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -226,6 +241,7 @@ class RecoveraUpgradeTests(unittest.TestCase):
         self.assertIn("recovera-upgrade-check.timer", control)
         self.assertIn("apply-branding.py", control)
         self.assertIn("REQUIRE_BASELINE_PACKAGES=recovera-appliance", (ROOT / "upgrade" / "recovera-upgrade.conf").read_text())
+        self.assertIn("RECOVERA_DEFER_SERVICE_RESTART", control)
 
     def test_assembler_reclaims_verified_parts_before_decompression(self):
         self.assertIn("local.unlink()", UPDATER.read_text())

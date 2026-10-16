@@ -55,6 +55,9 @@ final class RecoveraTargetController extends AbstractController
             'speed-set' => ['POST', '/v1/admin/offsite/speed-set'],
             'speed-test' => ['POST', '/v1/admin/offsite/speed-test'],
             'concurrency-set' => ['POST', '/v1/admin/offsite/concurrency-set'],
+            'update-status' => ['GET', '/v1/admin/update/status'],
+            'update-check' => ['GET', '/v1/admin/update/check'],
+            'update-install' => ['POST', '/v1/admin/update/install'],
         ];
         if (!isset($map[$operation])) {
             return new JsonResponse(['error' => 'Unknown operation'], 404);
@@ -73,7 +76,8 @@ final class RecoveraTargetController extends AbstractController
             CURLOPT_RETURNTRANSFER => true,
             CURLOPT_UNIX_SOCKET_PATH => '/run/recovera-peer/http.sock',
             CURLOPT_CONNECTTIMEOUT => 5,
-            CURLOPT_TIMEOUT => $operation === 'sync' ? 3600 : 30,
+            CURLOPT_TIMEOUT => in_array($operation, ['sync', 'update-install'], true) ? 3600
+                : ($operation === 'update-check' ? 120 : 30),
             CURLOPT_HTTPHEADER => ['Content-Type: application/json', 'X-Recovera-Internal: ' . $token],
         ]);
         if ($method === 'POST') {
