@@ -78,8 +78,20 @@ set -e
 # not retain these vendor service drop-in directories, so ensure their parents
 # exist before dpkg creates the new conffiles within them.
 install -d -m 0755 \
+  /usr/local/sbin \
+  /usr/local/lib/recovera \
+  /usr/local/lib/recovera-upgrade \
+  /usr/local/share/recovera-upgrade \
+  /usr/local/share/recovera \
+  /usr/lib/recovera/branding \
+  /usr/share/recovera/defaults \
+  /etc/systemd/system \
   /etc/systemd/system/datto-sshd-configure.service.d \
-  /etc/systemd/system/datto-firewall-share-sync.service.d
+  /etc/systemd/system/datto-firewall-share-sync.service.d \
+  /etc/apache2/conf-available \
+  /etc/ssh/sshd_config.d \
+  /etc/sudoers.d \
+  /etc/update-motd.d
 exit 0
 PREINST
 chmod 0755 "$stage/DEBIAN/preinst"

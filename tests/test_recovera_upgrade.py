@@ -245,6 +245,8 @@ class RecoveraUpgradeTests(unittest.TestCase):
         self.assertIn('cat > "$stage/DEBIAN/preinst"', control)
         self.assertIn("/etc/systemd/system/datto-sshd-configure.service.d", control)
         self.assertIn("/etc/systemd/system/datto-firewall-share-sync.service.d", control)
+        self.assertIn("/usr/share/recovera/defaults", control)
+        self.assertIn("/usr/local/lib/recovera-upgrade", control)
 
     def test_assembler_reclaims_verified_parts_before_decompression(self):
         self.assertIn("local.unlink()", UPDATER.read_text())
