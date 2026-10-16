@@ -18,11 +18,25 @@ def append_once(path: Path, marker: str, content: str) -> None:
         path.write_text(text.rstrip() + "\n" + content + "\n", encoding="utf-8")
 
 
+def add_script_to_block(path: Path, marker: str, script: str) -> None:
+    """Put a script inside Twig's scripts block, repairing older bad installs."""
+    if not path.is_file():
+        raise SystemExit(f"required Recovera template is missing: {path}")
+    text = path.read_text(encoding="utf-8")
+    text = "\n".join(line for line in text.splitlines() if marker not in line) + "\n"
+    block_start = text.find("{% block scripts %}")
+    block_end = text.find("{% endblock %}", block_start)
+    if block_start < 0 or block_end < 0:
+        raise SystemExit(f"Twig scripts block is missing: {path}")
+    text = text[:block_end] + "    " + script + "\n" + text[block_end:]
+    path.write_text(text, encoding="utf-8")
+
+
 def main() -> int:
     WEB.mkdir(parents=True, exist_ok=True)
     for name in ("RecoveraProtectSystem.js", "RecoveraProtectStatus.js"):
         shutil.copy2(SOURCE / name, WEB / name)
-    append_once(
+    add_script_to_block(
         ROOT / "templates/commonlookandfeel/Agents/List/index.html.twig",
         "RecoveraProtectStatus.js",
         '''<script type="text/javascript" src="{{ asset('commonlookandfeel/js/App/Agents/RecoveraProtectStatus.js') }}"></script>''',

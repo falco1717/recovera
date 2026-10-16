@@ -66,6 +66,10 @@ try {
     if (!str_ends_with($queueApi, "\n200") || !str_contains($queueApi, '"items"')) {
         throw new RuntimeException('Recovery-point queue status API did not render successfully');
     }
+    $agents = curlRequest(['-b', $cookie, '-w', '\n%{http_code}', 'https://127.0.0.1/agents']);
+    if (!str_ends_with($agents, "\n200") || !str_contains($agents, 'RecoveraProtectStatus.js')) {
+        throw new RuntimeException('Protect page did not render successfully');
+    }
     $recoveryTemplate = (string) @file_get_contents(
         '/usr/lib/datto/device/templates/commonlookandfeel/Assets/RecoveryPoints/index.html.twig');
     $recoveryScript = (string) @file_get_contents(

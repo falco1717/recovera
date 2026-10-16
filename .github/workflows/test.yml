@@ -21,6 +21,7 @@ jobs:
           php -l setup/branding/RecoveraTargetController.php
           php -l tests/integration_recovera_auth.php
           python3 -m py_compile setup/peer/recovera-peer setup/branding/apply-branding.py \
+            setup/branding/apply-peer-ui.py \
             upgrade/recovera-upgrade
       - name: Build package update fixtures
         run: |
