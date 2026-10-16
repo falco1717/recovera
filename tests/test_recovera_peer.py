@@ -87,6 +87,23 @@ class RecoveraPeerTests(unittest.TestCase):
         self.assertNotIn("port", config)
         self.assertEqual(self.peer.SOCKET_PATH, self.root / "peer.sock")
 
+    def test_replication_account_permissions_are_repaired_after_uid_changes(self):
+        ssh_dir = self.peer.AUTHORIZED_KEYS_PATH.parent
+        ssh_dir.mkdir(parents=True, exist_ok=True)
+        self.peer.AUTHORIZED_KEYS_PATH.write_text("restricted key\n")
+        account = SimpleNamespace(pw_uid=995, pw_gid=995)
+        fake_pwd = SimpleNamespace(getpwnam=lambda _name: account)
+        with mock.patch.dict(sys.modules, {"pwd": fake_pwd}), \
+                mock.patch.object(self.peer.os, "chown", create=True) as chown, \
+                mock.patch.object(self.peer.os, "chmod") as chmod:
+            self.peer.repair_replication_account_permissions()
+
+        chown.assert_any_call(self.peer.STATE_DIR, 995, 995)
+        chown.assert_any_call(ssh_dir, 995, 995)
+        chown.assert_any_call(self.peer.AUTHORIZED_KEYS_PATH, 995, 995)
+        chmod.assert_any_call(ssh_dir, 0o700)
+        chmod.assert_any_call(self.peer.AUTHORIZED_KEYS_PATH, 0o600)
+
     def test_webui_and_apache_use_restricted_unix_socket(self):
         gateway = GATEWAY.read_text(encoding="utf-8")
         controller = CONTROLLER.read_text(encoding="utf-8")

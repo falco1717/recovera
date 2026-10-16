@@ -34,6 +34,14 @@ class RecoveraBrandingTests(unittest.TestCase):
         self.assertIn("update-policy", cleanup)
         self.assertIn("update-install", cleanup)
         self.assertIn("input[name=\"csrf\"]", cleanup)
+        self.assertIn("recovera.upgrade.available", cleanup)
+        self.assertIn("globalAlertTemplate", cleanup)
+        self.assertIn("updater.state.available", cleanup)
+
+        home = (ROOT / "setup" / "branding" / "RecoveraHome.js").read_text()
+        self.assertIn("replication-success", home)
+        self.assertIn("last_success", home)
+        self.assertIn("recoveraLastSynced", home)
 
     def test_console_and_login_branding_are_recovera_owned(self):
         logo = (ROOT / "setup" / "branding" / "recovera-ascii.logo").read_text()

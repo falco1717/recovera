@@ -111,6 +111,46 @@
         return value;
     }
 
+    function cachedRelease(value) {
+        const release = value && value.updater && value.updater.state && value.updater.state.available;
+        return release && release.available ? release : null;
+    }
+
+    function showGlobalUpdateBanner(release) {
+        const id = 'recovera.upgrade.available';
+        const container = document.getElementById('bannerContainer');
+        if (!container || !release || sessionStorage.getItem('dismissed-' + id) ||
+            container.querySelector('[data-notification-id="' + id + '"]')) return;
+        const box = document.createElement('div');
+        box.className = 'notificationBox';
+        box.dataset.notificationId = id;
+        container.appendChild(box);
+        if (window.Datto && Datto.Utility && Datto.Utility.EventBus) {
+            Datto.Utility.EventBus.dispatch('notification', window, id, 'info', 'alert', {
+                templateId: 'globalAlertTemplate',
+                type: 'info',
+                message: {
+                    title: 'Recovera update available',
+                    text: 'Recovera ' + release.version + ' is ready to install.'
+                },
+                buttons: [{
+                    text: 'Review update',
+                    url: '/configure/device#settingRecoveraUpdateNow'
+                }],
+                options: {dismissible: true}
+            });
+        }
+    }
+
+    async function initializeUpdateBanner() {
+        try {
+            const value = await request('update-status');
+            showGlobalUpdateBanner(cachedRelease(value));
+        } catch (error) {
+            // A banner must never interfere with the page it decorates.
+        }
+    }
+
     function hour(value) {
         const normalized = Number(value) % 24;
         return (normalized % 12 || 12) + ':00 ' + (normalized >= 12 ? 'PM' : 'AM');
@@ -251,6 +291,7 @@
     }
 
     function initialize() {
+        initializeUpdateBanner();
         if (!/^\/configure\/device\/?$/.test(window.location.pathname)) return;
         removeLegacyRelayControl();
         const oldPanel = document.getElementById('recovera-update-panel');

@@ -31,7 +31,7 @@ import uuid
 from pathlib import Path
 from typing import Any, BinaryIO
 
-VERSION = "0.6.8"
+VERSION = "0.6.9"
 ETC = Path(os.environ.get("RECOVERA_PEER_ETC", "/etc/recovera-peer"))
 STATE_DIR = Path(os.environ.get("RECOVERA_PEER_STATE", "/var/lib/recovera-peer"))
 CONFIG_PATH = ETC / "config.json"
@@ -344,6 +344,7 @@ def init() -> None:
     require_root()
     ETC.mkdir(mode=0o700, parents=True, exist_ok=True)
     STATE_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+    repair_replication_account_permissions()
     if not CONFIG_PATH.exists():
         save_config(default_config())
     if not STATE_PATH.exists():
@@ -364,6 +365,24 @@ def init() -> None:
         os.chown(WEB_TOKEN_PATH, 0, grp.getgrnam("www-data").gr_gid)
     print(f"Recovera peer replication initialized ({config()['appliance_id']})")
     print(f"Pairing HTTPS fingerprint: {gateway_tls_fingerprint()}")
+
+
+def repair_replication_account_permissions() -> None:
+    """Keep the restricted SSH account usable if system UIDs are reassigned."""
+    try:
+        import pwd
+        account = pwd.getpwnam("recovera-repl")
+    except (ImportError, KeyError):
+        return
+    paths = (
+        (STATE_DIR, 0o700),
+        (authorized_keys_path().parent, 0o700),
+        (authorized_keys_path(), 0o600),
+    )
+    for path, mode in paths:
+        if path.exists():
+            os.chown(path, account.pw_uid, account.pw_gid)
+            os.chmod(path, mode)
 
 
 def validate_asset(asset: str) -> str:
@@ -1635,7 +1654,7 @@ class ThreadingUnixHTTPServer(socketserver.ThreadingMixIn, UnixHTTPServer):
 
 
 def serve() -> None:
-    require_root(); config()
+    require_root(); repair_replication_account_permissions(); config()
     SOCKET_PATH.parent.mkdir(mode=0o750, parents=True, exist_ok=True)
     with contextlib.suppress(FileNotFoundError):
         SOCKET_PATH.unlink()
