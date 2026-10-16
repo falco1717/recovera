@@ -15,6 +15,19 @@ def load_module():
 
 
 class RecoveraBrandingTests(unittest.TestCase):
+    def test_global_assets_include_device_settings_cleanup_once(self):
+        branding = load_module()
+        source = "<html><head></head><body></body></html>"
+        patched = branding.add_global_branding(source)
+
+        self.assertIn("recovera-brand.css", patched)
+        self.assertIn("RecoveraDeviceSettings.js", patched)
+        self.assertEqual(branding.add_global_branding(patched), patched)
+
+        cleanup = (ROOT / "setup" / "branding" / "RecoveraDeviceSettings.js").read_text()
+        self.assertIn("recovera relay forced login", cleanup)
+        self.assertIn(r"configure\/device", cleanup)
+
     def test_console_and_login_branding_are_recovera_owned(self):
         logo = (ROOT / "setup" / "branding" / "recovera-ascii.logo").read_text()
         motd = (ROOT / "setup" / "branding" / "recovera-motd").read_text()

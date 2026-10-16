@@ -159,21 +159,29 @@ class RecoveraUpgradeTests(unittest.TestCase):
                 with self.assertRaises(self.module.UpgradeError):
                     self.module.ensure_newer(self.manifest())
 
-    def test_channel_is_dormant_until_first_image(self):
+    def test_channel_points_to_first_package_release(self):
         channel = json.loads((ROOT / "upgrade" / "channels" / "stable.json").read_text())
-        self.assertIsNone(channel["release_tag"])
-        self.assertEqual(channel["sequence"], 0)
+        self.assertEqual(channel["type"], "package")
+        self.assertEqual(channel["release_tag"], "package-v0.6.1")
+        self.assertEqual(channel["version"], "0.6.1")
+        self.assertEqual(channel["sequence"], 1)
 
     def test_empty_channel_is_a_successful_no_update_check(self):
         with tempfile.TemporaryDirectory() as directory:
             config = Path(directory) / "upgrade.conf"
+            channel = Path(directory) / "stable.json"
             config.write_text(
                 "REPOSITORY=falco1717/recovera\nCHANNEL=stable\n"
                 "CHANNEL_BRANCH=main\nHOST_ROOT=/host\n"
             )
+            channel.write_text(json.dumps({
+                "schema": 1, "channel": "stable", "release_tag": None,
+                "manifest_asset": None, "signature_asset": None,
+                "sequence": 0, "version": None,
+            }))
             arguments = self.module.parser().parse_args([
                 "--config", str(config), "check", "--channel-file",
-                str(ROOT / "upgrade" / "channels" / "stable.json"),
+                str(channel),
             ])
             self.assertEqual(self.module.command_check(self.module.read_config(config), arguments), 0)
 

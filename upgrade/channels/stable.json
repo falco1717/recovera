@@ -1,9 +1,10 @@
 {
   "schema": 1,
   "channel": "stable",
-  "release_tag": null,
-  "manifest_asset": null,
-  "signature_asset": null,
-  "sequence": 0,
-  "version": null
+  "type": "package",
+  "release_tag": "package-v0.6.1",
+  "manifest_asset": "recovera-package-manifest.json",
+  "signature_asset": "recovera-package-manifest.json.sig",
+  "sequence": 1,
+  "version": "0.6.1"
 }

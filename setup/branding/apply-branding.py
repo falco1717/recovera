@@ -26,12 +26,15 @@ def update(path: Path, transform) -> bool:
 
 
 def add_global_branding(text: str) -> str:
-    marker = "/commonlookandfeel/UI/css/recovera-brand.css"
-    if marker in text:
-        return text
     needle = "</head>"
-    tag = f'    <link rel="stylesheet" href="{marker}" />\n'
-    return text.replace(needle, tag + needle, 1)
+    additions = ""
+    css = "/commonlookandfeel/UI/css/recovera-brand.css"
+    device_settings = "/commonlookandfeel/js/App/Configure/RecoveraDeviceSettings.js"
+    if css not in text:
+        additions += f'    <link rel="stylesheet" href="{css}" />\n'
+    if device_settings not in text:
+        additions += f'    <script defer src="{device_settings}"></script>\n'
+    return text.replace(needle, additions + needle, 1) if additions else text
 
 
 def replace_nav_logo(text: str) -> str:
@@ -281,6 +284,7 @@ def main() -> int:
     recovery_points_js = WEB / "commonlookandfeel/js/App/Assets/RecoveraRecoveryPoints.js"
     protect_system_js = WEB / "commonlookandfeel/js/App/Agents/RecoveraProtectSystem.js"
     home_js = WEB / "commonlookandfeel/js/App/Home/RecoveraHome.js"
+    device_settings_js = WEB / "commonlookandfeel/js/App/Configure/RecoveraDeviceSettings.js"
     for source, target in (
         (resources / "RecoveraTargetController.php", controller),
         (resources / "recovera-target.html.twig", target_template),
@@ -291,6 +295,7 @@ def main() -> int:
         (resources / "RecoveraRecoveryPoints.js", recovery_points_js),
         (resources / "RecoveraProtectSystem.js", protect_system_js),
         (resources / "RecoveraHome.js", home_js),
+        (resources / "RecoveraDeviceSettings.js", device_settings_js),
     ):
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(source, target)
