@@ -2,9 +2,9 @@
   "schema": 1,
   "channel": "stable",
   "type": "package",
-  "release_tag": "package-v0.6.3",
+  "release_tag": "package-v0.6.4",
   "manifest_asset": "recovera-package-manifest.json",
   "signature_asset": "recovera-package-manifest.json.sig",
-  "sequence": 3,
-  "version": "0.6.3"
+  "sequence": 4,
+  "version": "0.6.4"
 }
