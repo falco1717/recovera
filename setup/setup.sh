@@ -1151,6 +1151,7 @@ p79_image_updater() {
   fi
   systemctl daemon-reload || return 1
   systemctl enable recovera-upgrade-check.timer recovera-upgrade-validate.service >/dev/null || return 1
+  systemctl try-restart recovera-upgrade-check.timer >/dev/null || return 1
   baseline=$(find "$INSTALL_DIR/debs" -maxdepth 1 -type f -name 'recovera-appliance_*.deb' -print -quit 2>/dev/null)
   if [ -n "$baseline" ] && ! dpkg-query -W -f='${db:Status-Abbrev}' recovera-appliance 2>/dev/null | grep -q '^ii'; then
     dpkg -i "$baseline" >/dev/null || return 1

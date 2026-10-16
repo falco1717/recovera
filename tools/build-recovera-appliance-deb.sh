@@ -115,6 +115,7 @@ fi
 [ ! -e /etc/update-motd.d/25-datto ] || chmod a-x /etc/update-motd.d/25-datto
 systemctl daemon-reload
 systemctl enable recovera-upgrade-check.timer recovera-upgrade-validate.service >/dev/null
+systemctl try-restart recovera-upgrade-check.timer >/dev/null || true
 if id recovera-repl >/dev/null 2>&1 && [ -f /etc/recovera-peer/config.json ]; then
   python3 /usr/lib/recovera/branding/apply-peer-ui.py
   visudo -cf /etc/sudoers.d/recovera-peer >/dev/null
