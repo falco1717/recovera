@@ -20,6 +20,7 @@ class RecoveraLayoutTests(unittest.TestCase):
         self.assertIn("/var/lib/recovera-setup", setup)
         self.assertIn("/var/log/recovera-setup.log", setup)
         self.assertIn("UNIT=recovera-setup", setup)
+        self.assertIn('BUNDLE_TAG="installer-payload-v2"', release)
         self.assertIn('BUNDLE_ASSET="recovera-setup.tar"', release)
         self.assertIn("recovera-setup.tar", installer)
         self.assertIn("recovera-setup.tar", bundle)
