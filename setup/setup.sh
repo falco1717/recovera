@@ -2,12 +2,12 @@
 # Recovera: one-shot setup for a fresh Ubuntu 22.04 (jammy, amd64) VM.
 #
 # Installs the reviewed application package set at its exact versions from the bundled
-# .debs (no internet needed), then applies everything learned building spf-datto-pkgs:
+# .debs (no internet needed), then applies the Recovera appliance configuration:
 # SSH lockout guard, FIPS-off boot, snapd/cloud-init removal, ZFS homePool, and a
 # NetworkManager bridge with a self-check and automatic revert.
 #
 #   sudo ./setup.sh            run (detaches into a systemd unit and follows the log)
-#   sudo ./setup.sh check      preflight + apt dry run only (stages /opt/spf-datto and adds the
+#   sudo ./setup.sh check      preflight + apt dry run only (stages /opt/recovera and adds the
 #                              local apt source; installs nothing)
 #   sudo ./setup.sh status     show progress / follow the log of a running setup
 #   sudo ./setup.sh verify     health check of a finished replica
@@ -15,16 +15,16 @@
 #   sudo ./setup.sh install-updater install/update only the signed updater
 #   sudo ./setup.sh apply-branding apply/update only the Recovera WebUI branding
 #
-# Resumable: finished phases are recorded in /var/lib/spf-datto-setup; just run it again.
+# Resumable: finished phases are recorded in /var/lib/recovera-setup; just run it again.
 set -uo pipefail
 
-INSTALL_DIR=/opt/spf-datto
-STATE_DIR=/var/lib/spf-datto-setup
-LOG=/var/log/spf-datto-setup.log
-VERIFY_LOG=/var/log/spf-datto-verify.log
-BACKUP_DIR=/root/spf-datto-backup
-UNIT=spf-datto-setup
-LOCAL_LIST=/etc/apt/sources.list.d/spf-datto-local.list
+INSTALL_DIR=/opt/recovera
+STATE_DIR=/var/lib/recovera-setup
+LOG=/var/log/recovera-setup.log
+VERIFY_LOG=/var/log/recovera-verify.log
+BACKUP_DIR=/root/recovera-backup
+UNIT=recovera-setup
+LOCAL_LIST=/etc/apt/sources.list.d/recovera-local.list
 LOCAL_ONLY=(-o "Dir::Etc::sourcelist=$LOCAL_LIST" -o "Dir::Etc::sourceparts=/nonexistent" -o "DPkg::Lock::Timeout=900" -o "Acquire::Retries=0")
 EXPECTED_FAILED="openipmi.service datto-ipmi-setup.service datto-asset-replication-reconcile.service datto-https-check.service datto-send-volumes-to-portal.service datto-speedsync-cache-update.service datto-system-speedsync-check.service datto-update-assets.service datto-upgrade-channel-get.service"
 # Source-appliance identity, removed telemetry, and physical watchdog configuration
@@ -36,6 +36,10 @@ PROTECTED_RE='^(openssh-server|sudo|systemd|network-manager|netplan\.io|zfsutils
 SELF="$(readlink -f "$0")"
 BUNDLE="$(dirname "$SELF")"
 MODE="${1:-run}"
+
+if [ "$(id -u)" -eq 0 ] && [ -f "$BUNDLE/migrate-layout.sh" ]; then
+  /bin/sh "$BUNDLE/migrate-layout.sh" || exit 1
+fi
 
 export DEBIAN_FRONTEND=noninteractive NEEDRESTART_SUSPEND=1
 
@@ -181,7 +185,7 @@ preflight() {
   fi
 }
 
-stage_bundle() {   # copy the bundle to /opt/spf-datto so nothing depends on /home (which may move to ZFS)
+stage_bundle() {   # copy the bundle to /opt/recovera so nothing depends on /home (which may move to ZFS)
   if [ "$BUNDLE" = "$INSTALL_DIR" ]; then return 0; fi
   local need_kb free_kb
   # Validate every required source before replacing an already-staged copy. This
@@ -327,16 +331,16 @@ disable_online_registration_gates() {
     /usr/lib/datto/device/templates/commonlookandfeel/Registration/Register/index.html.twig \
     /usr/lib/datto/device/templates/vintage/Registration/Register/index.html.twig; do
     [ -f "$f" ] || continue
-    if ! grep -q 'spf-datto offline replica: skip online update pane' "$f"; then
-      sed -i "/^{% set panes = \[\] %}$/i\\{% set updatePaneEnabled = false %} {# spf-datto offline replica: skip online update pane #}" "$f" || return 1
+    if ! grep -q 'offline replica: skip online update pane' "$f"; then
+      sed -i "/^{% set panes = \[\] %}$/i\\{% set updatePaneEnabled = false %} {# Recovera offline replica: skip online update pane #}" "$f" || return 1
     fi
   done
   for f in \
     /datto/web/commonlookandfeel/js/App/Registration/RegisterWizard.js \
     /datto/web/vintage/js/App/Registration/RegisterWizard.js; do
     [ -f "$f" ] || continue
-    if ! grep -q 'spf-datto offline replica: no online panes' "$f"; then
-      sed -i '/^[[:space:]]*this\.checkNetworkConnectivity();$/c\        // spf-datto offline replica: no online panes, so do not poll forever\n        if (this.context.authorizationPaneEnabled || this.context.updatePaneEnabled) {\n            this.checkNetworkConnectivity();\n        } else {\n            this.networkConnected = true;\n        }' "$f" || return 1
+    if ! grep -q 'offline replica: no online panes' "$f"; then
+      sed -i '/^[[:space:]]*this\.checkNetworkConnectivity();$/c\        // Recovera offline replica: no online panes, so do not poll forever\n        if (this.context.authorizationPaneEnabled || this.context.updatePaneEnabled) {\n            this.checkNetworkConnectivity();\n        } else {\n            this.networkConnected = true;\n        }' "$f" || return 1
     fi
   done
   # Production Twig caches do not check source mtimes. Invalidate only the two
@@ -388,7 +392,7 @@ if ($host === '' || $refererHost === '' || !hash_equals($host, $refererHost)) {
     failOfflineRegistration(403, 'Invalid request origin');
 }
 
-$lock = fopen('/run/lock/spf-datto-offline-registration.lock', 'c');
+$lock = fopen('/run/lock/recovera-offline-registration.lock', 'c');
 if ($lock === false || !flock($lock, LOCK_EX | LOCK_NB)) {
     failOfflineRegistration(409, 'Registration is already in progress');
 }
@@ -697,7 +701,7 @@ p45_conffiles() {
   # Packages downloaded from Ubuntu carry stock config files, but Datto's mirror ships rebuilds
   # with the same version numbers and different config files (e.g. apache2's ports.conf, whose
   # stock "Listen 80/443" duplicates device.conf's and stops Apache from binding). Apply
-  # spf-datto's copy of every package config file that differs, except CONFFILE_DENY_RE.
+  # Apply the reviewed appliance copy of each differing package configuration.
   local src="$INSTALL_DIR/conffiles" tmp n=0 skip=0 sum f pkg cur bad_owners applied=$STATE_DIR/conffiles-applied.txt
   [ -f "$src/conffiles.tgz" ] || { log "no conffiles in bundle; skipping"; return 0; }
   bad_owners=$(tar --numeric-owner -tvzf "$src/conffiles.tgz" |
@@ -720,10 +724,10 @@ p45_conffiles() {
     printf '%s\t%s\n' "$f" "$pkg" >> "$applied"; n=$((n+1))
   done < "$src/manifest.tsv"
   rm -rf "$tmp"
-  log "applied $n spf-datto config files ($skip withheld: identity/hardware); list in $applied"
+  log "applied $n Recovera config files ($skip withheld: identity/hardware); list in $applied"
 
   # Validate privileged configuration before invoking any service or helper.
-  # Put the replica's original copy back if spf-datto's version does not pass.
+  # Put the replica's original copy back if the appliance version does not pass.
   if grep -q '^/etc/sudoers' "$applied" && ! visudo -c >/dev/null 2>&1; then
     restore_conf $(cut -f1 "$applied" | grep '^/etc/sudoers'); log "sudoers failed visudo -c; restored"
   fi
@@ -760,7 +764,7 @@ p45_conffiles() {
   systemctl reset-failed logrotate.service 2>/dev/null || true
   systemctl start logrotate.service >/dev/null 2>&1 || return 1
   systemctl daemon-reload
-  # spf-datto's firewalld.conf switches the backend (nftables -> iptables); a reload doesn't do
+  # The appliance firewalld configuration switches the backend; a reload does not
   # that cleanly and leaves rules half-applied until reboot, so restart instead
   grep -q '^/etc/firewalld/' "$applied" && systemctl is-active --quiet firewalld && systemctl restart firewalld
   systemctl reset-failed apache2 2>/dev/null; systemctl restart apache2 2>/dev/null
@@ -770,7 +774,7 @@ p45_conffiles() {
 
 p50_boot() {
   if [ "$FIPS_OFF" = yes ]; then
-    cat > /etc/default/grub.d/99z-match-spf-datto.cfg <<'EOF'
+    cat > /etc/default/grub.d/99-recovera.cfg <<'EOF'
 # The VM payload contains only the supported 6.8 HWE generic kernel.
 GRUB_FLAVOUR_ORDER="generic"
 GRUB_CMDLINE_LINUX_DEFAULT="$(echo "$GRUB_CMDLINE_LINUX_DEFAULT" | sed "s/ *fips=1//g")"
@@ -897,7 +901,7 @@ EOF
 p75_protection_engine() {
   [ "$REQUIRE_KVM" = yes ] || { log "KVM protection-engine check disabled in setup.conf"; return 0; }
   kvm_ready || { log "KVM is not available; agentless VM protection cannot run"; return 1; }
-  local test_log=/var/log/spf-datto-libguestfs-test.log
+  local test_log=/var/log/recovera-libguestfs-test.log
   log "testing the libguestfs/KVM disk-inspection engine (log: $test_log)"
   timeout 180 libguestfs-test-tool > "$test_log" 2>&1 || {
     tail -n 40 "$test_log"
@@ -916,8 +920,8 @@ p76_backup_admin() {
   local helper="$INSTALL_DIR/peer/recovera-backup-admin" policy dropin firewall_dropin
   [ -f "$helper" ] || { log "Recovera backup administrator helper is missing"; return 1; }
   policy="$INSTALL_DIR/peer/recovera-sshd-policy"
-  dropin="$INSTALL_DIR/peer/datto-sshd-configure-recovera.conf"
-  firewall_dropin="$INSTALL_DIR/peer/datto-firewall-share-sync-recovera.conf"
+  dropin="$INSTALL_DIR/peer/recovera-sshd-service.conf"
+  firewall_dropin="$INSTALL_DIR/peer/recovera-firewall-service.conf"
   [ -f "$policy" ] && [ -f "$dropin" ] && [ -f "$firewall_dropin" ] || {
     log "Recovera service policy hook is missing"
     return 1
@@ -1266,7 +1270,7 @@ EOF
   else
     log "br0 up: $(ip -4 -o addr show dev br0 | awk '{print $4}'), no gateway configured"
   fi
-  # spf-datto has no networkd; otherwise its wait-online adds ~2 min to every boot
+  # The appliance does not use networkd; its wait-online service delays every boot.
   systemctl disable --now systemd-networkd-wait-online.service systemd-networkd.socket systemd-networkd.service >/dev/null 2>&1
 }
 
@@ -1281,29 +1285,29 @@ p85_apt() {
     log "apt frozen: only $LOCAL_LIST remains (Ubuntu sources backed up to $BACKUP_DIR/apt)"
   else
     systemctl start apt-daily.timer apt-daily-upgrade.timer 2>/dev/null || true
-    log "apt left on Ubuntu sources; unattended-upgrades will drift from spf-datto's versions"
+    log "apt left on Ubuntu sources; unattended-upgrades may drift from the tested package set"
   fi
   offline_run apt-get -qq "${LOCAL_ONLY[@]}" update 2>/dev/null || true
 }
 
 p90_verify_timer() {
-  cat > /etc/systemd/system/spf-datto-verify.service <<EOF
+  cat > /etc/systemd/system/recovera-verify.service <<EOF
 [Unit]
-Description=spf-datto replica post-setup verification
+Description=Recovera post-setup verification
 [Service]
 Type=oneshot
 ExecStart=$INSTALL_DIR/setup.sh verify --after-boot
 EOF
-  cat > /etc/systemd/system/spf-datto-verify.timer <<EOF
+  cat > /etc/systemd/system/recovera-verify.timer <<EOF
 [Unit]
-Description=Run spf-datto replica verification once after boot
+Description=Run Recovera verification once after boot
 [Timer]
 OnBootSec=3min
 [Install]
 WantedBy=timers.target
 EOF
   systemctl daemon-reload
-  systemctl enable spf-datto-verify.timer >/dev/null 2>&1
+  systemctl enable recovera-verify.timer >/dev/null 2>&1
 }
 
 # --------------------------------------------------------------------------- verify
@@ -1311,7 +1315,7 @@ verify() {
   load_conf
   local fails=0 failed unexpected cyc want have sshlink mem_kb mem_gb
   check() { if eval "$2" >/dev/null 2>&1; then printf '  ok    %s\n' "$1"; else printf '  FAIL  %s\n' "$1"; fails=$((fails+1)); fi; }
-  echo "spf-datto replica verification $(ts) on $(hostname)"
+  echo "Recovera appliance verification $(ts) on $(hostname)"
   echo "  kernel $(uname -r), fips_enabled=$(cat /proc/sys/crypto/fips_enabled 2>/dev/null || echo n/a)"
   want=$(wc -l < "$INSTALL_DIR/lists/all-packages-versions.txt")
   have=$(comm -12 <(sort "$INSTALL_DIR/lists/all-packages-versions.txt") <(dpkg-query -W -f='${Package}=${Version}\n' | sort) | wc -l)
@@ -1319,7 +1323,7 @@ verify() {
   sshlink=$(readlink /etc/ssh/sshd_config)
   mem_kb=$(awk '/^MemTotal:/{print $2}' /proc/meminfo)
   mem_gb=$(( (mem_kb + 1024*1024 - 1) / 1024 / 1024 ))
-  check "packages at spf-datto versions: $have/$want"      "[ $have -eq $want ]"
+  check "packages at tested versions: $have/$want"        "[ $have -eq $want ]"
   check "dpkg --audit clean"                               "[ -z \"\$(dpkg --audit)\" ]"
   check "no systemd ordering cycles this boot ($cyc)"      "[ $cyc -eq 0 ]"
   check "sshd active, config -> ${sshlink:-regular file}"  "systemctl is-active ssh"
@@ -1335,7 +1339,7 @@ verify() {
                                                             "[ $mem_gb -ge $MIN_RAM_GB ]"
   if [ "$REQUIRE_KVM" = yes ]; then
     check "hardware virtualization available (/dev/kvm)"  "kvm_ready"
-    check "libguestfs/KVM self-test passed"                "test -f /var/lib/recovera/libguestfs-self-test-passed || grep -q 'TEST FINISHED OK' /var/log/spf-datto-libguestfs-test.log"
+    check "libguestfs/KVM self-test passed"                "test -f /var/lib/recovera/libguestfs-self-test-passed || grep -q 'TEST FINISHED OK' /var/log/recovera-libguestfs-test.log"
   fi
   if [ "$ZFS_CONFIGURE" != no ] && zpool list -H "$ZFS_POOL" >/dev/null 2>&1; then
     check "$ZFS_POOL ONLINE"                               "[ \"\$(zpool list -H -o health $ZFS_POOL)\" = ONLINE ]"
@@ -1391,14 +1395,14 @@ verify() {
 run_all() {
   load_conf
   validate_conf
-  log "spf-datto replica setup starting on $(hostname) ($(. /etc/os-release; echo "$PRETTY_NAME"), kernel $(uname -r))"
+  log "Recovera appliance setup starting on $(hostname) ($(. /etc/os-release; echo "$PRETTY_NAME"), kernel $(uname -r))"
   log "config: login=$LOGIN_USER offline=$OFFLINE_MODE net=$NET_CONFIGURE/$NET_IP zfs=$ZFS_CONFIGURE/$ZFS_DISK fips_off=$FIPS_OFF freeze=$APT_FREEZE"
   phase p10 "local apt repo from $INSTALL_DIR/debs"           p10_repo
   phase p20 "dry run"                                         p20_dryrun
   phase p30 "SSH guard (remote-users) and cloud-init network" p30_prep
   phase p40 "install all packages at exact versions"          p40_install
   phase p42 "remove stale source-appliance-only packages"      purge_pruned_packages
-  phase p45 "spf-datto config files (apache, sudoers, audit, ...)" p45_conffiles
+  phase p45 "Recovera config files (apache, sudoers, audit, ...)" p45_conffiles
   phase p50 "boot config (FIPS off)"                          p50_boot
   phase p60 "remove snapd + cloud-init, restore snapctl"      p60_cleanup
   phase p70 "ZFS $ZFS_POOL"                                   p70_zfs
@@ -1416,7 +1420,7 @@ run_all() {
   echo "SETUP-COMPLETE"
   if [ "$AUTO_REBOOT" = yes ]; then
     log "rebooting in 15 s"
-    systemd-run --on-active=15 --unit=spf-datto-reboot /bin/systemctl reboot >/dev/null
+    systemd-run --on-active=15 --unit=recovera-reboot /bin/systemctl reboot >/dev/null
   fi
 }
 
@@ -1431,14 +1435,14 @@ follow() {
 
 case "$MODE" in
   run)
-    if [ "${SPF_DETACHED:-}" = 1 ]; then run_all; exit $?; fi
+    if [ "${RECOVERA_DETACHED:-}" = 1 ]; then run_all; exit $?; fi
     preflight
     if systemctl is-active --quiet "$UNIT"; then echo "setup is already running"; follow; exit 0; fi
     stage_bundle; verify_checksums
     echo "starting setup as systemd unit $UNIT (safe to lose this SSH session)"
     : >> "$LOG"
     echo "------------------------------------------------------------ $(ts)" >> "$LOG"
-    systemd-run --unit="$UNIT" --collect --setenv=SPF_DETACHED=1 \
+    systemd-run --unit="$UNIT" --collect --setenv=RECOVERA_DETACHED=1 \
       --property=StandardOutput=append:"$LOG" --property=StandardError=append:"$LOG" \
       /bin/bash "$INSTALL_DIR/setup.sh" run >/dev/null || die "could not start $UNIT"
     sleep 1; follow ;;
@@ -1454,7 +1458,7 @@ case "$MODE" in
       # The timer already waits three minutes after boot. Polling
       # is-system-running here deadlocks on this verification job itself.
       verify > "$VERIFY_LOG" 2>&1; rc=$?
-      systemctl disable spf-datto-verify.timer >/dev/null 2>&1
+      systemctl disable recovera-verify.timer >/dev/null 2>&1
       exit $rc
     fi
     verify ;;

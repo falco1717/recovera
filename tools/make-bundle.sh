@@ -2,12 +2,12 @@
 # Build the self-contained, sanitized setup bundle (run on Ubuntu/Linux).
 #   tools/make-bundle.sh [export-dir] [out-dir]
 # export-dir: the pkgexport folder with debs/ (SHA256SUMS and package indexes) and lists/
-# Produces <out-dir>/spf-datto-setup/ and <out-dir>/spf-datto-setup.tar.
+# Produces <out-dir>/recovera-setup/ and <out-dir>/recovera-setup.tar.
 set -euo pipefail
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
-EXPORT="${1:-/f/Users/jfarmer/Desktop/pkgexport-spf-datto}"
+EXPORT="${1:-/f/Users/jfarmer/Desktop/pkgexport-recovera}"
 OUT="${2:-$REPO/dist}"
-B="$OUT/spf-datto-setup"
+B="$OUT/recovera-setup"
 PRUNE="$REPO/setup/prune-packages.txt"
 
 for command in dpkg-deb dpkg-scanpackages fakeroot gzip python3 sha256sum tar; do
@@ -21,10 +21,11 @@ echo "checking export checksums..."
 (cd "$EXPORT/debs" && sha256sum -c --quiet SHA256SUMS)
 
 rm -rf "$B"; mkdir -p "$B/lists" "$B/debs"
-cp "$REPO/setup/setup.sh" "$REPO/setup/setup.conf" "$REPO/setup/README.txt" "$B/"
+cp "$REPO/setup/setup.sh" "$REPO/setup/migrate-layout.sh" \
+  "$REPO/setup/setup.conf" "$REPO/setup/README.txt" "$B/"
 cp -r "$REPO/setup/wheels" "$B/wheels"
 sed -i 's/\r$//' "$B/setup.sh" "$B/setup.conf" "$B/README.txt"
-chmod 755 "$B/setup.sh"
+chmod 755 "$B/setup.sh" "$B/migrate-layout.sh"
 cp "$EXPORT/lists/manual.txt" "$EXPORT/lists/portable.txt" \
    "$EXPORT/lists/local-debs.txt" "$EXPORT/lists/repacked.txt" "$B/lists/"
 cp "$PRUNE" "$B/lists/pruned-packages.txt"
@@ -50,8 +51,8 @@ recovera_version=$(tr -d '[:space:]' < "$REPO/VERSION")
 bash "$REPO/tools/build-recovera-appliance-deb.sh" \
   --version "${recovera_version}-1" --output "$B/debs" >/dev/null
 
-datto_deb=$(find "$B/debs" -maxdepth 1 -name 'datto-siris-os-2_*.deb' -print -quit)
-[ -n "$datto_deb" ] || { echo "datto-siris-os-2 package not found"; exit 1; }
+source_deb=$(find "$B/debs" -maxdepth 1 -name 'datto-siris-os-2_*.deb' -print -quit)
+[ -n "$source_deb" ] || { echo "required base application package not found"; exit 1; }
 tmp=$(mktemp -d)
 cleanup() {
   # The source package contains deliberately non-traversable config directories
@@ -85,22 +86,22 @@ package_ownership_map() {
     sort
 }
 
-echo "sanitizing datto-siris-os-2 package..."
-package_ownership_map "$datto_deb" > "$tmp/ownership.before"
+echo "sanitizing base application package..."
+package_ownership_map "$source_deb" > "$tmp/ownership.before"
 fakeroot "${FAKEROOT_ARGS[@]}" -- bash -euo pipefail -c '
-  mkdir -p "$2/datto/DEBIAN"
-  dpkg-deb --fsys-tarfile "$1" | tar --numeric-owner -xpf - -C "$2/datto"
-  dpkg-deb --ctrl-tarfile "$1" | tar --numeric-owner -xpf - -C "$2/datto/DEBIAN"
-  python3 "$3" "$2/datto" "$4"
-  dpkg-deb -b "$2/datto" "$2/datto-siris-os-2.deb" >/dev/null
-' _ "$datto_deb" "$tmp" "$REPO/tools/sanitize-datto-package.py" "$PRUNE"
-package_ownership_map "$tmp/datto-siris-os-2.deb" > "$tmp/ownership.after"
+  mkdir -p "$2/source/DEBIAN"
+  dpkg-deb --fsys-tarfile "$1" | tar --numeric-owner -xpf - -C "$2/source"
+  dpkg-deb --ctrl-tarfile "$1" | tar --numeric-owner -xpf - -C "$2/source/DEBIAN"
+  python3 "$3" "$2/source" "$4"
+  dpkg-deb -b "$2/source" "$2/source-package.deb" >/dev/null
+' _ "$source_deb" "$tmp" "$REPO/tools/sanitize-source-package.py" "$PRUNE"
+package_ownership_map "$tmp/source-package.deb" > "$tmp/ownership.after"
 if ! cmp -s "$tmp/ownership.before" "$tmp/ownership.after"; then
   echo "sanitized package changed file ownership metadata"
   diff -u "$tmp/ownership.before" "$tmp/ownership.after" | head -n 80 || true
   exit 1
 fi
-mv "$tmp/datto-siris-os-2.deb" "$datto_deb"
+mv "$tmp/source-package.deb" "$source_deb"
 
 # Remove source identity and configuration for packages intentionally excluded.
 if [ -f "$B/conffiles/conffiles.tgz" ]; then
@@ -248,7 +249,7 @@ if [ -f "$B/conffiles/conffiles.tgz" ]; then
   fi
 fi
 rm -rf "$tmp/check"; mkdir -p "$tmp/check"
-dpkg-deb --fsys-tarfile "$datto_deb" | tar --no-same-owner -xpf - -C "$tmp/check"
+dpkg-deb --fsys-tarfile "$source_deb" | tar --no-same-owner -xpf - -C "$tmp/check"
 for excluded in \
   etc/apache2/ssl/www.key etc/apache2/ssl/www.crt \
   etc/filebeat etc/fluent-bit etc/telegraf \
@@ -269,7 +270,7 @@ done
     echo "Telegraf PHP-FPM socket group survived in application package"; exit 1;
   }
 ! grep -Eq '(telegraf package file list not found|systemctl preset[[:space:]\\]*(fluent-bit|telegraf|al-agent|filebeat))' \
-  "$tmp/datto/DEBIAN/postinst" || { echo "excluded-agent postinst hook survived"; exit 1; }
+  "$tmp/source/DEBIAN/postinst" || { echo "excluded-agent postinst hook survived"; exit 1; }
 if awk -F: '$2 !~ /^(!|\*|!!)?$/ { found=1 } END { exit found ? 0 : 1 }' \
     "$tmp/check/datto/def-configs/shadow"; then
   echo "active factory password hash survived"; exit 1
@@ -277,11 +278,11 @@ fi
 
 echo "payload contains $(wc -l < "$B/lists/all-packages-versions.txt") packages"
 
-(cd "$OUT" && tar -cf spf-datto-setup.tar spf-datto-setup)
+(cd "$OUT" && tar -cf recovera-setup.tar recovera-setup)
 echo
-echo "bundle: $OUT/spf-datto-setup.tar  ($(du -h "$OUT/spf-datto-setup.tar" | cut -f1))"
-echo "sha256: $(sha256sum "$OUT/spf-datto-setup.tar" | cut -d' ' -f1)"
+echo "bundle: $OUT/recovera-setup.tar  ($(du -h "$OUT/recovera-setup.tar" | cut -f1))"
+echo "sha256: $(sha256sum "$OUT/recovera-setup.tar" | cut -d' ' -f1)"
 echo
 echo "next:"
-echo "  ./install.sh --bundle $OUT/spf-datto-setup.tar --check"
-echo "  ./install.sh --bundle $OUT/spf-datto-setup.tar"
+echo "  ./install.sh --bundle $OUT/recovera-setup.tar --check"
+echo "  ./install.sh --bundle $OUT/recovera-setup.tar"

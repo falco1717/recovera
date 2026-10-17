@@ -15,7 +15,7 @@ def die(message: str) -> None:
 
 
 if len(sys.argv) != 3:
-    die("usage: sanitize-datto-package.py EXTRACTED_DEB PRUNE_LIST")
+    die("usage: sanitize-source-package.py EXTRACTED_DEB PRUNE_LIST")
 
 root = pathlib.Path(sys.argv[1]).resolve()
 prune_file = pathlib.Path(sys.argv[2]).resolve()
@@ -40,14 +40,14 @@ def package_name(requirement: str) -> str:
 text = control.read_text(encoding="utf-8")
 match = re.search(r"(?ms)^Depends:\s*(.*?)(?=\n\S[^:]*:|\Z)", text)
 if not match:
-    die("datto-siris-os-2 has no Depends field")
+    die("source appliance package has no Depends field")
 
 raw = re.sub(r"\n[ \t]+", " ", match.group(1)).strip()
 requirements = [item.strip() for item in raw.split(",") if item.strip()]
 removed = [item for item in requirements if package_name(item) in pruned]
 kept = [item for item in requirements if package_name(item) not in pruned]
 if not removed:
-    die("no excluded dependencies were found in datto-siris-os-2")
+    die("no excluded dependencies were found in the source appliance package")
 
 wrapped = "Depends: " + ",\n ".join(kept)
 text = text[: match.start()] + wrapped + text[match.end() :]
@@ -122,7 +122,7 @@ if conffiles.is_file():
 # excluded agent services. Remove only those agent-specific operations.
 postinst = root / "DEBIAN" / "postinst"
 if not postinst.is_file():
-    die("datto-siris-os-2 has no postinst")
+    die("source appliance package has no postinst")
 postinst_text = postinst.read_text(encoding="utf-8")
 telegraf_block = re.compile(
     r"\n        # The Telegraf package does not install its systemd unit file\..*?"
@@ -192,4 +192,4 @@ md5sums.write_text("\n".join(entries) + "\n", encoding="utf-8")
 print("removed dependencies:", " ".join(package_name(item) for item in removed))
 print("removed source-appliance TLS identity and excluded-agent integration")
 print("changed the PHP-FPM application socket group from telegraf to www-data")
-print("locked password hashes in datto/def-configs/shadow")
+print("locked password hashes in the factory shadow template")

@@ -2,9 +2,9 @@ Recovera: single-script appliance setup
 ========================================
 
 Turns a fresh Ubuntu 22.04 (jammy, amd64) VM into a Recovera backup appliance using
-the retained SIRIS package stack:
-1,329 retained packages at spf-datto's exact versions, installed offline from debs/, plus
-the fixes required to run that application stack on a normal Ubuntu VM.
+the reviewed application package set: 1,329 retained packages at tested versions,
+installed offline from debs/, plus the fixes required to run that application stack
+on a normal Ubuntu VM.
 The bundle excludes 22 source-appliance-only security, telemetry, debug, and legacy FIPS
 kernel packages after validating the retained package dependency closure.
 
@@ -20,7 +20,7 @@ AIR-GAPPED MODE
   OFFLINE_MODE=yes is the default. Every apt update, simulation, install, and purge runs in
   a private network namespace and is restricted to the bundled file: repository. Package
   maintainer scripts are prevented from starting services during installation. The exact
-  npyscreen wheel required by datto-siris-os-2 is bundled too, and pip is forced to use that
+  The required npyscreen wheel is bundled too, and pip is forced to use that
   local wheel directory without querying an online index. At the end, public apt sources and
   automatic update timers are disabled.
 
@@ -41,15 +41,15 @@ RUN
     ./install.sh                          # about 20 min, then reboots
 
   With a manually transferred archive on an isolated VM:
-    ./install.sh --bundle /path/to/spf-datto-setup.tar --check
-    ./install.sh --bundle /path/to/spf-datto-setup.tar
+    ./install.sh --bundle /path/to/recovera-setup.tar --check
+    ./install.sh --bundle /path/to/recovera-setup.tar
 
-  It runs as the systemd unit "spf-datto-setup", so losing the SSH session doesn't stop it.
-  Reconnect and run:  sudo ./setup.sh status       (or: sudo /opt/spf-datto/setup.sh status)
+  It runs as the systemd unit "recovera-setup", so losing the SSH session doesn't stop it.
+  Reconnect and run:  sudo ./setup.sh status       (or: sudo /opt/recovera/setup.sh status)
   Re-running resumes; finished phases are skipped.
 
 WHAT IT DOES (in order)
-  p10  copies the bundle to /opt/spf-datto, checks SHA256SUMS, adds it as a local apt source
+  p10  copies the bundle to /opt/recovera, checks SHA256SUMS, adds it as a local apt source
   p20  apt dry run; aborts on errors or if it would remove a protected package
   p30  creates group remote-users and adds your user. The bundled sshd config, applied at every
        boot, has "AllowGroups remote-users"; without this you are locked out after the reboot.
@@ -65,27 +65,27 @@ WHAT IT DOES (in order)
        removed so this replica can start without Internet. The first-run wizard's online-update
        pane and perpetual connectivity polling are removed, and a one-time same-origin finalizer
        completes the native local registration without contacting the cloud.
-  p50  GRUB: 6.8 generic kernel without fips=1, like spf-datto. The unused legacy FIPS kernel
+  p50  GRUB: 6.8 generic kernel without fips=1. The unused legacy FIPS kernel
        and its meta-packages are not included in the bundle.
   p60  purges snapd + cloud-init (they make boot ordering cycles with appliance units) and
        restores the /usr/bin/snapctl link
-  p70  requires a suitable blank disk, creates ZFS homePool with spf-datto's layout, and
+  p70  requires a suitable blank disk, creates the Recovera ZFS homePool layout, and
        copies /home onto it. Limited troubleshooting installs can explicitly select auto/no.
   p75  verifies /dev/kvm and runs the libguestfs disk-inspection self-test used by
        agentless VM protection; this catches missing nested virtualization before registration
   p78  installs the offline peer-replication service, restricted SSH receiver, management UI,
        and five-minute scheduler. Pairing and snapshot transport never use a cloud endpoint.
-  p80  NetworkManager bridge br0 (port = your NIC, zone datto). With a gateway configured it
+  p80  NetworkManager bridge br0 (port = your NIC). With a gateway configured it
        checks that the gateway answers; without one it checks the bridge address. It reverts to
        netplan automatically if the check fails. Then networkd is disabled.
   p85  APT_FREEZE=yes: Ubuntu sources disabled and backed up, unattended-upgrades off
-  p90  verification timer: 3 min after the reboot, writes /var/log/spf-datto-verify.log
+  p90  verification timer: 3 min after the reboot, writes /var/log/recovera-verify.log
 
 AFTERWARDS
-  sudo cat /var/log/spf-datto-verify.log       (RESULT: PASS expected)
-  sudo /opt/spf-datto/setup.sh verify          (run the check any time)
-  Logs: /var/log/spf-datto-setup.log   Backups: /root/spf-datto-backup/
-  The bundle in your home directory can be deleted; /opt/spf-datto keeps a copy.
+  sudo cat /var/log/recovera-verify.log       (RESULT: PASS expected)
+  sudo /opt/recovera/setup.sh verify          (run the check any time)
+  Logs: /var/log/recovera-setup.log   Backups: /root/recovera-backup/
+  The bundle in your home directory can be deleted; /opt/recovera keeps a copy.
 
 WEB UI
   https://<VM IP>/  ->  "Set Up Recovera" on an unregistered appliance. Apache listens once
@@ -116,12 +116,12 @@ PEER REPLICATION
   addresses. No default route, DNS, or Internet is required. The internal peer API
   uses a restricted Unix-domain socket and does not listen on another TCP port.
 
-EXPECTED FAILED SERVICES (no IPMI hardware / no vendor cloud registration)
-  openipmi, datto-https-check, datto-send-volumes-to-portal, datto-speedsync-cache-update,
-  datto-system-speedsync-check, datto-update-assets, datto-upgrade-channel-get
+EXPECTED FAILED SERVICES
+  Hardware-management and original cloud-registration services are expected to remain
+  inactive on a virtual, locally managed Recovera appliance.
 
 SENSITIVE
-  Some .debs were rebuilt from spf-datto's installed files (dpkg-repack). The builder removes
+  Some .debs were rebuilt from reference-appliance installed files. The builder removes
   known source-appliance TLS/log-shipping keys and locks exported factory password hashes, but
   the payload still contains proprietary packages and selected configs. Keep it private and
   treat it as sensitive.

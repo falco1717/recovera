@@ -115,5 +115,5 @@ Existing appliances installed from an older version of this branch can install
 or refresh only this feature, without rerunning package setup or rebooting:
 
 ```bash
-sudo /opt/spf-datto/setup.sh install-peer
+sudo /opt/recovera/setup.sh install-peer
 ```

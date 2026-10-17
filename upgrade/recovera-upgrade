@@ -605,7 +605,7 @@ def verify_deb(path, package):
 def find_cached_deb(config, name, version):
     roots = [
         config_path(config, "PACKAGE_CACHE", DEFAULT_PACKAGE_CACHE),
-        Path("/opt/spf-datto/debs"),
+        Path("/opt/recovera/debs"),
         Path("/var/cache/apt/archives"),
     ]
     for root in roots:

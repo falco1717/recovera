@@ -46,7 +46,7 @@ merge it into `upgrade/channels/stable.json`; uploading assets alone does not
 expose a release. Successful packages are retained in
 `/var/cache/recovera-upgrade/packages`, transactions in
 `/var/lib/recovera-upgrade/transactions`, and the original baseline remains in
-`/opt/spf-datto/debs`.
+`/opt/recovera/debs`.
 
 Fresh installer bundles include `recovera-appliance` as a versioned package so
 its files have a rollback baseline from the beginning. An older development

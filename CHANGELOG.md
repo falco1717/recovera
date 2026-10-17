@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Renamed Recovera-owned installer, bundle, service, state, cache, log, backup,
+  and verification paths; upgrades migrate the previous layout without losing
+  setup progress or the offline package cache.
+- Renamed the offline installer payload to `recovera-setup.tar` and removed
+  legacy branding from Recovera-owned setup documentation and helper names.
 - Added signed schema-2 package repositories as the default appliance update
   path, with installed-version filtering, changed-package-only downloads, offline APT transactions, strict
   platform-package separation, cached rollback packages, service validation,

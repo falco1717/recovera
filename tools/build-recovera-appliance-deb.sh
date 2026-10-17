@@ -23,7 +23,8 @@ stage=$work/stage
 mkdir -p "$stage/DEBIAN" "$stage/usr/local/sbin" "$stage/usr/local/lib/recovera" \
   "$stage/usr/local/lib/recovera-upgrade" "$stage/usr/local/share/recovera-upgrade" \
   "$stage/usr/local/share/recovera" "$stage/usr/lib/recovera/branding" \
-  "$stage/usr/share/recovera/defaults" "$stage/etc/systemd/system" \
+  "$stage/usr/share/recovera/defaults" "$stage/usr/share/recovera/setup" \
+  "$stage/etc/systemd/system" \
   "$stage/etc/apache2/conf-available" "$stage/etc/ssh/sshd_config.d" \
   "$stage/etc/sudoers.d" "$stage/etc/update-motd.d" \
   "$stage/etc/systemd/system/datto-sshd-configure.service.d" \
@@ -52,15 +53,19 @@ install -m 0644 "$ROOT/setup/peer/recovera-peer-sync.timer" "$stage/etc/systemd/
 install -m 0644 "$ROOT/setup/peer/recovera-peer-gateway.conf" "$stage/etc/apache2/conf-available/"
 install -m 0644 "$ROOT/setup/peer/sshd-recovera-peer.conf" "$stage/etc/ssh/sshd_config.d/91-recovera-peer.conf"
 install -m 0440 "$ROOT/setup/peer/sudoers-recovera-peer" "$stage/etc/sudoers.d/recovera-peer"
-install -m 0644 "$ROOT/setup/peer/datto-sshd-configure-recovera.conf" \
+install -m 0644 "$ROOT/setup/peer/recovera-sshd-service.conf" \
   "$stage/etc/systemd/system/datto-sshd-configure.service.d/recovera.conf"
-install -m 0644 "$ROOT/setup/peer/datto-firewall-share-sync-recovera.conf" \
+install -m 0644 "$ROOT/setup/peer/recovera-firewall-service.conf" \
   "$stage/etc/systemd/system/datto-firewall-share-sync.service.d/recovera.conf"
 
 cp -a "$ROOT/setup/branding/." "$stage/usr/lib/recovera/branding/"
 install -m 0644 "$ROOT/setup/branding/recovera-logo.png" "$stage/usr/local/share/recovera/recovera-logo.png"
 install -m 0644 "$ROOT/setup/branding/recovera-ascii.logo" "$stage/usr/local/share/recovera/recovera-ascii.logo"
 install -m 0755 "$ROOT/setup/branding/recovera-motd" "$stage/etc/update-motd.d/25-recovera"
+install -m 0755 "$ROOT/setup/migrate-layout.sh" "$stage/usr/local/lib/recovera/migrate-layout"
+install -m 0755 "$ROOT/setup/setup.sh" "$stage/usr/share/recovera/setup/setup.sh"
+install -m 0755 "$ROOT/setup/migrate-layout.sh" "$stage/usr/share/recovera/setup/migrate-layout.sh"
+install -m 0644 "$ROOT/setup/README.txt" "$stage/usr/share/recovera/setup/README.txt"
 
 install -m 0755 "$ROOT/upgrade/recovera-upgrade" "$stage/usr/local/sbin/recovera-upgrade"
 install -m 0755 "$ROOT/upgrade/recovera-upgrade-schedule" "$stage/usr/local/sbin/recovera-upgrade-schedule"
@@ -101,6 +106,12 @@ cat > "$stage/DEBIAN/postinst" <<'POSTINST'
 #!/bin/sh
 set -e
 [ "$1" = configure ] || exit 0
+/usr/local/lib/recovera/migrate-layout
+if [ -d /opt/recovera ]; then
+  install -m 0755 /usr/share/recovera/setup/setup.sh /opt/recovera/setup.sh
+  install -m 0755 /usr/share/recovera/setup/migrate-layout.sh /opt/recovera/migrate-layout.sh
+  install -m 0644 /usr/share/recovera/setup/README.txt /opt/recovera/README.txt
+fi
 install -d -m 0755 /etc/recovera /var/cache/recovera-upgrade/packages /var/lib/recovera-upgrade/transactions
 if [ ! -f /etc/recovera/upgrade.conf ]; then
   install -m 0600 /usr/share/recovera/defaults/upgrade.conf /etc/recovera/upgrade.conf

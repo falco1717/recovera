@@ -6,7 +6,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$ROOT/setup/release.env"
 
 MODE=run
-BUNDLE="${RECOVERA_BUNDLE:-${SPF_DATTO_BUNDLE:-}}"
+BUNDLE="${RECOVERA_BUNDLE:-}"
 
 usage() {
   cat <<'EOF'
@@ -14,7 +14,7 @@ Usage: ./install.sh [--bundle PATH] [--check]
 
 Installs the complete Recovera appliance on an existing Ubuntu 22.04 amd64 VM.
 
-  --bundle PATH  Use a previously downloaded spf-datto-setup.tar.
+  --bundle PATH  Use a previously downloaded recovera-setup.tar.
   --check        Validate the VM and simulate package installation only.
   -h, --help     Show this help.
 
@@ -55,12 +55,12 @@ download_payload() {
   local owner cache
   owner="${SUDO_USER:-$(id -un)}"
   if [ "$owner" = root ]; then
-    cache="${XDG_CACHE_HOME:-/root/.cache}/spf-datto"
+    cache="${XDG_CACHE_HOME:-/root/.cache}/recovera"
     mkdir -p "$cache"
     gh release download "$BUNDLE_TAG" --repo "$BUNDLE_REPO" \
       --pattern "$BUNDLE_ASSET" --dir "$cache" --clobber
   else
-    cache="$(getent passwd "$owner" | cut -d: -f6)/.cache/spf-datto"
+    cache="$(getent passwd "$owner" | cut -d: -f6)/.cache/recovera"
     if [ "$(id -u)" -eq 0 ]; then
       install -d -o "$owner" -g "$(id -gn "$owner")" "$cache"
       sudo -H -u "$owner" gh release download "$BUNDLE_TAG" --repo "$BUNDLE_REPO" \
@@ -104,7 +104,7 @@ fi
 [ "${VERSION_ID:-}" = 22.04 ] || die "Ubuntu 22.04 is required (found ${PRETTY_NAME:-unknown})"
 [ "$(dpkg --print-architecture)" = amd64 ] || die "amd64 is required"
 
-work="$(mktemp -d /var/tmp/spf-datto-install.XXXXXX)"
+work="$(mktemp -d /var/tmp/recovera-install.XXXXXX)"
 cleanup() { rm -rf -- "$work"; }
 trap cleanup EXIT
 
@@ -118,12 +118,14 @@ if tar -tf "$BUNDLE" | awk '
 fi
 
 tar -xf "$BUNDLE" -C "$work"
-payload="$work/spf-datto-setup"
-[ -x "$payload/setup.sh" ] || die "payload does not contain spf-datto-setup/setup.sh"
+mapfile -t payloads < <(find "$work" -mindepth 2 -maxdepth 2 -type f -name setup.sh -executable -printf '%h\n')
+[ "${#payloads[@]}" -eq 1 ] || die "payload must contain exactly one top-level setup directory"
+payload="${payloads[0]}"
 
 # The checked-out branch owns installer behavior and local configuration; the
 # release asset supplies the large immutable package/config payload.
 install -m 0755 "$ROOT/setup/setup.sh" "$payload/setup.sh"
+install -m 0755 "$ROOT/setup/migrate-layout.sh" "$payload/migrate-layout.sh"
 install -m 0644 "$ROOT/setup/setup.conf" "$payload/setup.conf"
 install -m 0644 "$ROOT/setup/README.txt" "$payload/README.txt"
 rm -rf "$payload/wheels"

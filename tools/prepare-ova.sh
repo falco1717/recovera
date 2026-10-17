@@ -115,7 +115,7 @@ compact_root_disk() {
 }
 
 compact_installer_payload() {
-  local deb_dir=/opt/spf-datto/debs version baseline saved
+  local deb_dir=/opt/recovera/debs version baseline saved
 
   # A deployed OVA does not need the 1.3 GB offline bootstrap repository. Keep
   # only the installed Recovera control-plane package as its signed-updater
@@ -203,7 +203,7 @@ if [ -n "$builder_user" ] && [ "$builder_user" != backup-admin ] && id "$builder
     exit 1
   }
 fi
-sed -Ei 's/^LOGIN_USER=.*/LOGIN_USER="backup-admin"/' /opt/spf-datto/setup.conf
+sed -Ei 's/^LOGIN_USER=.*/LOGIN_USER="backup-admin"/' /opt/recovera/setup.conf
 
 # Remove all clone-sensitive identities. First boot recreates them.
 registered_admin=""

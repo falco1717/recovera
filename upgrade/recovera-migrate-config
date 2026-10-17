@@ -27,7 +27,7 @@ for path in \
   /etc/hosts \
   /etc/hostid \
   /etc/fstab \
-  /opt/spf-datto/setup.conf; do
+  /opt/recovera/setup.conf; do
   copy_path "$path"
 done
 for path in /etc/ssh/ssh_host_*; do copy_path "$path"; done

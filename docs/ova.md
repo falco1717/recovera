@@ -93,5 +93,5 @@ identities, or licensing state that Recovera is not authorized to publish.
 Always import the resulting OVA twice and verify that the two instances report
 different peer appliance IDs and TLS fingerprints. Complete registration on a
 validation instance, confirm **Appliance Access** reveals its credential, test
-SSH and sudo with that credential, run `sudo /opt/spf-datto/setup.sh verify`,
+SSH and sudo with that credential, run `sudo /opt/recovera/setup.sh verify`,
 and compare the checksum with the published SHA-256 value.

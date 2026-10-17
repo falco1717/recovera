@@ -112,7 +112,7 @@ class RecoveraOvaTests(unittest.TestCase):
         self.assertIn("Include /etc/ssh/sshd_config.d/*.conf", policy)
         self.assertIn("Match User backup-admin", policy)
         self.assertIn("Match all", policy)
-        dropin = (ROOT / "setup" / "peer" / "datto-sshd-configure-recovera.conf").read_text()
+        dropin = (ROOT / "setup" / "peer" / "recovera-sshd-service.conf").read_text()
         self.assertIn("ExecStartPost=/usr/local/sbin/recovera-sshd-policy", dropin)
         self.assertIn("password SSH is enabled only for backup-admin", script)
 
@@ -120,7 +120,7 @@ class RecoveraOvaTests(unittest.TestCase):
         setup = (ROOT / "setup" / "setup.sh").read_text()
         self.assertIn("/var/lib/recovera/libguestfs-self-test-passed", setup)
         dropin = (
-            ROOT / "setup" / "peer" / "datto-firewall-share-sync-recovera.conf"
+            ROOT / "setup" / "peer" / "recovera-firewall-service.conf"
         ).read_text()
         self.assertIn("After=firewalld.service dbus.service", dropin)
         self.assertIn("Restart=on-failure", dropin)
