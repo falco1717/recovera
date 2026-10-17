@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.6.14 - 2026-10-17
+
+- Published a no-impact maintenance release to validate authenticated appliance
+  updates through the redundant Recovera gateway cluster and a private source
+  repository.
+
 ## Unreleased
 
 - Renamed Recovera-owned installer, bundle, service, state, cache, log, backup,
