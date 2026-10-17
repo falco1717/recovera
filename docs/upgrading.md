@@ -87,7 +87,10 @@ Window is open and the Update Channel is set to Stable. It never installs or
 reboots automatically; use the WebUI's Update Now section for installation.
 For a private repository, place a fine-grained,
 read-only GitHub token in `/etc/recovera/github-token`, owned by root with mode
-`0600`. The token needs only repository Contents and Releases read access.
+`0600`. The token needs only read-only repository **Contents** access.
+An interactive GitHub CLI login is not required. See
+[private updates without a hosted gateway](private-updates.md) for token and
+manual signed-update procedures.
 
 An image is accepted only when all of these checks pass:
 
@@ -115,11 +118,11 @@ During the first conversion from a conventional installation, the image-layout
 marker records that installation's GRUB entry as the fallback until the first
 candidate has passed validation.
 
-The signing private key is not in Git. It is currently stored on the maintainer
-workstation at `F:\Users\jfarmer\Documents\Recovera Secrets\recovera-upgrade-signing-key`.
-Back it up into an access-controlled secret store before publishing the first
-production image. Losing it prevents new releases; exposing it requires a
-public-key rotation delivered through an already trusted release.
+The signing private key is not in Git and must not be named or located in
+public release documentation. Back it up into an access-controlled secret
+store before publishing a production image. Losing it prevents new releases;
+exposing it requires the rotation or recovery procedure in
+[release security and key rotation](release-security.md).
 
 ## Release format
 

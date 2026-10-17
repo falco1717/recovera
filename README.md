@@ -104,6 +104,9 @@ dependencies, so installation and registration do not require Internet access.
 - Recovera image releases use signed manifests, SHA-256 verified split GitHub
   assets, one-time candidate boots, health validation, and automatic rollback.
 - Maintainers should follow the [release checklist](docs/releasing.md).
+- Release operators should follow the
+  [signing-key lifecycle](docs/release-security.md); private deployments can
+  use [private updates without a hosted gateway](docs/private-updates.md).
 - Evaluate future reference releases with the sanitized
   [compatibility workflow](docs/compatibility-workflow.md) before changing the
   Recovera application stack.

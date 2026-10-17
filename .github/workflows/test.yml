@@ -23,6 +23,7 @@ jobs:
           python3 -m py_compile setup/peer/recovera-peer setup/branding/apply-branding.py \
             setup/branding/apply-peer-ui.py \
             upgrade/recovera-upgrade \
+            tools/verify-release.py \
             tools/merge-offline-package.py \
             tools/compatibility/collect-baseline.py \
             tools/compatibility/compare-baselines.py
