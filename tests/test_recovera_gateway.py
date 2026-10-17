@@ -133,6 +133,11 @@ class RecoveraGatewayGitHubTests(unittest.TestCase):
         request = opener.open.call_args.args[0]
         self.assertEqual(dict(request.header_items())["Authorization"], "Bearer read-only-secret")
 
+    def test_gateway_handles_another_process_winning_release_publish(self):
+        source = (GATEWAY / "recovera-gateway").read_text()
+        self.assertIn("errno.ENOTEMPTY", source)
+        self.assertIn("self.verify_release(target, manifest_name)", source)
+
 
 if __name__ == "__main__":
     unittest.main()

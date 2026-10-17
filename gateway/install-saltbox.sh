@@ -67,6 +67,18 @@ compose=(docker compose --env-file .env.saltbox -f compose.saltbox.yaml)
 "${compose[@]}" run --rm --user root --entrypoint chown gateway \
   -R 39871:39871 /var/lib/recovera-gateway
 "${compose[@]}" up -d
-"${compose[@]}" exec -T gateway /opt/recovera-gateway/recovera-gateway sync
+ready=false
+for _attempt in $(seq 1 30); do
+  if "${compose[@]}" exec -T gateway test -s /var/lib/recovera-gateway/channels/stable.json; then
+    ready=true
+    break
+  fi
+  sleep 2
+done
+if [[ $ready != true ]]; then
+  "${compose[@]}" logs --tail=100 gateway >&2
+  echo "Gateway did not cache the stable channel within 60 seconds." >&2
+  exit 1
+fi
 "${compose[@]}" ps
 echo "Recovera gateway is available through Saltbox Traefik at https://$hostname/"

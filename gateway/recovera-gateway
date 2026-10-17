@@ -3,6 +3,7 @@
 
 import argparse
 import base64
+import errno
 import http.server
 import json
 import os
@@ -264,7 +265,15 @@ class Cache:
                         raise GatewayError(f"release asset is missing: {name}")
                     self.github.download(available[name], temporary / name)
                 self.verify_release(temporary, manifest_name)
-                os.replace(temporary, target)
+                try:
+                    os.replace(temporary, target)
+                except OSError as exc:
+                    # Another gateway process may have completed the same
+                    # immutable release between the exists check and rename.
+                    if exc.errno not in (errno.EEXIST, errno.ENOTEMPTY) or not target.is_dir():
+                        raise
+                    shutil.rmtree(temporary, ignore_errors=True)
+                    self.verify_release(target, manifest_name)
             except Exception:
                 shutil.rmtree(temporary, ignore_errors=True)
                 raise
