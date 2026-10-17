@@ -72,6 +72,42 @@ class RecoveraLayoutTests(unittest.TestCase):
             self.assertFalse((old_units / "spf-datto-verify.service").exists())
             self.assertTrue((old_units / "recovera-verify.service").exists())
 
+    @unittest.skipIf(os.name == "nt" or not shutil.which("bash"), "requires a Linux shell")
+    def test_layout_migration_does_not_fail_when_legacy_backup_cannot_move(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            legacy_backup = root / "root/spf-datto-backup"
+            legacy_backup.mkdir(parents=True)
+            (legacy_backup / "keep.txt").write_text("keep\n", encoding="utf-8")
+
+            bin_dir = root / "test-bin"
+            bin_dir.mkdir()
+            real_mv = shutil.which("mv")
+            fake_mv = bin_dir / "mv"
+            fake_mv.write_text(
+                "#!/bin/sh\n"
+                "case \"$1\" in */root/spf-datto-backup) exit 30;; esac\n"
+                f'exec "{real_mv}" "$@"\n',
+                encoding="utf-8",
+            )
+            fake_mv.chmod(0o755)
+
+            environment = dict(
+                os.environ,
+                RECOVERA_MIGRATION_ROOT=str(root),
+                PATH=f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}",
+            )
+            result = subprocess.run(
+                ["bash", str(MIGRATOR)],
+                env=environment,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+            self.assertTrue((legacy_backup / "keep.txt").is_file())
+            self.assertIn("preserving /root/spf-datto-backup", result.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()
