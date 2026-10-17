@@ -47,7 +47,7 @@ if ! docker compose version >/dev/null 2>&1; then
 fi
 
 install -d -m 0700 "$gateway_dir/config"
-install -m 0600 "$token_file" "$gateway_dir/config/github-token"
+install -o root -g 39871 -m 0640 "$token_file" "$gateway_dir/config/github-token"
 install -m 0644 "$gateway_dir/keys/recovera-gateway-access-signers" \
   "$gateway_dir/config/access-signers"
 printf 'GATEWAY_HOSTNAME=%s\nRECOVERA_GATEWAY_REPOSITORY=%s\nRECOVERA_GATEWAY_CHANNELS=stable\nRECOVERA_GATEWAY_SYNC_INTERVAL=900\n' \
@@ -56,6 +56,8 @@ chmod 0600 "$gateway_dir/.env"
 
 cd "$gateway_dir"
 docker compose build --pull
+docker compose run --rm --user root --entrypoint chown gateway \
+  -R 39871:39871 /var/lib/recovera-gateway
 docker compose up -d
 docker compose exec -T gateway /opt/recovera-gateway/recovera-gateway sync
 docker compose ps

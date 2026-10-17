@@ -98,6 +98,13 @@ class RecoveraGatewayReleaseTrustTests(unittest.TestCase):
         self.assertTrue(all(line.startswith("recovera-release ssh-ed25519 ") for line in lines))
         self.assertEqual(len(set(lines)), 2)
 
+    def test_container_uses_fixed_unprivileged_identity_for_secret_mounts(self):
+        dockerfile = (GATEWAY / "Dockerfile").read_text()
+        saltbox_installer = (GATEWAY / "install-saltbox.sh").read_text()
+        self.assertIn("--uid 39871 --gid 39871", dockerfile)
+        self.assertIn("-g 39871 -m 0640", saltbox_installer)
+        self.assertIn("USER recovera-gateway", dockerfile)
+
 
 class RecoveraGatewayGitHubTests(unittest.TestCase):
     @classmethod
