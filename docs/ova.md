@@ -4,10 +4,11 @@ The Recovera OVA contains a complete, unregistered Ubuntu 22.04 appliance. It
 is an alternative to running `install.sh` on an existing VM; both deployment
 paths produce the same application and offline registration workflow.
 
-Release OVAs must be no larger than 3,000,000,000 bytes (3 GB). The validated
-v0.6.0 artifact is `Recovera-Virtual-Appliance-v0.6.0.ova`, 2,462,407,168 bytes
-(2.2933 GiB), with SHA-256
-`CB44937826F960CDD2824EFD88D9CF570162AB5E942D6FEB601D92E379644785`.
+Release OVAs must be no larger than 2,000,000,000 bytes (2 GB), which keeps a
+single file under GitHub's 2 GiB release-asset limit. The validated v0.6.11
+artifact is `Recovera-Virtual-Appliance-v0.6.11.ova`, 1,681,838,080 bytes
+(1.566 GiB), with SHA-256
+`5925B96B30A6F7C688074FCB7D82ACBAAB25B8452C6E29937FAD50F7B9122076`.
 Verify the downloaded image against its published digest before import.
 
 ## Import and register
@@ -66,7 +67,9 @@ sudo tools/prepare-ova.sh
 ```
 
 The script refuses unsafe source state, stops network-facing services, removes
-clone-sensitive data and logs, rebuilds the empty ZFS data pool, zeroes and
+clone-sensitive data and logs, purges the unused 5.15 cloud kernel, drops the
+`linux-firmware` payload that VMware virtual hardware never loads, rebuilds
+the empty ZFS data pool, zeroes and
 trims unused system-disk space, installs the one-time initializer, and tells
 you when preparation is complete. Power the VM off immediately and export it
 as stream-optimized VMDKs without booting it again. Booting the prepared
@@ -79,7 +82,7 @@ sparse; exporting the original thick disk can still force vCenter to read the
 entire provisioned capacity even though the resulting VMDK is compressed.
 
 Validate the exported artifact before publication. The check rejects images
-over 3 GB, unexpected archive members, an incorrect disk count, and disks
+over 2 GB, unexpected archive members, an incorrect disk count, and disks
 that were not exported in VMware stream-optimized format:
 
 ```bash

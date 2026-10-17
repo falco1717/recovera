@@ -114,6 +114,52 @@ compact_root_disk() {
   fstrim -av >/dev/null 2>&1 || true
 }
 
+compact_boot_payload() {
+  local running legacy removed package
+
+  # The Ubuntu cloud image leaves its 5.15 virtual kernel installed beside the
+  # supported 6.8 HWE kernel. GRUB never selects it, but it costs ~120 MB of
+  # compressed OVA. Purge it only when apt proposes nothing else.
+  running=$(uname -r)
+  case "$running" in
+    6.8.*-generic) ;;
+    *) echo "refusing OVA preparation: builder must run the 6.8 HWE kernel (running $running)" >&2; exit 1 ;;
+  esac
+  dpkg-query -W -f='${db:Status-Abbrev}' "linux-image-$running" 2>/dev/null | grep -q '^ii' || {
+    echo "refusing OVA preparation: linux-image-$running is not installed" >&2
+    exit 1
+  }
+  legacy=$(dpkg-query -W -f='${db:Status-Abbrev} ${Package}\n' 'linux-*' 2>/dev/null | awk '
+    $1 == "ii" && ($2 ~ /^linux-(image|modules|modules-extra|headers)-5\.15\./ ||
+                   $2 ~ /^linux-(virtual|image-virtual|headers-virtual|headers-generic)$/) { print $2 }
+  ')
+  if [ -n "$legacy" ]; then
+    removed=$(apt-get -s purge $legacy 2>/dev/null | awk '/^Purg |^Remv / { print $2 }')
+    for package in $removed; do
+      grep -Fxq "$package" <<<"$legacy" || {
+        echo "refusing OVA preparation: purging the 5.15 kernel would also remove $package" >&2
+        exit 1
+      }
+    done
+    DEBIAN_FRONTEND=noninteractive apt-get -y purge $legacy >/dev/null
+  fi
+
+  # VMware virtual hardware loads no device firmware, and linux-firmware is
+  # 1.1 GB on disk (~530 MB compressed). Keep the package registered for the
+  # HWE kernel dependency but drop its payload, then rebuild the initramfs so
+  # it no longer embeds firmware copies.
+  dpkg -L linux-firmware 2>/dev/null | while IFS= read -r path; do
+    case "$path" in
+      /lib/firmware/*|/usr/lib/firmware/*)
+        if [ -f "$path" ] || [ -L "$path" ]; then rm -f -- "$path"; fi ;;
+    esac
+  done
+  find /usr/lib/firmware -mindepth 1 -type d -empty -delete 2>/dev/null || true
+  rm -f /boot/initrd.img.old /boot/vmlinuz.old
+  update-initramfs -u -k "$running" >/dev/null
+  update-grub >/dev/null 2>&1
+}
+
 compact_installer_payload() {
   local deb_dir=/opt/recovera/debs version baseline saved
 
@@ -234,6 +280,11 @@ if id backup-admin >/dev/null 2>&1; then
   fi
 fi
 rm -rf /etc/recovera /etc/recovera-peer /var/lib/recovera-peer
+# /etc/recovera also held the builder's backup-admin credential and any GitHub
+# token. Restore only the identity-free updater defaults; recovera-upgrade
+# cannot run without upgrade.conf.
+install -d -m 0755 /etc/recovera
+install -m 0600 /usr/share/recovera/defaults/upgrade.conf /etc/recovera/upgrade.conf
 rm -f /datto/config/deviceID \
   /datto/config/local/offline-registration.pending.json \
   /datto/config/local/reg /datto/config/local/reg.error \
@@ -249,6 +300,7 @@ find /home -path '*/.ssh/authorized_keys' -type f -delete
 rm -f /root/.bash_history /home/*/.bash_history
 apt-get clean
 compact_installer_payload
+compact_boot_payload
 compact_data_pool
 compact_root_disk
 

@@ -80,9 +80,33 @@ class RecoveraOvaTests(unittest.TestCase):
         ):
             self.assertIn(required, script)
 
-    def test_exported_ova_has_a_three_gib_release_gate(self):
+    def test_preparation_restores_updater_defaults(self):
+        script = (ROOT / "tools" / "prepare-ova.sh").read_text()
+        self.assertLess(
+            script.index("rm -rf /etc/recovera /etc/recovera-peer"),
+            script.index(
+                "install -m 0600 /usr/share/recovera/defaults/upgrade.conf /etc/recovera/upgrade.conf"
+            ),
+        )
+
+    def test_preparation_drops_unused_kernel_and_firmware(self):
+        script = (ROOT / "tools" / "prepare-ova.sh").read_text()
+        for required in (
+            "compact_boot_payload",
+            r"linux-(image|modules|modules-extra|headers)-5\.15\.",
+            "purging the 5.15 kernel would also remove",
+            "dpkg -L linux-firmware",
+            'update-initramfs -u -k "$running"',
+        ):
+            self.assertIn(required, script)
+        self.assertLess(
+            script.index("\ncompact_boot_payload\n"),
+            script.index("\ncompact_root_disk\n"),
+        )
+
+    def test_exported_ova_fits_a_github_release_asset(self):
         script = (ROOT / "tools" / "check-ova.sh").read_text()
-        self.assertIn("3000000000", script)
+        self.assertIn("2000000000", script)
         self.assertIn("streamOptimized", script)
         self.assertIn('"${#vmdk_members[@]}" -eq 2', script)
 

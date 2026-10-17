@@ -3,7 +3,7 @@
 set -euo pipefail
 
 OVA=${1:-}
-MAX_BYTES=${RECOVERA_OVA_MAX_BYTES:-3000000000}
+MAX_BYTES=${RECOVERA_OVA_MAX_BYTES:-2000000000}
 
 [ -n "$OVA" ] || { echo "usage: $0 /path/to/Recovera.ova" >&2; exit 2; }
 [ -f "$OVA" ] || { echo "OVA not found: $OVA" >&2; exit 1; }
