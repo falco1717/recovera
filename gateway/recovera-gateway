@@ -1,0 +1,402 @@
+#!/usr/bin/env python3
+"""Stateless, cache-backed Recovera update gateway."""
+
+import argparse
+import base64
+import http.server
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import ssl
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+from recovera_gateway_auth import AccessError, CHANNEL_RE, verify as verify_access
+
+
+TAG_RE = re.compile(r"[0-9A-Za-z][0-9A-Za-z._-]{0,127}")
+ASSET_RE = re.compile(r"[0-9A-Za-z][0-9A-Za-z.+_~-]{0,191}")
+CHANNEL_PATH_RE = re.compile(r"/v1/channels/([0-9A-Za-z][0-9A-Za-z._-]{0,31})\.json")
+RELEASE_PATH_RE = re.compile(
+    r"/v1/releases/([0-9A-Za-z][0-9A-Za-z._-]{0,127})/"
+    r"([0-9A-Za-z][0-9A-Za-z.+_~-]{0,191})"
+)
+
+
+class GatewayError(RuntimeError):
+    pass
+
+
+class SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, request_value, fp, code, message, headers, new_url):
+        redirected = super().redirect_request(request_value, fp, code, message, headers, new_url)
+        if redirected is not None:
+            old = urllib.parse.urlsplit(request_value.full_url).hostname
+            new = urllib.parse.urlsplit(new_url).hostname
+            if old != new:
+                redirected.remove_header("Authorization")
+        return redirected
+
+
+def safe_file(root, name):
+    if not ASSET_RE.fullmatch(name) or Path(name).name != name:
+        raise GatewayError("unsafe asset name")
+    root = Path(root).resolve()
+    path = root / name
+    if path.is_symlink() or not path.is_file() or path.resolve().parent != root:
+        raise GatewayError("asset is unavailable")
+    return path
+
+
+def atomic_bytes(path, value, mode=0o600):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(path.name + ".tmp")
+    temporary.write_bytes(value)
+    temporary.chmod(mode)
+    os.replace(temporary, path)
+
+
+class Configuration:
+    def __init__(self):
+        self.repository = os.environ.get("RECOVERA_GATEWAY_REPOSITORY", "falco1717/recovera")
+        if not re.fullmatch(r"[0-9A-Za-z_.-]+/[0-9A-Za-z_.-]+", self.repository):
+            raise GatewayError("invalid GitHub repository")
+        self.channels = [item for item in re.split(
+            r"[,\s]+", os.environ.get("RECOVERA_GATEWAY_CHANNELS", "stable")
+        ) if item]
+        if not self.channels or any(not CHANNEL_RE.fullmatch(item) for item in self.channels):
+            raise GatewayError("invalid gateway channel list")
+        self.branch = os.environ.get("RECOVERA_GATEWAY_BRANCH", "main")
+        if not re.fullmatch(r"[0-9A-Za-z][0-9A-Za-z._/-]{0,127}", self.branch):
+            raise GatewayError("invalid GitHub branch")
+        self.cache = Path(os.environ.get("RECOVERA_GATEWAY_CACHE", "/var/lib/recovera-gateway"))
+        self.github_token_file = Path(os.environ.get(
+            "RECOVERA_GATEWAY_GITHUB_TOKEN_FILE", "/run/secrets/github-token"
+        ))
+        self.access_signers = Path(os.environ.get(
+            "RECOVERA_GATEWAY_ACCESS_SIGNERS", "/etc/recovera-gateway/access-signers"
+        ))
+        self.release_signers = Path(os.environ.get(
+            "RECOVERA_GATEWAY_RELEASE_SIGNERS", "/etc/recovera-gateway/release-signers"
+        ))
+        self.revocations = Path(os.environ.get(
+            "RECOVERA_GATEWAY_REVOCATIONS", "/etc/recovera-gateway/revocations.json"
+        ))
+        self.verifier = Path(os.environ.get(
+            "RECOVERA_GATEWAY_RELEASE_VERIFIER", "/opt/recovera-gateway/verify-release.py"
+        ))
+        self.bind = os.environ.get("RECOVERA_GATEWAY_BIND", "127.0.0.1")
+        self.port = int(os.environ.get("RECOVERA_GATEWAY_PORT", "8080"))
+        self.sync_interval = max(60, int(os.environ.get("RECOVERA_GATEWAY_SYNC_INTERVAL", "900")))
+        self.tls_certificate = os.environ.get("RECOVERA_GATEWAY_TLS_CERT")
+        self.tls_key = os.environ.get("RECOVERA_GATEWAY_TLS_KEY")
+
+    def github_token(self):
+        value = os.environ.get("RECOVERA_GATEWAY_GITHUB_TOKEN")
+        if not value and self.github_token_file.is_file():
+            value = self.github_token_file.read_text(encoding="ascii").strip()
+        if not value:
+            raise GatewayError("GitHub read token is not configured")
+        return value
+
+
+class GitHub:
+    def __init__(self, configuration):
+        self.configuration = configuration
+
+    def request(self, url, accept="application/vnd.github+json"):
+        headers = {
+            "Accept": accept,
+            "Authorization": f"Bearer {self.configuration.github_token()}",
+            "User-Agent": "recovera-gateway/1",
+            "X-GitHub-Api-Version": "2022-11-28",
+        }
+        opener = urllib.request.build_opener(SafeRedirectHandler())
+        try:
+            return opener.open(urllib.request.Request(url, headers=headers), timeout=120)
+        except urllib.error.HTTPError as exc:
+            detail = exc.read(512).decode("utf-8", "replace")
+            raise GatewayError(f"GitHub request failed ({exc.code}): {detail}") from exc
+        except urllib.error.URLError as exc:
+            raise GatewayError(f"GitHub is unreachable: {exc.reason}") from exc
+
+    def json(self, path):
+        with self.request("https://api.github.com" + path) as response:
+            return json.load(response)
+
+    def download(self, api_url, target):
+        temporary = Path(target).with_name(Path(target).name + ".partial")
+        with self.request(api_url, "application/octet-stream") as response, temporary.open("wb") as output:
+            shutil.copyfileobj(response, output, 1024 * 1024)
+        os.replace(temporary, target)
+
+
+class Cache:
+    def __init__(self, configuration):
+        self.configuration = configuration
+        self.github = GitHub(configuration)
+        self.lock = threading.Lock()
+
+    def channel_path(self, channel):
+        return self.configuration.cache / "channels" / f"{channel}.json"
+
+    def release_path(self, tag):
+        return self.configuration.cache / "releases" / tag
+
+    def read_channel(self, channel):
+        try:
+            value = json.loads(self.channel_path(channel).read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise GatewayError("channel is not cached") from exc
+        if value.get("channel") != channel or not TAG_RE.fullmatch(str(value.get("release_tag", ""))):
+            raise GatewayError("cached channel is invalid")
+        return value
+
+    def revocations(self):
+        try:
+            value = json.loads(self.configuration.revocations.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return set()
+        except json.JSONDecodeError as exc:
+            raise GatewayError("revocation file is invalid") from exc
+        revoked = value.get("revoked", [])
+        if not isinstance(revoked, list) or any(not isinstance(item, str) for item in revoked):
+            raise GatewayError("revocation file is invalid")
+        return set(revoked)
+
+    def release_channel(self, tag):
+        for channel in self.configuration.channels:
+            try:
+                if self.read_channel(channel).get("release_tag") == tag:
+                    return channel
+            except GatewayError:
+                continue
+        raise GatewayError("release is not referenced by a cached channel")
+
+    def verify_signature(self, manifest, signature):
+        result = subprocess.run([
+            "ssh-keygen", "-Y", "verify", "-f", str(self.configuration.release_signers),
+            "-I", "recovera-release", "-n", "recovera-upgrade", "-s", str(signature),
+        ], input=Path(manifest).read_bytes(), check=False, stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT)
+        if result.returncode:
+            raise GatewayError("release manifest signature is invalid")
+
+    def manifest_assets(self, manifest):
+        if manifest.get("type") == "package" and manifest.get("schema") == 2:
+            packages = manifest.get("packages")
+            if not isinstance(packages, list) or not packages:
+                raise GatewayError("package manifest contains no assets")
+            return [item.get("asset") for item in packages]
+        image = manifest.get("image")
+        if manifest.get("schema") == 1 and isinstance(image, dict):
+            parts = image.get("parts")
+            if not isinstance(parts, list) or not parts:
+                raise GatewayError("image manifest contains no assets")
+            return [item.get("name") for item in parts]
+        raise GatewayError("unsupported release manifest")
+
+    def verify_release(self, directory, manifest_name):
+        result = subprocess.run([
+            sys.executable, str(self.configuration.verifier), "--directory", str(directory),
+            "--manifest", manifest_name, "--signers", str(self.configuration.release_signers),
+        ], check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        if result.returncode:
+            detail = result.stderr.decode("utf-8", "replace").strip()
+            raise GatewayError(detail or "release verification failed")
+
+    def sync_channel(self, channel):
+        owner_repo = urllib.parse.quote(self.configuration.repository, safe="/")
+        branch = urllib.parse.quote(self.configuration.branch, safe="")
+        result = self.github.json(
+            f"/repos/{owner_repo}/contents/upgrade/channels/{channel}.json?ref={branch}"
+        )
+        try:
+            pointer = json.loads(base64.b64decode(result["content"]))
+        except (KeyError, ValueError, json.JSONDecodeError) as exc:
+            raise GatewayError("GitHub channel response is invalid") from exc
+        tag = pointer.get("release_tag")
+        if (pointer.get("schema") != 1 or pointer.get("channel") != channel
+                or not TAG_RE.fullmatch(str(tag or ""))):
+            raise GatewayError("channel pointer is invalid")
+        tag_path = urllib.parse.quote(tag, safe="")
+        release = self.github.json(f"/repos/{owner_repo}/releases/tags/{tag_path}")
+        available = {
+            item["name"]: item["url"] for item in release.get("assets", [])
+            if ASSET_RE.fullmatch(str(item.get("name", "")))
+        }
+        manifest_name = pointer.get("manifest_asset")
+        signature_name = pointer.get("signature_asset")
+        if not ASSET_RE.fullmatch(str(manifest_name or "")) or not ASSET_RE.fullmatch(str(signature_name or "")):
+            raise GatewayError("channel manifest names are invalid")
+        target = self.release_path(tag)
+        if not target.exists():
+            target.parent.mkdir(parents=True, exist_ok=True)
+            temporary = Path(tempfile.mkdtemp(prefix=f".{tag}.", dir=target.parent))
+            try:
+                for name in (manifest_name, signature_name):
+                    if name not in available:
+                        raise GatewayError(f"release asset is missing: {name}")
+                    self.github.download(available[name], temporary / name)
+                self.verify_signature(temporary / manifest_name, temporary / signature_name)
+                manifest = json.loads((temporary / manifest_name).read_text(encoding="utf-8"))
+                if (manifest.get("channel") != channel or manifest.get("version") != pointer.get("version")
+                        or int(manifest.get("sequence", -1)) != int(pointer.get("sequence", -2))):
+                    raise GatewayError("signed manifest does not match channel pointer")
+                names = self.manifest_assets(manifest)
+                if any(not isinstance(name, str) or not ASSET_RE.fullmatch(name) for name in names):
+                    raise GatewayError("release contains an unsafe asset name")
+                for name in names:
+                    if name not in available:
+                        raise GatewayError(f"release asset is missing: {name}")
+                    self.github.download(available[name], temporary / name)
+                self.verify_release(temporary, manifest_name)
+                os.replace(temporary, target)
+            except Exception:
+                shutil.rmtree(temporary, ignore_errors=True)
+                raise
+        else:
+            self.verify_release(target, manifest_name)
+        atomic_bytes(self.channel_path(channel), json.dumps(
+            pointer, indent=2, sort_keys=True
+        ).encode("utf-8") + b"\n", mode=0o644)
+        return {"channel": channel, "release_tag": tag, "version": pointer.get("version")}
+
+    def sync(self):
+        with self.lock:
+            return [self.sync_channel(channel) for channel in self.configuration.channels]
+
+
+class GatewayHandler(http.server.BaseHTTPRequestHandler):
+    server_version = "RecoveraGateway/1"
+
+    def log_message(self, fmt, *args):
+        sys.stderr.write("gateway-http: " + fmt % args + "\n")
+
+    @property
+    def cache(self):
+        return self.server.cache
+
+    def reply_json(self, status, value):
+        data = json.dumps(value, sort_keys=True).encode("utf-8") + b"\n"
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.end_headers()
+        self.wfile.write(data)
+
+    def credential(self, channel):
+        header = self.headers.get("Authorization", "")
+        if not header.startswith("Bearer "):
+            raise AccessError("gateway credential is required")
+        return verify_access(
+            header[7:].strip(), self.cache.configuration.access_signers, channel,
+            revoked=self.cache.revocations(),
+        )
+
+    def send_path(self, path, immutable=False):
+        path = Path(path)
+        if path.is_symlink() or not path.is_file():
+            raise GatewayError("requested content is unavailable")
+        size = path.stat().st_size
+        self.send_response(200)
+        self.send_header("Content-Type", "application/octet-stream")
+        self.send_header("Content-Length", str(size))
+        self.send_header("Cache-Control", "public, max-age=31536000, immutable" if immutable else "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.end_headers()
+        with path.open("rb") as stream:
+            shutil.copyfileobj(stream, self.wfile, 1024 * 1024)
+
+    def do_GET(self):
+        try:
+            parsed = urllib.parse.urlsplit(self.path)
+            if parsed.query or parsed.fragment:
+                raise GatewayError("query parameters are not supported")
+            if parsed.path == "/healthz":
+                self.reply_json(200, {"ok": True})
+                return
+            channel_match = CHANNEL_PATH_RE.fullmatch(parsed.path)
+            if channel_match:
+                channel = channel_match.group(1)
+                self.credential(channel)
+                self.send_path(self.cache.channel_path(channel))
+                return
+            release_match = RELEASE_PATH_RE.fullmatch(parsed.path)
+            if release_match:
+                tag, name = release_match.groups()
+                channel = self.cache.release_channel(tag)
+                self.credential(channel)
+                self.send_path(safe_file(self.cache.release_path(tag), name), immutable=True)
+                return
+            self.reply_json(404, {"error": "not found"})
+        except AccessError as exc:
+            self.reply_json(401, {"error": str(exc)})
+        except GatewayError as exc:
+            self.reply_json(404, {"error": str(exc)})
+        except Exception as exc:
+            self.reply_json(500, {"error": "gateway request failed"})
+            self.log_error("request failed: %s", exc)
+
+
+def sync_loop(cache, interval):
+    while True:
+        try:
+            result = cache.sync()
+            sys.stderr.write("gateway-sync: " + json.dumps(result, sort_keys=True) + "\n")
+        except Exception as exc:
+            sys.stderr.write(f"gateway-sync: {exc}\n")
+        time.sleep(interval)
+
+
+def serve(configuration, cache):
+    try:
+        cache.sync()
+    except Exception as exc:
+        sys.stderr.write(f"gateway-sync: initial synchronization failed: {exc}\n")
+    thread = threading.Thread(
+        target=sync_loop, args=(cache, configuration.sync_interval), daemon=True
+    )
+    thread.start()
+    server = http.server.ThreadingHTTPServer((configuration.bind, configuration.port), GatewayHandler)
+    server.cache = cache
+    if configuration.tls_certificate or configuration.tls_key:
+        if not configuration.tls_certificate or not configuration.tls_key:
+            raise GatewayError("both TLS certificate and key are required")
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        context.minimum_version = ssl.TLSVersion.TLSv1_2
+        context.load_cert_chain(configuration.tls_certificate, configuration.tls_key)
+        server.socket = context.wrap_socket(server.socket, server_side=True)
+    server.serve_forever()
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("command", choices=("serve", "sync"))
+    arguments = parser.parse_args(argv)
+    configuration = Configuration()
+    cache = Cache(configuration)
+    if arguments.command == "sync":
+        print(json.dumps(cache.sync(), indent=2, sort_keys=True))
+    else:
+        serve(configuration, cache)
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except (GatewayError, AccessError) as exc:
+        print(f"recovera-gateway: {exc}", file=sys.stderr)
+        sys.exit(1)

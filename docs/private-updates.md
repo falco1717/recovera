@@ -60,9 +60,10 @@ must contain no GitHub token. Alternatively, send the published OVA and its
 the SHA-256 value against the signed or independently communicated release
 record before import.
 
-## Later gateway migration
+## Gateway migration
 
-A gateway can be added later without changing Recovera's signing trust. It
-would replace GitHub credential distribution, not signature verification.
-Until then, use root-only per-appliance tokens for automatic checks or manual
-signed update media for appliances that must hold no online credential.
+For multiple appliances, use the [active-active update gateway
+cluster](update-gateway.md). It replaces GitHub credential distribution, not
+release-signature verification. Until gateways are deployed, use root-only
+per-appliance tokens for automatic checks or manual signed update media for
+appliances that must hold no online credential.

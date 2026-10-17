@@ -184,6 +184,68 @@ class RecoveraUpgradeTests(unittest.TestCase):
         self.assertEqual(assets["manifest.json"], "https://api.github.test/1")
         github_api.assert_called_once()
 
+    def test_gateway_channel_and_assets_fail_over_in_order(self):
+        pointer = {
+            "schema": 1, "channel": "stable", "release_tag": "package-v0.7.0",
+            "manifest_asset": "manifest.json", "signature_asset": "manifest.json.sig",
+            "sequence": 7, "version": "0.7.0",
+        }
+        config = {
+            "REPOSITORY": "falco1717/recovera", "CHANNEL": "stable",
+            "CHANNEL_BRANCH": "main", "HOST_ROOT": "/host",
+            "UPDATE_ORIGINS": "https://west.example https://east.example",
+        }
+        with mock.patch.object(
+            self.module, "request",
+            side_effect=[self.module.UpgradeError("west unavailable"),
+                         io.BytesIO(json.dumps(pointer).encode())],
+        ) as requester:
+            self.assertEqual(self.module.fetch_channel(config), pointer)
+        self.assertEqual(requester.call_count, 2)
+        self.assertEqual(config["_ACTIVE_GATEWAY_ORIGIN"], "https://east.example")
+        assets = self.module.release_assets(pointer, config)
+        self.assertEqual(assets["__release_base_urls__"], [
+            "https://east.example/v1/releases/package-v0.7.0",
+            "https://west.example/v1/releases/package-v0.7.0",
+        ])
+
+    def test_gateway_asset_download_fails_over(self):
+        assets = {"__release_base_urls__": [
+            "https://west.example/v1/releases/package-v0.7.0",
+            "https://east.example/v1/releases/package-v0.7.0",
+        ]}
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "package.deb"
+            def download_side_effect(url, output, _config, **_kwargs):
+                if "west.example" in url:
+                    raise self.module.UpgradeError("offline")
+                Path(output).write_bytes(b"package")
+            with mock.patch.object(self.module, "download", side_effect=download_side_effect) as downloader:
+                self.module.obtain_asset("package.deb", assets, target, {})
+            self.assertEqual(target.read_bytes(), b"package")
+            self.assertEqual(downloader.call_count, 2)
+
+    def test_gateway_origin_requires_https_and_exact_credential_host(self):
+        with self.assertRaises(self.module.UpgradeError):
+            self.module.gateway_origins({"UPDATE_ORIGINS": "http://updates.example"})
+        config = {
+            "UPDATE_ORIGINS": "https://updates.example",
+            "GATEWAY_TOKEN_FILE": "/missing",
+        }
+        with mock.patch.object(self.module, "gateway_token", return_value="gateway-secret"), \
+             mock.patch.object(self.module, "token", return_value="github-secret"):
+            self.assertEqual(
+                self.module.credential_for_url("https://updates.example/v1/channels/stable.json", config),
+                "gateway-secret",
+            )
+            self.assertIsNone(
+                self.module.credential_for_url("https://updates.example.evil/v1/channel", config)
+            )
+            self.assertEqual(
+                self.module.credential_for_url("https://api.github.com/repos/o/r", config),
+                "github-secret",
+            )
+
     def test_pointer_rejects_path_traversal_before_asset_download(self):
         arguments = mock.Mock(
             channel_file=ROOT / "upgrade" / "channels" / "stable.json",

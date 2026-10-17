@@ -22,7 +22,7 @@ try:
 except ImportError:  # pragma: no cover - production appliances run Linux
     fcntl = None
 
-UPDATER_VERSION = 2
+UPDATER_VERSION = 3
 DEFAULT_CONFIG = Path("/etc/recovera/upgrade.conf")
 DEFAULT_SIGNERS = Path("/usr/local/share/recovera-upgrade/release-signers")
 DEFAULT_STATE = Path("/host/recovera/state.json")
@@ -123,14 +123,59 @@ class UpgradeLock:
             self.stream.close()
 
 
-def token(config):
-    value = os.environ.get("RECOVERA_GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
-    token_file = Path(config.get("TOKEN_FILE", "/etc/recovera/github-token"))
+def credential_file(config, environment_name, config_name, default):
+    value = os.environ.get(environment_name)
+    token_file = Path(config.get(config_name, default))
     if not value and token_file.exists():
         if token_file.stat().st_mode & 0o077:
-            raise UpgradeError(f"GitHub token file must have mode 0600: {token_file}")
+            raise UpgradeError(f"credential file must have mode 0600: {token_file}")
         value = token_file.read_text().strip()
     return value
+
+
+def token(config):
+    return (os.environ.get("RECOVERA_GITHUB_TOKEN") or os.environ.get("GH_TOKEN") or
+            credential_file(config, "RECOVERA_GITHUB_TOKEN", "TOKEN_FILE",
+                            "/etc/recovera/github-token"))
+
+
+def gateway_token(config):
+    return credential_file(
+        config, "RECOVERA_GATEWAY_TOKEN", "GATEWAY_TOKEN_FILE",
+        "/etc/recovera/gateway-token",
+    )
+
+
+def gateway_origins(config):
+    raw = os.environ.get("RECOVERA_UPDATE_ORIGINS", config.get("UPDATE_ORIGINS", ""))
+    values = [item.strip().rstrip("/") for item in re.split(r"[,\s]+", raw) if item.strip()]
+    origins = []
+    for value in values:
+        parsed = urllib.parse.urlsplit(value)
+        if (parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password
+                or parsed.query or parsed.fragment or parsed.path not in ("", "/")):
+            raise UpgradeError(f"invalid Recovera update gateway origin: {value}")
+        normalized = f"https://{parsed.netloc}"
+        if normalized not in origins:
+            origins.append(normalized)
+    return origins
+
+
+def credential_for_url(url, config):
+    target = urllib.parse.urlsplit(url)
+    for origin in gateway_origins(config):
+        candidate = urllib.parse.urlsplit(origin)
+        if target.scheme == candidate.scheme and target.netloc == candidate.netloc:
+            credential = gateway_token(config)
+            if not credential:
+                raise UpgradeError(
+                    "Recovera update gateway requires an appliance credential; place it in "
+                    f"{config.get('GATEWAY_TOKEN_FILE', '/etc/recovera/gateway-token')} with mode 0600"
+                )
+            return credential
+    if target.hostname in ("api.github.com", "github.com", "raw.githubusercontent.com"):
+        return token(config)
+    return None
 
 
 class SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
@@ -151,7 +196,7 @@ def request(url, config, *, accept="application/vnd.github+json"):
         "User-Agent": f"recovera-upgrade/{UPDATER_VERSION}",
         "X-GitHub-Api-Version": "2022-11-28",
     }
-    credential = token(config)
+    credential = credential_for_url(url, config)
     if credential:
         headers["Authorization"] = f"Bearer {credential}"
     try:
@@ -199,10 +244,29 @@ def fetch_channel(config, local_channel=None):
     if local_channel:
         pointer = read_json(local_channel)
     else:
+        origins = gateway_origins(config)
+        if origins:
+            channel_name = urllib.parse.quote(config["CHANNEL"], safe="")
+            failures = []
+            for origin in origins:
+                url = f"{origin}/v1/channels/{channel_name}.json"
+                try:
+                    with request(url, config, accept="application/json") as response:
+                        pointer = json.load(response)
+                    config["_ACTIVE_GATEWAY_ORIGIN"] = origin
+                    break
+                except (UpgradeError, ValueError, json.JSONDecodeError) as exc:
+                    failures.append(f"{origin}: {exc}")
+            else:
+                raise UpgradeError("all Recovera update gateways failed: " + "; ".join(failures))
+        else:
+            pointer = None
         repo = validated_repository(config)
         channel = config["CHANNEL"]
         branch = config["CHANNEL_BRANCH"]
-        if use_github_api(config):
+        if pointer is not None:
+            pass
+        elif use_github_api(config):
             path = f"/repos/{repo}/contents/upgrade/channels/{channel}.json?ref={branch}"
             result = github_json(path, config)
             try:
@@ -235,6 +299,13 @@ def release_assets(pointer, config, source_dir=None):
     repo = validated_repository(config)
     tag = pointer["release_tag"]
     tag_path = urllib.parse.quote(tag, safe="")
+    origins = gateway_origins(config)
+    if origins:
+        active = config.get("_ACTIVE_GATEWAY_ORIGIN")
+        ordered = ([active] if active in origins else []) + [item for item in origins if item != active]
+        return {"__release_base_urls__": [
+            f"{origin}/v1/releases/{tag_path}" for origin in ordered
+        ]}
     if use_github_api(config):
         release = github_json(f"/repos/{repo}/releases/tags/{tag_path}", config)
         return {asset["name"]: asset["url"] for asset in release.get("assets", [])}
@@ -244,12 +315,25 @@ def release_assets(pointer, config, source_dir=None):
 def obtain_asset(name, assets, target, config):
     if name in assets:
         source = assets[name]
+    elif "__release_base_urls__" in assets and safe_asset_name(name):
+        source = [base + "/" + urllib.parse.quote(name, safe="")
+                  for base in assets["__release_base_urls__"]]
     elif "__release_base_url__" in assets and safe_asset_name(name):
         source = assets["__release_base_url__"] + "/" + urllib.parse.quote(name, safe="")
     else:
         raise UpgradeError(f"release asset is missing: {name}")
     if isinstance(source, Path):
         shutil.copyfile(source, target)
+    elif isinstance(source, list):
+        failures = []
+        for candidate in source:
+            try:
+                download(candidate, target, config, api_asset=True)
+                return
+            except UpgradeError as exc:
+                failures.append(f"{urllib.parse.urlsplit(candidate).netloc}: {exc}")
+        raise UpgradeError("all Recovera update gateways failed while downloading "
+                           f"{name}: " + "; ".join(failures))
     else:
         download(source, target, config, api_asset=True)
 

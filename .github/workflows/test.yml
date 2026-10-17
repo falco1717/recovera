@@ -16,6 +16,7 @@ jobs:
       - name: Validate scripts
         run: |
           bash -n install.sh setup/setup.sh tests/e2e-recovera-peer.sh \
+            gateway/install.sh \
             tools/build-package-release.sh tools/build-recovera-appliance-deb.sh \
             tools/publish-package-release.sh tools/make-bundle.sh
           php -l setup/branding/RecoveraTargetController.php
@@ -23,6 +24,8 @@ jobs:
           python3 -m py_compile setup/peer/recovera-peer setup/branding/apply-branding.py \
             setup/branding/apply-peer-ui.py \
             upgrade/recovera-upgrade \
+            gateway/recovera-gateway gateway/recovera-gateway-token \
+            gateway/recovera_gateway_auth.py \
             tools/verify-release.py \
             tools/merge-offline-package.py \
             tools/compatibility/collect-baseline.py \
