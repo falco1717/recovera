@@ -23,6 +23,7 @@ jobs:
           python3 -m py_compile setup/peer/recovera-peer setup/branding/apply-branding.py \
             setup/branding/apply-peer-ui.py \
             upgrade/recovera-upgrade \
+            tools/merge-offline-package.py \
             tools/compatibility/collect-baseline.py \
             tools/compatibility/compare-baselines.py
       - name: Build package update fixtures
@@ -30,6 +31,10 @@ jobs:
           bash tools/build-recovera-appliance-deb.sh \
             --version "$(tr -d '[:space:]' < VERSION)-1" --output /tmp/recovera-debs
           test "$(dpkg-deb -f /tmp/recovera-debs/recovera-appliance_*_all.deb Package)" = recovera-appliance
+          (cd /tmp/recovera-debs && \
+            dpkg-scanpackages -m . /dev/null > Packages && \
+            gzip -9c Packages > Packages.gz && \
+            sha256sum recovera-appliance_*_all.deb Packages Packages.gz > SHA256SUMS)
           bash tools/build-package-release.sh \
             --packages /tmp/recovera-debs --version 0.6.1 --sequence 1 \
             --output /tmp/recovera-package-release
@@ -39,7 +44,11 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: recovera-appliance-${{ github.sha }}
-          path: /tmp/recovera-debs/recovera-appliance_*_all.deb
+          path: |
+            /tmp/recovera-debs/recovera-appliance_*_all.deb
+            /tmp/recovera-debs/Packages
+            /tmp/recovera-debs/Packages.gz
+            /tmp/recovera-debs/SHA256SUMS
           if-no-files-found: error
           retention-days: 7
       - name: Run unit tests
