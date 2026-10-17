@@ -19,26 +19,38 @@ move_directory() {
     note "both $1 and $2 exist; preserving $1 for manual review"
     return 0
   fi
-  mkdir -p "$(dirname "$new")"
-  mv "$old" "$new"
-  note "moved $1 to $2"
+  if ! mkdir -p "$(dirname "$new")"; then
+    note "could not prepare $2; preserving $1"
+    return 0
+  fi
+  if mv "$old" "$new"; then
+    note "moved $1 to $2"
+  else
+    note "could not move $1 to $2; preserving $1"
+  fi
 }
 
 move_file() {
   old=$(at "$1")
   new=$(at "$2")
   [ -e "$old" ] || return 0
-  mkdir -p "$(dirname "$new")"
+  if ! mkdir -p "$(dirname "$new")"; then
+    note "could not prepare $2; preserving $1"
+    return 0
+  fi
   if [ -e "$new" ]; then
     if cmp -s "$old" "$new"; then
-      rm -f "$old"
+      rm -f "$old" || note "could not remove duplicate $1; preserving it"
     else
       note "both $1 and $2 exist; preserving $1 for manual review"
     fi
     return 0
   fi
-  mv "$old" "$new"
-  note "moved $1 to $2"
+  if mv "$old" "$new"; then
+    note "moved $1 to $2"
+  else
+    note "could not move $1 to $2; preserving $1"
+  fi
 }
 
 move_directory /opt/spf-datto /opt/recovera
