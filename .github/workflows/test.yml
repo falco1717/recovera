@@ -16,7 +16,7 @@ jobs:
       - name: Validate scripts
         run: |
           bash -n install.sh setup/setup.sh tests/e2e-recovera-peer.sh \
-            gateway/install.sh \
+            gateway/install.sh gateway/install-saltbox.sh \
             tools/build-package-release.sh tools/build-recovera-appliance-deb.sh \
             tools/publish-package-release.sh tools/make-bundle.sh
           php -l setup/branding/RecoveraTargetController.php
@@ -30,6 +30,8 @@ jobs:
             tools/merge-offline-package.py \
             tools/compatibility/collect-baseline.py \
             tools/compatibility/compare-baselines.py
+          RECOVERA_GATEWAY_TRAEFIK_RULE='Host(`gateway.example.com`)' \
+            docker compose -f gateway/compose.saltbox.yaml config --quiet
       - name: Build package update fixtures
         run: |
           bash tools/build-recovera-appliance-deb.sh \

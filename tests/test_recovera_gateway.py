@@ -7,6 +7,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -22,6 +23,20 @@ def load_auth():
     module = importlib.util.module_from_spec(spec)
     loader.exec_module(module)
     sys.modules[loader.name] = module
+    return module
+
+
+def load_gateway():
+    if str(GATEWAY) not in sys.path:
+        sys.path.insert(0, str(GATEWAY))
+    if "recovera_gateway_auth" not in sys.modules:
+        load_auth()
+    loader = importlib.machinery.SourceFileLoader(
+        "recovera_gateway", str(GATEWAY / "recovera-gateway")
+    )
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
     return module
 
 
@@ -82,6 +97,34 @@ class RecoveraGatewayReleaseTrustTests(unittest.TestCase):
         self.assertEqual(len(lines), 2)
         self.assertTrue(all(line.startswith("recovera-release ssh-ed25519 ") for line in lines))
         self.assertEqual(len(set(lines)), 2)
+
+
+class RecoveraGatewayGitHubTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.module = load_gateway()
+
+    def test_public_repository_request_does_not_require_or_send_token(self):
+        configuration = mock.Mock()
+        configuration.github_token.return_value = None
+        opener = mock.Mock()
+        response = mock.Mock()
+        opener.open.return_value = response
+        with mock.patch.object(self.module.urllib.request, "build_opener", return_value=opener):
+            result = self.module.GitHub(configuration).request("https://api.github.com/example")
+        self.assertIs(result, response)
+        request = opener.open.call_args.args[0]
+        self.assertNotIn("Authorization", dict(request.header_items()))
+
+    def test_private_repository_request_sends_configured_token(self):
+        configuration = mock.Mock()
+        configuration.github_token.return_value = "read-only-secret"
+        opener = mock.Mock()
+        opener.open.return_value = mock.Mock()
+        with mock.patch.object(self.module.urllib.request, "build_opener", return_value=opener):
+            self.module.GitHub(configuration).request("https://api.github.com/example")
+        request = opener.open.call_args.args[0]
+        self.assertEqual(dict(request.header_items())["Authorization"], "Bearer read-only-secret")
 
 
 if __name__ == "__main__":

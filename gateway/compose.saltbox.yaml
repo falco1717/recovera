@@ -1,0 +1,48 @@
+services:
+  gateway:
+    container_name: recovera-gateway
+    hostname: recovera-gateway
+    build:
+      context: ..
+      dockerfile: gateway/Dockerfile
+    restart: unless-stopped
+    environment:
+      RECOVERA_GATEWAY_BIND: 0.0.0.0
+      RECOVERA_GATEWAY_PORT: 8080
+      RECOVERA_GATEWAY_REPOSITORY: ${RECOVERA_GATEWAY_REPOSITORY:-falco1717/recovera}
+      RECOVERA_GATEWAY_CHANNELS: ${RECOVERA_GATEWAY_CHANNELS:-stable}
+      RECOVERA_GATEWAY_SYNC_INTERVAL: ${RECOVERA_GATEWAY_SYNC_INTERVAL:-900}
+    networks:
+      - saltbox
+    volumes:
+      - gateway-cache:/var/lib/recovera-gateway
+      - ./config/github-token:/run/secrets/github-token:ro
+      - ./config/access-signers:/etc/recovera-gateway/access-signers:ro
+      - ../upgrade/keys/recovera-release-signers:/etc/recovera-gateway/release-signers:ro
+      - ./config/revocations.json:/etc/recovera-gateway/revocations.json:ro
+    labels:
+      com.github.saltbox.saltbox_managed: "true"
+      traefik.enable: "true"
+      traefik.http.routers.recovera-gateway-http.entrypoints: web
+      traefik.http.routers.recovera-gateway-http.middlewares: globalHeaders@file,redirect-to-https@docker,robotHeaders@file
+      traefik.http.routers.recovera-gateway-http.rule: ${RECOVERA_GATEWAY_TRAEFIK_RULE:?set RECOVERA_GATEWAY_TRAEFIK_RULE}
+      traefik.http.routers.recovera-gateway-http.service: recovera-gateway
+      traefik.http.routers.recovera-gateway.entrypoints: websecure
+      traefik.http.routers.recovera-gateway.middlewares: globalHeaders@file,secureHeaders@file,robotHeaders@file
+      traefik.http.routers.recovera-gateway.rule: ${RECOVERA_GATEWAY_TRAEFIK_RULE:?set RECOVERA_GATEWAY_TRAEFIK_RULE}
+      traefik.http.routers.recovera-gateway.service: recovera-gateway
+      traefik.http.routers.recovera-gateway.tls.certresolver: cfdns
+      traefik.http.routers.recovera-gateway.tls.options: securetls@file
+      traefik.http.services.recovera-gateway.loadbalancer.server.port: "8080"
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=5).read()"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+networks:
+  saltbox:
+    external: true
+
+volumes:
+  gateway-cache:

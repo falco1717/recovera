@@ -44,6 +44,25 @@ Repeat with `updates-east.example.com`, or as many independent locations as
 needed. Use separate GitHub read tokens per gateway so one site can be revoked
 without taking down the others.
 
+### Saltbox deployment
+
+Saltbox already owns ports 80 and 443 through Traefik. Use the dedicated
+deployment so Recovera joins the external `saltbox` Docker network and lets
+Traefik provide HTTPS instead of starting Caddy:
+
+```bash
+sudo ./gateway/install-saltbox.sh \
+  --hostname updates-a.example.com \
+  --alias updates.example.com \
+  --github-token-file /root/recovera-github-read-token
+```
+
+Omit `--alias` on the other sites. Saltbox's `cfdns` certificate resolver is
+used, and its DDNS service can create records from the Traefik host rules. The
+gateway publishes no host port. The GitHub token argument may be omitted while
+the repository is public, but synchronization will require it after the
+repository becomes private.
+
 ## Issue an appliance credential
 
 Run this only on a trusted administrative workstation that holds the gateway
