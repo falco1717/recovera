@@ -138,6 +138,19 @@ class RecoveraGatewayGitHubTests(unittest.TestCase):
         self.assertIn("errno.ENOTEMPTY", source)
         self.assertIn("self.verify_release(target, manifest_name)", source)
 
+    def test_gateway_root_has_branded_operational_page(self):
+        page = self.module.LANDING_PAGE.decode("utf-8")
+        self.assertIn("<title>Recovera Update Gateway</title>", page)
+        self.assertIn("Update Gateway", page)
+        self.assertIn("Operational", page)
+        self.assertNotIn("Datto", page)
+
+    def test_gateway_html_response_uses_security_headers(self):
+        source = (GATEWAY / "recovera-gateway").read_text()
+        self.assertIn("Content-Security-Policy", source)
+        self.assertIn("frame-ancestors 'none'", source)
+        self.assertIn('if parsed.path == "/":', source)
+
 
 if __name__ == "__main__":
     unittest.main()
