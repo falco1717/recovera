@@ -21,6 +21,7 @@ gateway/config/github-token
 gateway/config/access-signers
 gateway/config/*.token
 gateway/.env
+gateway/.env.saltbox
 recovera-gateway-access-key*
 
 # built bundles
