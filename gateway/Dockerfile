@@ -8,7 +8,9 @@ WORKDIR /opt/recovera-gateway
 COPY gateway/recovera-gateway gateway/recovera_gateway_auth.py gateway/recovera-gateway-token ./
 COPY tools/verify-release.py ./verify-release.py
 RUN chmod 0755 recovera-gateway recovera-gateway-token verify-release.py \
-    && useradd --system --home /var/lib/recovera-gateway --shell /usr/sbin/nologin recovera-gateway \
+    && groupadd --gid 39871 recovera-gateway \
+    && useradd --uid 39871 --gid 39871 --home-dir /var/lib/recovera-gateway \
+        --no-create-home --shell /usr/sbin/nologin recovera-gateway \
     && install -d -o recovera-gateway -g recovera-gateway /var/lib/recovera-gateway
 
 USER recovera-gateway

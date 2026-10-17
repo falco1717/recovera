@@ -42,10 +42,12 @@ docker inspect traefik >/dev/null 2>&1 || { echo "The Saltbox Traefik container 
 gateway_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 install -d -m 0700 "$gateway_dir/config"
 if [[ -n $token_file ]]; then
-  install -m 0600 "$token_file" "$gateway_dir/config/github-token"
+  install -o root -g 39871 -m 0640 "$token_file" "$gateway_dir/config/github-token"
 elif [[ ! -e $gateway_dir/config/github-token ]]; then
-  install -m 0600 /dev/null "$gateway_dir/config/github-token"
+  install -o root -g 39871 -m 0640 /dev/null "$gateway_dir/config/github-token"
 fi
+chown root:39871 "$gateway_dir/config/github-token"
+chmod 0640 "$gateway_dir/config/github-token"
 install -m 0644 "$gateway_dir/keys/recovera-gateway-access-signers" \
   "$gateway_dir/config/access-signers"
 
@@ -62,6 +64,8 @@ chmod 0600 "$gateway_dir/.env.saltbox"
 cd "$gateway_dir"
 compose=(docker compose --env-file .env.saltbox -f compose.saltbox.yaml)
 "${compose[@]}" build --pull
+"${compose[@]}" run --rm --user root --entrypoint chown gateway \
+  -R 39871:39871 /var/lib/recovera-gateway
 "${compose[@]}" up -d
 "${compose[@]}" exec -T gateway /opt/recovera-gateway/recovera-gateway sync
 "${compose[@]}" ps
