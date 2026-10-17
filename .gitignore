@@ -15,6 +15,8 @@ vc-session.txt
 *.key
 *password*
 *creds*
+recovera-upgrade-signing-key*
+recovera-upgrade-recovery-key*
 
 # built bundles
 dist/

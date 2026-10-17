@@ -64,6 +64,11 @@ package releases, and OVA. Follow [Recovera package and image upgrades](upgradin
 The signing private key must never be copied into the repository, release
 assets, installation payload, root image, or OVA.
 
+Follow [release security and key rotation](release-security.md) for key
+custody, independent verification, planned rotation, emergency recovery, and
+release retention. Private-repository delivery without a gateway is documented
+in [private updates](private-updates.md).
+
 Consumers must verify the payload downloaded by `install.sh`; the script checks
 it against `BUNDLE_SHA256` before extraction. `SHA256SUMS` additionally protects
 the bootstrap script and release metadata copied outside Git.
