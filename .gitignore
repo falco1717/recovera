@@ -17,6 +17,11 @@ vc-session.txt
 *creds*
 recovera-upgrade-signing-key*
 recovera-upgrade-recovery-key*
+gateway/config/github-token
+gateway/config/access-signers
+gateway/config/*.token
+gateway/.env
+recovera-gateway-access-key*
 
 # built bundles
 dist/
