@@ -82,9 +82,11 @@ sudo recovera-upgrade install --reboot
 sudo recovera-upgrade rollback
 ```
 
-The hourly timer checks for availability only while the configured Update
-Window is open and the Update Channel is set to Stable. It never installs or
-reboots automatically; use the WebUI's Update Now section for installation.
+The hourly timer checks for availability while the configured Update Window is
+open and the Update Channel is set to Stable. When a newer signed release is
+available, it installs automatically. If the signed manifest requires a reboot,
+the appliance reboots within the configured window. The WebUI's Update Now
+section remains available for an immediate administrator-initiated update.
 For a private repository, place a fine-grained,
 read-only GitHub token in `/etc/recovera/github-token`, owned by root with mode
 `0600`. The token needs only read-only repository **Contents** access.
