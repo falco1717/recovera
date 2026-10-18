@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run signed update discovery only inside the configured Recovera window."""
+"""Install the latest signed channel release inside the configured window."""
 from __future__ import annotations
 
 import datetime
@@ -33,8 +33,25 @@ def main() -> int:
     inside = start <= hour < end if start < end else hour >= start or hour < end
     if not inside:
         return 0
-    result = subprocess.run([UPDATER, "check", "--cache"], check=False)
-    return 0 if result.returncode in (0, 3) else result.returncode
+    result = subprocess.run(
+        [UPDATER, "check", "--cache"], check=False, capture_output=True, text=True
+    )
+    if result.stdout:
+        print(result.stdout, end="")
+    if result.stderr:
+        print(result.stderr, end="", file=sys.stderr)
+    if result.returncode == 3:
+        return 0
+    if result.returncode != 0:
+        return result.returncode
+    try:
+        available = bool(json.loads(result.stdout).get("available"))
+    except (AttributeError, json.JSONDecodeError, TypeError):
+        print("recovera-upgrade-schedule: updater returned invalid check output", file=sys.stderr)
+        return 1
+    if not available:
+        return 0
+    return subprocess.run([UPDATER, "install", "--reboot"], check=False).returncode
 
 
 if __name__ == "__main__":
