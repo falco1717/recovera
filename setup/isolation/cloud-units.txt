@@ -5,6 +5,10 @@ datto-agent-types-audit-report.timer
 datto-apache-ca-update-boot.service
 datto-apache-ca-update-refresh.service
 datto-apache-ca-update-refresh.timer
+datto-asset-replication-reconcile.service
+datto-asset-replication-reconcile.timer
+datto-bandwidth-schedule.service
+datto-bandwidth-schedule.timer
 datto-check-billing-status.service
 datto-check-billing-status.timer
 datto-check-billing-status-on-boot.service

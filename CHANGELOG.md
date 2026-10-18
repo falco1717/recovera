@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.6.18 - 2026-10-18
+
+- Isolated the remaining legacy cloud asset-reconciliation and bandwidth-
+  schedule jobs discovered during the live post-0.6.17 appliance audit.
+- Kept Off-Site Sync scheduling and upload-rate enforcement entirely local in
+  the Recovera replication worker, which evaluates the configured schedule on
+  every five-minute replication pass and before each transfer.
+
 ## v0.6.17 - 2026-10-18
 
 - Isolated the remaining legacy network-connectivity test, automatic DDNS and
