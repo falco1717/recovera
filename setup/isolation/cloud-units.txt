@@ -57,3 +57,4 @@ datto-network-connectivity-test.timer
 datto-salt-configure.service
 salt-minion.service
 dtcserver.service
+rly-client.service

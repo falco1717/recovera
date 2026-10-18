@@ -11,3 +11,9 @@ test443.dattobackup.com
 dlt-salt.dattobackup.com
 packages.dattobackup.com
 bmc.datto.com
+dlt-rly-tracker-1.datto.com
+dlt-rly-tracker-2.datto.com
+dlt-rly-tracker-3.datto.com
+dlt-rly-tracker-4.datto.com
+dlt-rly-tracker-5.datto.com
+dlt-rly-tracker-6.datto.com
