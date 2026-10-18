@@ -22,7 +22,8 @@ trap 'rm -rf "$work"' EXIT
 stage=$work/stage
 mkdir -p "$stage/DEBIAN" "$stage/usr/local/sbin" "$stage/usr/local/lib/recovera" \
   "$stage/usr/local/lib/recovera-upgrade" "$stage/usr/local/share/recovera-upgrade" \
-  "$stage/usr/local/share/recovera" "$stage/usr/lib/recovera/branding" \
+  "$stage/usr/local/share/recovera" "$stage/usr/local/share/recovera/isolation" \
+  "$stage/usr/lib/recovera/branding" \
   "$stage/usr/share/recovera/defaults" "$stage/usr/share/recovera/setup" \
   "$stage/etc/systemd/system" \
   "$stage/etc/apache2/conf-available" "$stage/etc/ssh/sshd_config.d" \
@@ -76,6 +77,10 @@ install -m 0644 "$ROOT/upgrade/recovera-upgrade.conf" "$stage/usr/share/recovera
 install -m 0644 "$ROOT/upgrade/recovera-upgrade-check.service" "$stage/etc/systemd/system/"
 install -m 0644 "$ROOT/upgrade/recovera-upgrade-check.timer" "$stage/etc/systemd/system/"
 install -m 0644 "$ROOT/upgrade/recovera-upgrade-validate.service" "$stage/etc/systemd/system/"
+install -m 0755 "$ROOT/setup/isolation/recovera-cloud-isolation" "$stage/usr/local/sbin/"
+install -m 0644 "$ROOT/setup/isolation/cloud-units.txt" "$stage/usr/local/share/recovera/isolation/"
+install -m 0644 "$ROOT/setup/isolation/cloud-hosts.txt" "$stage/usr/local/share/recovera/isolation/"
+install -m 0644 "$ROOT/setup/isolation/recovera-cloud-isolation.service" "$stage/etc/systemd/system/"
 
 cat > "$stage/DEBIAN/preinst" <<'PREINST'
 #!/bin/sh
@@ -89,6 +94,7 @@ install -d -m 0755 \
   /usr/local/lib/recovera-upgrade \
   /usr/local/share/recovera-upgrade \
   /usr/local/share/recovera \
+  /usr/local/share/recovera/isolation \
   /usr/lib/recovera/branding \
   /usr/share/recovera/defaults \
   /etc/systemd/system \
@@ -125,7 +131,8 @@ if [ -d /usr/lib/datto/statusshell/logo ]; then
 fi
 [ ! -e /etc/update-motd.d/25-datto ] || chmod a-x /etc/update-motd.d/25-datto
 systemctl daemon-reload
-systemctl enable recovera-upgrade-check.timer recovera-upgrade-validate.service >/dev/null
+systemctl enable recovera-upgrade-check.timer recovera-upgrade-validate.service recovera-cloud-isolation.service >/dev/null
+/usr/local/sbin/recovera-cloud-isolation apply
 systemctl try-restart recovera-upgrade-check.timer >/dev/null || true
 if id recovera-repl >/dev/null 2>&1 && [ -f /etc/recovera-peer/config.json ]; then
   python3 /usr/lib/recovera/branding/apply-peer-ui.py

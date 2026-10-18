@@ -1,0 +1,13 @@
+# Exact legacy cloud endpoints observed in the retained application stack.
+dattobackup.com
+admin.dattobackup.com
+device.dattobackup.com
+device.dattobackup.com.cdn.cloudflare.net
+speedtest.dattobackup.com
+remote.dattobackup.com
+test22.dattobackup.com
+test80.dattobackup.com
+test443.dattobackup.com
+dlt-salt.dattobackup.com
+packages.dattobackup.com
+bmc.datto.com
