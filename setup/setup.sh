@@ -198,6 +198,7 @@ stage_bundle() {   # copy the bundle to /opt/recovera so nothing depends on /hom
   [ -d "$BUNDLE/branding" ] || die "missing branding/ in bundle: $BUNDLE"
   [ -d "$BUNDLE/peer" ] || die "missing peer/ in bundle: $BUNDLE"
   [ -d "$BUNDLE/upgrade" ] || die "missing upgrade/ in bundle: $BUNDLE"
+  [ -d "$BUNDLE/isolation" ] || die "missing isolation/ in bundle: $BUNDLE"
   need_kb=$(( $(du -sk "$BUNDLE" | cut -f1) + 6*1024*1024 ))   # bundle + ~6 GB for the install itself
   free_kb=$(df -Pk / | awk 'NR==2{print $4}')
   [ "$free_kb" -ge "$need_kb" ] || { echo "not enough space on /: need ~$((need_kb/1024/1024)) GB, have $((free_kb/1024/1024)) GB"; exit 1; }
@@ -210,6 +211,7 @@ stage_bundle() {   # copy the bundle to /opt/recovera so nothing depends on /hom
   rm -rf "$INSTALL_DIR/branding"; cp -a "$BUNDLE/branding" "$INSTALL_DIR/"
   rm -rf "$INSTALL_DIR/peer"; cp -a "$BUNDLE/peer" "$INSTALL_DIR/"
   rm -rf "$INSTALL_DIR/upgrade"; cp -a "$BUNDLE/upgrade" "$INSTALL_DIR/"
+  rm -rf "$INSTALL_DIR/isolation"; cp -a "$BUNDLE/isolation" "$INSTALL_DIR/"
   if [ -d "$BUNDLE/conffiles" ]; then rm -rf "$INSTALL_DIR/conffiles"; cp -a "$BUNDLE/conffiles" "$INSTALL_DIR/"; fi
   if [ ! -f "$INSTALL_DIR/debs/.verified" ]; then
     rm -rf "$INSTALL_DIR/debs"; cp -a "$BUNDLE/debs" "$INSTALL_DIR/"
@@ -1164,6 +1166,20 @@ p79_image_updater() {
   log "signed Recovera package updater installed; full-image activation remains disabled until an image-layout marker is provisioned"
 }
 
+p79a_cloud_isolation() {
+  local source="$INSTALL_DIR/isolation"
+  [ -x "$source/recovera-cloud-isolation" ] || { log "Recovera cloud isolation tool is missing"; return 1; }
+  install -d -m 0755 /usr/local/share/recovera/isolation /etc/systemd/system || return 1
+  install -m 0755 "$source/recovera-cloud-isolation" /usr/local/sbin/recovera-cloud-isolation || return 1
+  install -m 0644 "$source/cloud-units.txt" /usr/local/share/recovera/isolation/ || return 1
+  install -m 0644 "$source/cloud-hosts.txt" /usr/local/share/recovera/isolation/ || return 1
+  install -m 0644 "$source/recovera-cloud-isolation.service" /etc/systemd/system/ || return 1
+  systemctl daemon-reload || return 1
+  systemctl enable recovera-cloud-isolation.service >/dev/null || return 1
+  /usr/local/sbin/recovera-cloud-isolation apply || return 1
+  log "legacy cloud services and endpoints isolated; local protection and Recovera replication preserved"
+}
+
 net_revert() {
   rm -f /etc/NetworkManager/system-connections/br0.nmconnection \
         "/etc/NetworkManager/system-connections/$1.nmconnection"
@@ -1333,6 +1349,7 @@ verify() {
   check "snapctl works"                                    "snapctl --version"
   check "SpeedSync recognizes the local Recovera device"   "timeout 10 speedsync version"
   check "php8.1-fpm active (/run/php)"                     "systemctl is-active php8.1-fpm"
+  check "legacy cloud control plane is isolated"          "/usr/local/sbin/recovera-cloud-isolation verify"
   # libvirtd is socket-activated with --timeout 120, so "inactive" is normal; ask it instead
   check "libvirt answers (virsh version)"                  "virsh -c qemu:///system version"
   check "RAM for recovery verification: ${mem_gb} GB >= ${MIN_RAM_GB} GB" \
@@ -1411,6 +1428,7 @@ run_all() {
   phase p77 "Recovera application branding"                    p77_recovera_branding
   phase p78 "offline appliance-to-appliance replication"       p78_peer_replication
   phase p79 "signed package and image upgrade client"           p79_image_updater
+  phase p79a "legacy cloud isolation"                           p79a_cloud_isolation
   phase p80 "NetworkManager bridge br0"                       p80_network
   phase p85 "apt sources"                                     p85_apt
   log "== p90: post-boot verification timer (re-armed every run)"

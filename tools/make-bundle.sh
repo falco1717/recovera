@@ -24,6 +24,10 @@ rm -rf "$B"; mkdir -p "$B/lists" "$B/debs"
 cp "$REPO/setup/setup.sh" "$REPO/setup/migrate-layout.sh" \
   "$REPO/setup/setup.conf" "$REPO/setup/README.txt" "$B/"
 cp -r "$REPO/setup/wheels" "$B/wheels"
+cp -r "$REPO/setup/peer" "$B/peer"
+cp -r "$REPO/setup/branding" "$B/branding"
+cp -r "$REPO/setup/isolation" "$B/isolation"
+cp -r "$REPO/upgrade" "$B/upgrade"
 sed -i 's/\r$//' "$B/setup.sh" "$B/setup.conf" "$B/README.txt"
 chmod 755 "$B/setup.sh" "$B/migrate-layout.sh"
 cp "$EXPORT/lists/manual.txt" "$EXPORT/lists/portable.txt" \

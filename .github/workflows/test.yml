@@ -23,6 +23,7 @@ jobs:
           php -l tests/integration_recovera_auth.php
           python3 -m py_compile setup/peer/recovera-peer setup/branding/apply-branding.py \
             setup/branding/apply-peer-ui.py \
+            setup/isolation/recovera-cloud-isolation \
             upgrade/recovera-upgrade \
             gateway/recovera-gateway gateway/recovera-gateway-token \
             gateway/recovera_gateway_auth.py \

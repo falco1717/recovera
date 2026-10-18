@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.6.16 - 2026-10-18
+
+- Isolated confirmed legacy cloud check-in, telemetry, licensing, remote
+  management, VPN, and package-feed paths while preserving the complete local
+  backup, restore, ZFS, Web UI, and Recovera private-replication data plane.
+- Added boot-time enforcement and an administrator verification command:
+  `sudo recovera-cloud-isolation verify`.
+
 ## v0.6.15 - 2026-10-17
 
 - Changed the configured Update Window to automatically check for and install
