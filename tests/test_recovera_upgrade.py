@@ -351,8 +351,12 @@ class RecoveraUpgradeTests(unittest.TestCase):
         schedule = (ROOT / "upgrade" / "recovera-upgrade-schedule").read_text()
         self.assertIn('channel == "none"', schedule)
         self.assertIn('UPDATER, "check", "--cache"', schedule)
+        self.assertIn('UPDATER, "install", "--reboot"', schedule)
         timer = (ROOT / "upgrade" / "recovera-upgrade-check.timer").read_text()
         self.assertIn("OnCalendar=hourly", timer)
+        service = (ROOT / "upgrade" / "recovera-upgrade-check.service").read_text()
+        self.assertIn("ProtectSystem=false", service)
+        self.assertIn("TimeoutStartSec=infinity", service)
 
     def test_assembler_reclaims_verified_parts_before_decompression(self):
         self.assertIn("local.unlink()", UPDATER.read_text())
