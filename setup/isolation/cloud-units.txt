@@ -2,6 +2,9 @@
 # retention, or Recovera private-replication units to this file.
 datto-agent-types-audit-report.service
 datto-agent-types-audit-report.timer
+datto-apache-ca-update-boot.service
+datto-apache-ca-update-refresh.service
+datto-apache-ca-update-refresh.timer
 datto-check-billing-status.service
 datto-check-billing-status.timer
 datto-check-billing-status-on-boot.service
@@ -37,11 +40,16 @@ datto-snapnas-growth-report.service
 datto-snapnas-growth-report.timer
 datto-iscsi-health-check.service
 datto-iscsi-health-check.timer
+datto-https-check.service
+datto-https-check.timer
+datto-https-repair.service
 datto-zfs-check.service
 datto-zfs-check.timer
 datto-update-assets.service
 datto-update-assets.timer
 datto-netctl-reconcile.service
+datto-network-connectivity-test.service
+datto-network-connectivity-test.timer
 datto-salt-configure.service
 salt-minion.service
 dtcserver.service
