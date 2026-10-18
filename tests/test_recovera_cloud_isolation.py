@@ -22,6 +22,9 @@ class CloudIsolationTests(unittest.TestCase):
         units = set(line.strip() for line in (ROOT / "setup/isolation/cloud-units.txt").read_text().splitlines()
                     if line.strip() and not line.startswith("#"))
         self.assertIn("datto-emergency-checkin.timer", units)
+        self.assertIn("datto-network-connectivity-test.timer", units)
+        self.assertIn("datto-https-check.timer", units)
+        self.assertIn("datto-apache-ca-update-refresh.timer", units)
         self.assertIn("salt-minion.service", units)
         self.assertIn("dtcserver.service", units)
         for forbidden in (

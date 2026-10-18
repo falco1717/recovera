@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.6.17 - 2026-10-18
+
+- Isolated the remaining legacy network-connectivity test, automatic DDNS and
+  HTTPS repair, and Apache cloud-CA refresh jobs discovered during the live
+  post-0.6.16 appliance audit.
+
 ## v0.6.16 - 2026-10-18
 
 - Isolated confirmed legacy cloud check-in, telemetry, licensing, remote
