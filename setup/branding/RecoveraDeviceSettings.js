@@ -182,9 +182,9 @@
         const channelButton = document.getElementById('upgradeChannelApplyButton');
         if (channelCard) {
             const description = channelCard.querySelector('.card-body > p');
-            if (description) description.textContent = 'Choose whether this appliance checks the signed Recovera stable update channel during its Update Window.';
+            if (description) description.textContent = 'Choose whether this appliance automatically installs signed Recovera stable updates during its Update Window.';
             const alert = channelCard.querySelector('.alert');
-            if (alert) alert.textContent = 'Update checks are automatic. Installation occurs only when an administrator selects Update now.';
+            if (alert) alert.textContent = 'Update checks and installation are automatic during the configured window. The appliance reboots automatically when an update requires it.';
         }
         if (channel && channelButton && !channelButton.dataset.recovera) {
             channel.innerHTML = '<option value="stable">Stable</option><option value="none">None</option>';
@@ -208,7 +208,7 @@
         const windowButton = document.getElementById('updateWindowApplyButton');
         if (windowCard) {
             const description = windowCard.querySelector('.card-body > p');
-            if (description) description.textContent = 'Choose when this appliance performs scheduled Recovera update checks. Installation remains under your control in Update Now.';
+            if (description) description.textContent = 'Choose when this appliance checks for and automatically installs the latest signed Recovera update. Updates may reboot the appliance during this window.';
         }
         if (start && end) {
             start.value = String(currentPolicy.window.start);
