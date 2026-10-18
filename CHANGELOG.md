@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.6.19 - 2026-10-18
+
+- Disabled the legacy remote Partner Portal relay client after live packet
+  captures confirmed it was still sending periodic HTTP heartbeats to Datto.
+- Blocked all six observed Datto relay-tracker hostnames as a second isolation
+  layer while preserving local SSH, console access, and Recovera replication.
+
 ## v0.6.18 - 2026-10-18
 
 - Isolated the remaining legacy cloud asset-reconciliation and bandwidth-

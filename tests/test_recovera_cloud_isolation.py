@@ -31,6 +31,7 @@ class CloudIsolationTests(unittest.TestCase):
         self.assertIn("datto-bandwidth-schedule.timer", units)
         self.assertIn("salt-minion.service", units)
         self.assertIn("dtcserver.service", units)
+        self.assertIn("rly-client.service", units)
         for forbidden in (
             "recovera-peer.service",
             "recovera-peer-sync.timer",
@@ -62,6 +63,14 @@ class CloudIsolationTests(unittest.TestCase):
             module.replace_managed_block(hosts, lines)
             self.assertEqual(first, hosts.read_text())
             self.assertEqual(hosts.read_text().count(module.BEGIN), 1)
+
+    def test_datto_remote_relay_is_fully_isolated(self):
+        hosts = set(line.strip() for line in (ROOT / "setup/isolation/cloud-hosts.txt").read_text().splitlines()
+                    if line.strip() and not line.startswith("#"))
+        self.assertEqual(
+            {f"dlt-rly-tracker-{number}.datto.com" for number in range(1, 7)},
+            {host for host in hosts if host.startswith("dlt-rly-tracker-")},
+        )
 
     def test_package_and_fresh_setup_install_isolation(self):
         builder = (ROOT / "tools/build-recovera-appliance-deb.sh").read_text()
