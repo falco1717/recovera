@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.6.15 - 2026-10-17
+
+- Changed the configured Update Window to automatically check for and install
+  the latest signed build from the selected channel. Updates that require a
+  reboot now reboot automatically within that window.
+
 ## v0.6.14 - 2026-10-17
 
 - Published a no-impact maintenance release to validate authenticated appliance
