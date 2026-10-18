@@ -25,17 +25,31 @@ class CloudIsolationTests(unittest.TestCase):
         self.assertIn("datto-network-connectivity-test.timer", units)
         self.assertIn("datto-https-check.timer", units)
         self.assertIn("datto-apache-ca-update-refresh.timer", units)
+        self.assertIn("datto-asset-replication-reconcile.service", units)
+        self.assertIn("datto-asset-replication-reconcile.timer", units)
+        self.assertIn("datto-bandwidth-schedule.service", units)
+        self.assertIn("datto-bandwidth-schedule.timer", units)
         self.assertIn("salt-minion.service", units)
         self.assertIn("dtcserver.service", units)
         for forbidden in (
             "recovera-peer.service",
             "recovera-peer-sync.timer",
             "datto-asset-offsite-schedule-run.service",
-            "datto-asset-replication-reconcile.service",
             "datto-retention-offsite.service",
             "datto-update-offsite-points.service",
         ):
             self.assertNotIn(forbidden, units)
+
+    def test_local_offsite_scheduler_remains_the_replication_data_plane(self):
+        peer = (ROOT / "setup/peer/recovera-peer").read_text()
+        service = (ROOT / "setup/peer/recovera-peer-sync.service").read_text()
+        timer = (ROOT / "setup/peer/recovera-peer-sync.timer").read_text()
+
+        self.assertIn("def schedule_speed(", peer)
+        self.assertIn("speed = schedule_speed(now)", peer)
+        self.assertIn('["pv", "-q", "-L", str(speed_kbps * 1024)]', peer)
+        self.assertIn("recovera-peer sync --all", service)
+        self.assertIn("OnUnitActiveSec=5min", timer)
 
     def test_hosts_are_exact_and_managed_block_is_idempotent(self):
         module = load_script()
