@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.6.20 - 2026-10-18
+
+- Replaced the retained vendor NTP configuration with Recovera-managed neutral
+  time sources (`time.cloudflare.com` and `ntp.ubuntu.com`) and public pool
+  fallbacks.
+- Added the retired vendor NTP hostname to the legacy-cloud isolation blocklist
+  and restart time synchronization when the policy is applied.
+
 ## v0.6.19 - 2026-10-18
 
 - Disabled the legacy remote Partner Portal relay client after live packet

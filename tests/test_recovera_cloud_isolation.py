@@ -72,6 +72,32 @@ class CloudIsolationTests(unittest.TestCase):
             {host for host in hosts if host.startswith("dlt-rly-tracker-")},
         )
 
+    def test_vendor_ntp_is_replaced_with_neutral_sources(self):
+        module = load_script()
+        hosts = set(line.strip() for line in (ROOT / "setup/isolation/cloud-hosts.txt").read_text().splitlines()
+                    if line.strip() and not line.startswith("#"))
+        self.assertIn("ntp.dattobackup.com", hosts)
+        self.assertEqual("time.cloudflare.com ntp.ubuntu.com", module.RECOVERA_TIME_SERVERS)
+        self.assertEqual("0.pool.ntp.org 1.pool.ntp.org", module.RECOVERA_FALLBACK_TIME_SERVERS)
+        source = SCRIPT.read_text()
+        self.assertIn("01-datto-timesyncd.conf", source)
+        self.assertIn("20-recovera-timesyncd.conf", source)
+        self.assertIn('try-restart", "systemd-timesyncd.service', source)
+        with tempfile.TemporaryDirectory() as directory:
+            module.ETC = Path(directory)
+            legacy = module.ETC / module.DATTO_TIMESYNCD
+            legacy.parent.mkdir(parents=True)
+            legacy.write_text("[Time]\nNTP=ntp.dattobackup.com\n")
+            result = module.configure_time_sync()
+            replacement = module.ETC / module.RECOVERA_TIMESYNCD
+            self.assertTrue(result["removed_legacy_ntp_config"])
+            self.assertFalse(legacy.exists())
+            self.assertEqual(
+                "[Time]\nNTP=time.cloudflare.com ntp.ubuntu.com\n"
+                "FallbackNTP=0.pool.ntp.org 1.pool.ntp.org\n",
+                replacement.read_text(),
+            )
+
     def test_package_and_fresh_setup_install_isolation(self):
         builder = (ROOT / "tools/build-recovera-appliance-deb.sh").read_text()
         setup = (ROOT / "setup/setup.sh").read_text()

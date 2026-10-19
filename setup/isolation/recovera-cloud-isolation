@@ -18,6 +18,10 @@ STATE = Path(os.environ.get("RECOVERA_ISOLATION_STATE", "/var/lib/recovera/cloud
 BEGIN = "# BEGIN RECOVERA CLOUD ISOLATION"
 END = "# END RECOVERA CLOUD ISOLATION"
 DROPIN = """[Service]\nIPAddressDeny=any\nRestrictAddressFamilies=AF_UNIX\n"""
+DATTO_TIMESYNCD = Path("systemd/timesyncd.conf.d/01-datto-timesyncd.conf")
+RECOVERA_TIMESYNCD = Path("systemd/timesyncd.conf.d/20-recovera-timesyncd.conf")
+RECOVERA_TIME_SERVERS = "time.cloudflare.com ntp.ubuntu.com"
+RECOVERA_FALLBACK_TIME_SERVERS = "0.pool.ntp.org 1.pool.ntp.org"
 
 
 def records(path: Path) -> list[str]:
@@ -65,6 +69,21 @@ def disable_legacy_sources() -> list[str]:
     return changed
 
 
+def configure_time_sync() -> dict[str, object]:
+    """Replace the retained vendor NTP endpoint with neutral public sources."""
+    old_path = ETC / DATTO_TIMESYNCD
+    new_path = ETC / RECOVERA_TIMESYNCD
+    removed = old_path.exists()
+    old_path.unlink(missing_ok=True)
+    new_path.parent.mkdir(parents=True, exist_ok=True)
+    new_path.write_text(
+        "[Time]\n"
+        f"NTP={RECOVERA_TIME_SERVERS}\n"
+        f"FallbackNTP={RECOVERA_FALLBACK_TIME_SERVERS}\n"
+    )
+    return {"removed_legacy_ntp_config": removed, "config": str(new_path)}
+
+
 def unit_state(unit: str) -> dict[str, object]:
     enabled = run("systemctl", "is-enabled", unit, check=False)
     active = run("systemctl", "is-active", unit, check=False)
@@ -95,6 +114,7 @@ def apply(enforce_only: bool = False) -> dict[str, object]:
     nm.parent.mkdir(parents=True, exist_ok=True)
     nm.write_text("[connectivity]\nenabled=false\n")
     changed_sources = [] if enforce_only else disable_legacy_sources()
+    time_sync = configure_time_sync()
     if not enforce_only:
         for unit in units:
             if unit.endswith(".service"):
@@ -107,8 +127,10 @@ def apply(enforce_only: bool = False) -> dict[str, object]:
         run("systemctl", "mask", unit, check=False)
     if not enforce_only and which("nmcli"):
         run("nmcli", "general", "reload", check=False)
+    run("systemctl", "try-restart", "systemd-timesyncd.service", check=False)
     report = verify()
     report["legacy_sources_changed"] = changed_sources
+    report["time_sync"] = time_sync
     STATE.parent.mkdir(parents=True, exist_ok=True)
     STATE.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
     STATE.chmod(0o600)
@@ -124,6 +146,15 @@ def verify() -> dict[str, object]:
         rf"(?m)^0\.0\.0\.0\s+{re.escape(host)}(?:\s|$)", hosts_text)]
     nm = ETC / "NetworkManager/conf.d/20-recovera-cloud-isolation.conf"
     nm_disabled = nm.exists() and "enabled=false" in nm.read_text().replace(" ", "")
+    old_time = ETC / DATTO_TIMESYNCD
+    new_time = ETC / RECOVERA_TIMESYNCD
+    time_text = new_time.read_text() if new_time.exists() else ""
+    time_sync_ok = (
+        not old_time.exists()
+        and f"NTP={RECOVERA_TIME_SERVERS}" in time_text
+        and f"FallbackNTP={RECOVERA_FALLBACK_TIME_SERVERS}" in time_text
+        and "dattobackup.com" not in time_text.lower()
+    )
     active_sources: list[str] = []
     source_dir = ETC / "apt/sources.list.d"
     endpoint = re.compile(r"(?:datto(?:backup)?\.com|dattobackup)", re.I)
@@ -133,12 +164,13 @@ def verify() -> dict[str, object]:
                 if not line.lstrip().startswith("#") and endpoint.search(line):
                     active_sources.append(f"{path}:{line.strip()}")
     failures = [str(s["unit"]) for s in states if not s["masked"] or not s["inactive"]]
-    ok = not failures and not missing_hosts and nm_disabled and not active_sources
+    ok = not failures and not missing_hosts and nm_disabled and not active_sources and time_sync_ok
     return {
         "ok": ok,
         "failed_units": failures,
         "missing_hosts": missing_hosts,
         "networkmanager_connectivity_disabled": nm_disabled,
+        "neutral_time_sync_configured": time_sync_ok,
         "active_legacy_sources": active_sources,
         "units": states,
     }
