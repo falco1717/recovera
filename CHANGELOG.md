@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.6.22 - 2026-11-04
+
+- Protect-a-System wizard: when no replication peer is paired, the
+  "Target Recovera appliance" option is now grayed out and disabled (replacing
+  the empty-state note), with an info (i) icon whose tooltip explains how to
+  pair a target under Configure → Off-site Target.
+- Registration: after a freshly deployed appliance is named and registered, it
+  now checks for and installs any signed Recovera update before finishing, so
+  new deployments start current instead of waiting for the nightly window.
+
 ## v0.6.21 - 2026-11-04
 
 - Protect-a-System wizard: the per-asset Recovera replication policy editor was
