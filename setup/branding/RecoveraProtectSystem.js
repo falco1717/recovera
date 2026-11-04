@@ -107,43 +107,79 @@
         var prototype = View.prototype;
         var nativeRender = prototype.render;
         prototype.recoveraInstalled = true;
+        // The native "no targets" message lives inside #replicationTargetSelect,
+        // which toggleSelect(false) hides — so when no peer is paired the user
+        // sees a blank area instead of an explanation. This visible note sits
+        // OUTSIDE that collapsed container and explains the empty state.
+        function ensureTargetNote(self) {
+            if (self.$recoveraTargetNote && self.$recoveraTargetNote.length) {
+                return;
+            }
+            self.$recoveraTargetNote = $('<div class="pt-2 recovera-target-note" style="color:#b00020;">')
+                .text('No target Recovera appliance is paired yet. Pair one under ' +
+                      'Configure → Off-site Target, then reopen this wizard.')
+                .hide();
+            if (self.$replicationTargetSelect && self.$replicationTargetSelect.length) {
+                self.$replicationTargetSelect.before(self.$recoveraTargetNote);
+            }
+        }
         prototype.getAuthorizedDevices = function () {
             var self = this;
+            ensureTargetNote(self);
             request('status', 'GET').then(function (status) {
                 var peers = Object.keys(status.peers || {}).filter(function (id) {
                     return status.peers[id].enabled !== false;
                 });
+                self.recoveraHasPeers = peers.length > 0;
                 self.$replicationTargetSelectInput.empty();
                 peers.forEach(function (id) {
                     var peer = status.peers[id];
-                    $('<option>').val(id).text(peer.name + ' — ' + peer.host)
+                    $('<option>').val(id).text(peer.name + (peer.host ? ' — ' + peer.host : ''))
                         .appendTo(self.$replicationTargetSelectInput);
                 });
                 if (peers.length === 0) {
+                    // No peer paired: default to No Replication and keep the view
+                    // clean; the note is shown when the user actively picks Target
+                    // (click handler in render), matching native SIRIS behavior.
                     self.$replicationTypeCloud.prop('checked', true);
                     self.$replicationTypeSiris.prop('checked', false);
                     self.toggleSelect(false);
-                    self.$replicationTargetInfoBoxError
-                        .text('Pair a target appliance under Configure → Off-site Target first.').show();
+                    if (self.$recoveraTargetNote) { self.$recoveraTargetNote.hide(); }
                     return;
                 }
-                self.$replicationTargetInfoBoxError.hide();
+                if (self.$recoveraTargetNote) { self.$recoveraTargetNote.hide(); }
                 if ($('input[name=replicationType]:checked').val() === 'siris') {
                     self.toggleSelect(true);
                 }
             }).catch(function (error) {
+                self.recoveraHasPeers = false;
                 self.$replicationTypeCloud.prop('checked', true);
                 self.$replicationTypeSiris.prop('checked', false);
                 self.toggleSelect(false);
-                self.$replicationTargetInfoBoxError.text(error.message).show();
+                if (self.$recoveraTargetNote) {
+                    self.$recoveraTargetNote
+                        .text('Could not reach the Recovera replication service: ' + error.message)
+                        .show();
+                }
             });
         };
         prototype.render = function () {
             var result = nativeRender.apply(this, arguments);
+            var self = this;
             $('label[for="replicationTypeSiris"]').text('Target Recovera appliance');
             $('label[for="replicationTargetSelectInput"]').text('Select authorized target appliance');
             $('label[for="standardCloudBackupIntervalSelect"]').text('Replicate backups to the target appliance');
             $('#standardCloudRetention label').first().text('Keep backups on the target appliance for');
+            ensureTargetNote(self);
+            // Surface the empty-state reason the moment the user chooses Target.
+            self.$replicationTypeSiris.on('click', function () {
+                if (!self.recoveraHasPeers && self.$recoveraTargetNote) {
+                    self.$recoveraTargetNote.show();
+                }
+            });
+            self.$replicationTypeCloud.on('click', function () {
+                if (self.$recoveraTargetNote) { self.$recoveraTargetNote.hide(); }
+            });
             return result;
         };
     }

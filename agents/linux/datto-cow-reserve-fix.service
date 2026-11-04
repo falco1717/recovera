@@ -1,0 +1,18 @@
+[Unit]
+Description=Cap dattobd COW auto-expand reserved space so Datto backups of large volumes do not false-overflow
+Documentation=file:/opt/recovera/docs/offline-agent-pairing.md
+After=dlad.service
+Wants=dlad.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/datto-cow-reserve-fix.sh
+Restart=always
+RestartSec=10
+# Tunables (override with: systemctl edit datto-cow-reserve-fix):
+Environment=RESERVE_MIB=30720
+Environment=STEP_MIB=10240
+Environment=THRESH_MIB=40960
+
+[Install]
+WantedBy=multi-user.target

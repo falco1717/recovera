@@ -34,3 +34,9 @@ compatibility/reports/
 # Local Python test/runtime caches
 __pycache__/
 *.pyc
+
+# offline-agent-pairing: never commit private keys or minted PKI
+pki/
+*.key
+*_device.key
+ca.key

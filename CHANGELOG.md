@@ -1,5 +1,20 @@
 # Changelog
 
+## v0.6.21 - 2026-11-04
+
+- Protect-a-System wizard: the per-asset Recovera replication policy editor was
+  appended unconditionally to `Assets/Configure/cloud.backup.html.twig`, so it
+  also rendered inside the Set Replication & Retention wizard step as a second,
+  always-on form stacked on the native No-Replication/Target toggle — shown even
+  under "No Replication". Guarded it with `{% if not inWizard %}` so it only
+  appears on the per-asset Configure page; the wizard now uses the native
+  replication step (relabeled, peer-populated and save-hooked by
+  `RecoveraProtectSystem.js`), matching native SIRIS behavior.
+- Protect-a-System wizard: when "Target Recovera appliance" is selected with no
+  replication peer paired, the native empty-state message was hidden inside the
+  collapsed target container, leaving a blank area. Added a visible note that
+  explains a target must be paired under Configure → Off-site Target.
+
 ## v0.6.20 - 2026-10-18
 
 - Replaced the retained vendor NTP configuration with Recovera-managed neutral
