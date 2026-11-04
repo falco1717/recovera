@@ -6,8 +6,16 @@ import shutil
 ROOT = Path("/usr/lib/datto/device")
 WEB = Path("/datto/web/commonlookandfeel/js/App/Agents")
 SOURCE = Path(__file__).parent
-RECOVERA_PANEL = '''<div id="recovera-asset-replication" data-asset="{{ asset.keyName }}" class="card mt-3"><div class="d-none">{{ csrfTag() }}</div><div class="card-body"><h3>Recovera replication</h3><div id="recovera-asset-policy">Loading replication policy…</div></div></div>
-<script type="text/javascript" src="{{ asset('commonlookandfeel/js/App/Agents/RecoveraProtectSystem.js') }}"></script>'''
+# The per-asset Recovera replication editor belongs only on the Configure page.
+# In the "Protect a System" wizard (inWizard) the native replication step already
+# lets you pick a peer (RecoveraProtectSystem.js relabels it + populates the
+# target list + hooks the save), so this standalone policy form must NOT render
+# there — otherwise it shows a second, always-on form on top of the native
+# No-Replication/Target toggle. Guard it with {% if not inWizard %}.
+RECOVERA_PANEL = '''{% if not inWizard %}
+<div id="recovera-asset-replication" data-asset="{{ asset.keyName }}" class="card mt-3"><div class="d-none">{{ csrfTag() }}</div><div class="card-body"><h3>Recovera replication</h3><div id="recovera-asset-policy">Loading replication policy…</div></div></div>
+<script type="text/javascript" src="{{ asset('commonlookandfeel/js/App/Agents/RecoveraProtectSystem.js') }}"></script>
+{% endif %}'''
 
 
 def append_once(path: Path, marker: str, content: str) -> None:
