@@ -134,3 +134,40 @@ defaults. Tune the floor with `RESERVE_MIB`/`THRESH_MIB` (see the unit file).
 RTT here) as a differential merge is latency-bound and slow (hours). Once one
 backup completes, incrementals are small. Moving the agent onto the same LAN as
 the Recovera makes it fast.
+
+## "Error checking asset state for consistency" every minute (2026-11-04)
+
+After pairing, the asset's backup log shows this WARNING roughly once a minute:
+
+```
+Error checking asset state for consistency.
+```
+
+The detail is in `/var/log/datto/events.log` (logCode `SSM0017`):
+
+```
+error: Unable to parse speedsync options for the given path:
+       homePool/home/agents/<assetId>
+stack: SpeedSyncMaintenanceService->isDatasetPaused() -> checkAsset()
+       -> System/SpeedSync/CheckCommand
+```
+
+**Cause.** `datto-system-speedsync-check.timer` fires every minute and runs
+SpeedSync (offsite replication) maintenance against every asset. SpeedSync is
+Datto's **offsite/partner replication** engine. This appliance is air-gapped and
+every asset is paired `--offsiteTarget noOffsite`, so no dataset is ever
+registered with SpeedSync (`speedsync options <zfsPath>` → "not valid for
+zfsPath"). The check can't find the dataset and logs the error. It is **harmless**
+— local backups, recovery points and restores do not use SpeedSync — but it spams
+the log every minute.
+
+**Fix (offline appliance).** Disable the offsite-sync maintenance timer; there is
+nothing offsite to maintain:
+```bash
+sudo systemctl disable --now datto-system-speedsync-check.timer
+```
+Reversible — `sudo systemctl enable --now datto-system-speedsync-check.timer`
+restores it (do that if you ever configure real offsite replication). Leave
+`datto-speedsync-cache-update.timer` alone. Do **not** "fix" it with
+`speedsync add <zfsPath>`: that registers the dataset for mirroring and can queue
+replication toward a target that does not exist.
