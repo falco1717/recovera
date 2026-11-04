@@ -17,6 +17,7 @@ cloud). The full design and the failure-by-failure derivation are in
 tools/offline-agent-pairing/make-dla-ca.sh ./pki <recovera_device_id> <agent_install_uuid>
 
 # 2. On the Linux host to protect (as root): point the agent at Recovera's CA
+#    (also installs the datto-cow-reserve-fix watcher; SKIP_COW_FIX=1 to opt out)
 sudo agents/linux/install-recovera-agent.sh ./pki/agent
 
 # 3. On the Recovera appliance (as root): install the device cert set

@@ -118,7 +118,10 @@ dbdctl reconfigure-auto-expand -r 30720 10240 <minor>   # 30 GiB reserve, 10 GiB
 dlad **re-applies its large default on every new snapshot**, so this must run
 continuously. `agents/linux/datto-cow-reserve-fix.{sh,service}` is a tiny systemd
 watcher that caps `reserved_space_mib` to 30 GiB whenever it exceeds 40 GiB.
-Install:
+
+`agents/linux/install-recovera-agent.sh` installs and enables this watcher
+automatically (set `SKIP_COW_FIX=1` to opt out). To add it to an already-paired
+agent by hand:
 ```bash
 sudo install -m0755 agents/linux/datto-cow-reserve-fix.sh /usr/local/sbin/
 sudo install -m0644 agents/linux/datto-cow-reserve-fix.service /etc/systemd/system/
