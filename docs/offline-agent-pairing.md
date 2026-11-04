@@ -72,3 +72,62 @@ derived value is unchanged) and `/datto/config/deviceID = <N>`, and re-pair.
   (original `5651178892` at `/datto/config/deviceID.bak-cc`).
 - **Recovera** `/etc/sudoers.d/99-backup-admin-nopasswd` (granted so this could
   run unattended; remove when done).
+
+## Backups fail immediately: COW reserved-space overflow (2026-11-04)
+
+After pairing, the first real backup failed within ~90 s every time. The agent
+log showed the data path starting ("Remote has a valid superblock",
+DIFFERENTIAL_MERGE) then:
+
+```
+Failed during iscsi read command / Read iscsi failed. Sleeping, reconnecting...
+Failed to read length 16384 on block device /dev/datto0, err: 5
+Backup error: Error occurred reading the protected volume: ... read error 5 (VOLUME_READ_FAILED)
+```
+
+The "iscsi read failed" is a **downstream symptom**. The real cause is in
+`dmesg`:
+
+```
+datto: rejected auto-expand: 5120 MiB step size, 76639 MiB reserved space, N blocks available
+datto: cow file '/.datto' max size exceeded (X/X): -27        # -27 = EFBIG
+datto: error writing cow data / error handling write bio in kernel thread: -27
+```
+
+**Mechanism.** dlad configures the `dattobd` snapshot driver's COW auto-expand
+with a huge `reserved_space_mib` — observed **76639 MiB (74.8 GiB)** on a 491 GB
+root, i.e. ~15 % of the volume. dattobd refuses to grow the COW file unless that
+much space stays free. On a volume that is more than half full, the COW cannot
+expand (or, after earlier failed attempts leak COW files and eat free space, is
+rejected on the very first write). The COW file overflows, `/dev/datto0` goes
+EIO, and the backup dies. Churn itself is normal — confirmed live via
+`/proc/datto-info`: `cow_size_current` 10 GiB, `nr_changed_blocks` climbing only
+~0.5–4 MB/s. The reserve, not the write rate, is the problem.
+
+**Confirm it:**
+```bash
+cat /proc/datto-info      # look at devices[].auto_expand.reserved_space_mib
+dmesg -T | grep -i datto  # "rejected auto-expand" / "max size exceeded"
+```
+
+**Fix.** Cap the reserved space on the live snapshot so auto-expand works down to
+a sane floor (keeps the volume from truly filling, but gives the COW room):
+```bash
+dbdctl reconfigure-auto-expand -r 30720 10240 <minor>   # 30 GiB reserve, 10 GiB step
+```
+dlad **re-applies its large default on every new snapshot**, so this must run
+continuously. `agents/linux/datto-cow-reserve-fix.{sh,service}` is a tiny systemd
+watcher that caps `reserved_space_mib` to 30 GiB whenever it exceeds 40 GiB.
+Install:
+```bash
+sudo install -m0755 agents/linux/datto-cow-reserve-fix.sh /usr/local/sbin/
+sudo install -m0644 agents/linux/datto-cow-reserve-fix.service /etc/systemd/system/
+sudo systemctl enable --now datto-cow-reserve-fix.service
+```
+Reversible: `systemctl disable --now datto-cow-reserve-fix` restores dlad's
+defaults. Tune the floor with `RESERVE_MIB`/`THRESH_MIB` (see the unit file).
+
+**Note on speed.** A first backup over a WAN link (DC→home, ~40 Mbps / 105 ms
+RTT here) as a differential merge is latency-bound and slow (hours). Once one
+backup completes, incrementals are small. Moving the agent onto the same LAN as
+the Recovera makes it fast.
