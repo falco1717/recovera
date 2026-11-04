@@ -602,6 +602,44 @@ PHP
 (function ($, RegisterWizard) {
     "use strict";
 
+    // After the appliance is named + registered, immediately check for and
+    // install any signed Recovera update so a freshly deployed appliance starts
+    // current instead of waiting for its nightly update window. Every failure
+    // here is non-fatal and falls back to finishing registration normally.
+    function recoveraUpdateApi(operation, method) {
+        return $.ajax({
+            url: '/api/recovera/offsite-target/' + operation,
+            method: method || 'GET',
+            headers: { 'X-Requested-With': 'XMLHttpRequest' },
+            data: method === 'POST' ? { payload: '{}' } : undefined,
+            dataType: 'json'
+        });
+    }
+
+    function showUpdatingMessage(version) {
+        const html = '<div class="text-center p-5">' +
+            '<h3>Updating Recovera</h3>' +
+            '<p>Installing the latest signed Recovera update' +
+            (version ? ' (' + version + ')' : '') +
+            '. The appliance will reboot automatically — reconnect in a few minutes.</p>' +
+            '<div class="progress update-progress mt-3" style="height:1rem;">' +
+            '<div class="progress-bar progress-bar-striped progress-bar-animated" ' +
+            'style="width:100%"></div></div></div>';
+        const container = document.querySelector('.wizard-body, .modal-body, main') || document.body;
+        container.innerHTML = html;
+    }
+
+    function checkAndInstallUpdate(fallback) {
+        recoveraUpdateApi('update-check').done(function (value) {
+            const release = value && value.release && value.release.available ? value.release : null;
+            if (!release) { fallback(); return; }
+            // Fire the signed install (download + verify + install + reboot) and
+            // show a waiting message; the appliance reboots into the new version.
+            recoveraUpdateApi('update-install', 'POST');
+            showUpdatingMessage(release.version);
+        }).fail(function () { fallback(); });
+    }
+
     // Replace only the final submission. The server-side finalizer invokes the
     // appliance's native RegistrationService with its cloud call stubbed locally.
     RegisterWizard.prototype.finish = function (done) {
@@ -634,9 +672,18 @@ PHP
                 formData[self.context.csrfTokenId] = self.context.csrfToken;
                 const redirectUrl = $deviceMigrationBox.prop('checked') ?
                     self.context.urls.successDeviceMigration : self.context.urls.success;
-                $.post(self.context.loginPath, formData).always(function () {
+                const finishRegistration = function () {
                     self.close(redirectUrl);
                     done();
+                };
+                $.post(self.context.loginPath, formData).always(function () {
+                    // Device-migration restores keep the native redirect; a normal
+                    // registration checks for and installs updates first.
+                    if ($deviceMigrationBox.prop('checked')) {
+                        finishRegistration();
+                    } else {
+                        checkAndInstallUpdate(finishRegistration);
+                    }
                 });
             }).fail(function () {
                 self.displayValidation.setError(
