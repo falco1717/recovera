@@ -598,58 +598,211 @@ try {
 PHP
   chmod 0644 /datto/web/offline-register.php || return 1
 
+  # Registration-only update proxy used by the first-run update pane.
+  cat > /datto/web/offline-update.php <<'PHP'
+<?php
+declare(strict_types=1);
+
+// Registration-only, unauthenticated proxy to the privileged Recovera peer
+// socket, used by the first-run wizard's update pane (the admin account and an
+// authenticated session do not exist yet). It mirrors RecoveraTargetController
+// but drops the PERMISSION_OFFSITE_WRITE gate, and is inert once the appliance
+// is registered. Same-origin and XMLHttpRequest checks match offline-register.php.
+
+header('Content-Type: application/json');
+header('Cache-Control: no-store');
+
+function failUpdate(int $status, string $message): never
+{
+    http_response_code($status);
+    echo json_encode(['error' => $message]);
+    exit;
+}
+
+// Only usable during initial registration.
+if (is_file('/datto/config/local/reg')) {
+    failUpdate(403, 'Already registered');
+}
+if (strcasecmp($_SERVER['HTTP_X_REQUESTED_WITH'] ?? '', 'XMLHttpRequest') !== 0) {
+    failUpdate(403, 'Invalid request');
+}
+$host = strtolower((string) preg_replace('/:\\d+$/', '', $_SERVER['HTTP_HOST'] ?? ''));
+$refererHost = strtolower((string) parse_url($_SERVER['HTTP_REFERER'] ?? '', PHP_URL_HOST));
+if ($host === '' || $refererHost === '' || !hash_equals($host, $refererHost)) {
+    failUpdate(403, 'Invalid request origin');
+}
+
+$op = (string) ($_GET['op'] ?? 'check');
+$map = [
+    'check'   => ['GET',  '/v1/admin/update/check',   120],
+    'status'  => ['GET',  '/v1/admin/update/status',  30],
+    'install' => ['POST', '/v1/admin/update/install', 1800],
+];
+if (!isset($map[$op])) {
+    failUpdate(404, 'Unknown operation');
+}
+[$method, $path, $timeout] = $map[$op];
+if (($_SERVER['REQUEST_METHOD'] ?? '') !== $method) {
+    failUpdate(405, 'Method not allowed');
+}
+
+$token = @trim((string) @file_get_contents('/etc/recovera-peer/web.token'));
+if ($token === '') {
+    failUpdate(503, 'Recovera peer service is not initialized');
+}
+
+$curl = curl_init('http://localhost' . $path);
+curl_setopt_array($curl, [
+    CURLOPT_CUSTOMREQUEST => $method,
+    CURLOPT_RETURNTRANSFER => true,
+    CURLOPT_UNIX_SOCKET_PATH => '/run/recovera-peer/http.sock',
+    CURLOPT_CONNECTTIMEOUT => 5,
+    CURLOPT_TIMEOUT => $timeout,
+    CURLOPT_HTTPHEADER => ['Content-Type: application/json', 'X-Recovera-Internal: ' . $token],
+]);
+if ($method === 'POST') {
+    curl_setopt($curl, CURLOPT_POSTFIELDS, '{}');
+}
+$body = curl_exec($curl);
+$status = (int) curl_getinfo($curl, CURLINFO_RESPONSE_CODE);
+$error = curl_error($curl);
+curl_close($curl);
+
+if ($body === false) {
+    failUpdate(503, 'Recovera peer service is unavailable: ' . $error);
+}
+http_response_code($status ?: 502);
+echo $body;
+PHP
+  chmod 0644 /datto/web/offline-update.php || return 1
+
   cat > /datto/web/commonlookandfeel/js/App/Registration/OfflineRegister.js <<'JS'
 (function ($, RegisterWizard) {
-    "use strict";
+    'use strict';
 
-    // After the appliance is named + registered, immediately check for and
-    // install any signed Recovera update so a freshly deployed appliance starts
-    // current instead of waiting for its nightly update window. Every failure
-    // here is non-fatal and falls back to finishing registration normally.
-    function recoveraUpdateApi(operation, method) {
+    // Recovera update API for the registration wizard. The admin account does
+    // not exist yet at this point, so the authenticated Configure endpoints
+    // (/api/recovera/offsite-target/*) are not usable. offline-update.php is an
+    // unauthenticated, same-origin, registration-only proxy to the privileged
+    // Recovera peer socket (it refuses once the appliance is registered).
+    function recoveraUpdateApi(op, method) {
         return $.ajax({
-            url: '/api/recovera/offsite-target/' + operation,
+            url: '/offline-update.php?op=' + op,
             method: method || 'GET',
             headers: { 'X-Requested-With': 'XMLHttpRequest' },
-            data: method === 'POST' ? { payload: '{}' } : undefined,
             dataType: 'json'
         });
     }
 
-    function showUpdatingMessage(version) {
-        const html = '<div class="text-center p-5">' +
-            '<h3>Updating Recovera</h3>' +
-            '<p>Installing the latest signed Recovera update' +
-            (version ? ' (' + version + ')' : '') +
-            '. The appliance will reboot automatically — reconnect in a few minutes.</p>' +
-            '<div class="progress update-progress mt-3" style="height:1rem;">' +
-            '<div class="progress-bar progress-bar-striped progress-bar-animated" ' +
-            'style="width:100%"></div></div></div>';
-        const container = document.querySelector('.wizard-body, .modal-body, main') || document.body;
-        container.innerHTML = html;
+    // The offline appliance cannot reach Datto's cloud, so the native
+    // connectivity probe never succeeds. Report connected and let the update
+    // pane's own channel check be the real connectivity test.
+    RegisterWizard.prototype.checkNetworkConnectivity = function () {
+        this.networkConnected = true;
+        if (this.$checkingNetworkMessage) { this.$checkingNetworkMessage.hide(); }
+        if (this.$networkFailMessage) { this.$networkFailMessage.hide(); }
+    };
+
+    // Replace the native update pane (which drives Datto's upgradectl) with one
+    // that checks the signed Recovera channel and installs a newer release
+    // before registration continues. Pane order is unchanged: it is added here,
+    // before the name pane, exactly where the native wizard places it.
+    RegisterWizard.prototype.initUpdatePane = function () {
+        var self = this;
+        var pane = {
+            validate: function (pass) { pass(); },
+            events: {
+                beforeLoad: function () { self.$navNext.prop('disabled', true); },
+                afterLoad: function () { recoveraRunUpdate(self); }
+            }
+        };
+        self.addPane(pane);
+        self.$upgradeStage = $('#stageUpgradectl');
+        self.$updateProgressBar = $('#updateProgressBar');
+        self.$regErrorAlert = $('#regErrorAlert');
+        self.$noRebootAlert = $('#noRebootAlert');
+        self.$checkingNetworkMessage = $('#checkingNetworkMessage');
+        self.$networkFailMessage = $('#networkFailMessage');
+        self.$upgradePending = self.$upgradeStage.find('.stagePending');
+        self.$upgradeComplete = self.$upgradeStage.find('.stageComplete');
+    };
+
+    function recoveraPending(self, text) {
+        if (self.$checkingNetworkMessage) { self.$checkingNetworkMessage.hide(); }
+        if (self.$regErrorAlert) { self.$regErrorAlert.hide(); }
+        self.$upgradeStage.removeClass('complete stageError');
+        self.$upgradePending.html(
+            '<i class="fa-regular fa-spinner-third fa-spin text-primary me-1"></i><span></span>'
+        );
+        self.$upgradePending.find('span').text(text);
+        self.$upgradePending.show();
+        self.updateProgressBarAnimation(true);
     }
 
-    function checkAndInstallUpdate(fallback) {
-        recoveraUpdateApi('update-check').done(function (value) {
-            const release = value && value.release && value.release.available ? value.release : null;
-            if (!release) { fallback(); return; }
-            // Fire the signed install (download + verify + install + reboot) and
-            // show a waiting message; the appliance reboots into the new version.
-            recoveraUpdateApi('update-install', 'POST');
-            showUpdatingMessage(release.version);
-        }).fail(function () { fallback(); });
+    function recoveraComplete(self, text) {
+        self.$upgradeStage.addClass('complete');
+        if (text) { self.$upgradeComplete.text(text); }
+        self.updateProgressBarAnimation(false);
+        self.$navNext.prop('disabled', false);
     }
 
-    // Replace only the final submission. The server-side finalizer invokes the
-    // appliance's native RegistrationService with its cloud call stubbed locally.
+    // The update step must never trap the user: on any failure, surface the
+    // reason but allow registration to continue (the hourly updater retries).
+    function recoveraSoftError(self, text) {
+        self.$upgradeStage.addClass('stageError');
+        self.$upgradePending.text(text);
+        self.updateProgressBarAnimation(false);
+        self.$navNext.prop('disabled', false);
+    }
+
+    function recoveraRunUpdate(self) {
+        recoveraPending(self, 'Checking for updates…');
+        recoveraUpdateApi('check').done(function (value) {
+            var release = value && value.release;
+            if (!release || !release.available) {
+                recoveraComplete(self, 'Recovera is up to date.');
+                return;
+            }
+            var target = String(release.version);
+            recoveraPending(self, 'Installing Recovera ' + target + '…');
+            recoveraUpdateApi('install', 'POST').always(function () {
+                // install runs synchronously server-side, then php-fpm restarts
+                // ~5s later; tolerate the brief outage while polling the version.
+                recoveraPollInstalled(self, target, 48);
+            });
+        }).fail(function () {
+            recoveraSoftError(self, 'Could not reach the update service. You can continue; the appliance will update itself automatically later.');
+        });
+    }
+
+    function recoveraPollInstalled(self, target, triesLeft) {
+        recoveraUpdateApi('status').done(function (status) {
+            var installed = String(status.installed_version || '').split('-')[0];
+            if (installed === target) {
+                recoveraComplete(self, 'Updated to Recovera ' + target + '.');
+                return;
+            }
+            if (triesLeft <= 0) { recoveraComplete(self, 'Update applied.'); return; }
+            setTimeout(function () { recoveraPollInstalled(self, target, triesLeft - 1); }, 2500);
+        }).fail(function () {
+            // service restart (or reboot) window: keep polling; reload if it drags on
+            if (triesLeft <= 0) { location.reload(true); return; }
+            setTimeout(function () { recoveraPollInstalled(self, target, triesLeft - 1); }, 2500);
+        });
+    }
+
+    // Replace only the final submission: the server-side finalizer runs the
+    // appliance's native RegistrationService with its cloud call stubbed
+    // locally. The update step is now a wizard pane, so finish() no longer
+    // checks for updates here.
     RegisterWizard.prototype.finish = function (done) {
-        const self = this;
-        const user = self.$userName.val();
-        const password = self.$password.val();
-        const $deviceMigrationBox = $("#deviceMigrationRedirect");
+        var self = this;
+        var user = self.$userName.val();
+        var password = self.$password.val();
+        var $deviceMigrationBox = $('#deviceMigrationRedirect');
 
-        const pass = function () {
-            const params = {
+        var pass = function () {
+            var params = {
                 user: user,
                 password: password,
                 email: self.$email.val(),
@@ -666,24 +819,15 @@ PHP
                 dataType: 'json',
                 data: JSON.stringify(params)
             }).done(function () {
-                const formData = {};
+                var formData = {};
                 formData.username = user;
                 formData.password = password;
                 formData[self.context.csrfTokenId] = self.context.csrfToken;
-                const redirectUrl = $deviceMigrationBox.prop('checked') ?
+                var redirectUrl = $deviceMigrationBox.prop('checked') ?
                     self.context.urls.successDeviceMigration : self.context.urls.success;
-                const finishRegistration = function () {
+                $.post(self.context.loginPath, formData).always(function () {
                     self.close(redirectUrl);
                     done();
-                };
-                $.post(self.context.loginPath, formData).always(function () {
-                    // Device-migration restores keep the native redirect; a normal
-                    // registration checks for and installs updates first.
-                    if ($deviceMigrationBox.prop('checked')) {
-                        finishRegistration();
-                    } else {
-                        checkAndInstallUpdate(finishRegistration);
-                    }
                 });
             }).fail(function () {
                 self.displayValidation.setError(
@@ -710,9 +854,14 @@ JS
       if [[ "$f" == *commonlookandfeel* ]]; then asset=commonlookandfeel; else asset=vintage; fi
       sed -i "/RegisterWizard\.js/a\\    <script type=\"text/javascript\" src=\"{{ asset('$asset/js/App/Registration/OfflineRegister.js') }}\"></script>" "$f" || return 1
     fi
+    # Recovera checks the signed channel during registration: enable the
+    # native update pane in place and let OfflineRegister.js re-point it.
+    sed -i '/{% set updatePaneEnabled = /d' "$f" || return 1
+    sed -i "/^{% set panes = \\[\\] %}\$/i\\{% set updatePaneEnabled = true %} {# Recovera: check the signed channel during registration #}" "$f" || return 1
   done
 
   php -l /datto/web/offline-register.php >/dev/null || return 1
+  php -l /datto/web/offline-update.php >/dev/null || return 1
   if [ -d /var/cache/datto/device/prod/twig ]; then
     { find /var/cache/datto/device/prod/twig -type f -name '*.php' -exec \
       grep -lZ 'Registration/Register/index.html.twig' {} + 2>/dev/null || true; } | xargs -0 -r rm -f || return 1
