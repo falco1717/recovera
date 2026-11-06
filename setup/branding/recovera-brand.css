@@ -88,3 +88,25 @@
         white-space: nowrap;
     }
 }
+
+/* --- Mobile / small-screen layout: logged-in application --- */
+@media (max-width: 575.98px) {
+    /* clear the taller (wrapped) fixed nav so page titles are not hidden */
+    .siris-container.header-padding { padding-top: 96px !important; }
+    /* nothing forces the page wider than the phone screen */
+    img { max-width: 100%; height: auto; }
+    html, body { overflow-x: hidden; }
+    /* stack the page layout and any in-page settings sidebar full-width */
+    .siris-container .row.flex-nowrap { flex-wrap: wrap !important; }
+    .siris-container .row.flex-nowrap > * { flex: 0 0 100% !important; max-width: 100% !important; min-width: 0 !important; }
+    .dual-col-nav { width: 100% !important; max-width: 100% !important; position: static !important; }
+    /* stack dashboard cards and content columns one per row */
+    .single-col-content .row:not(.flex-nowrap) > .col,
+    .single-col-content .row:not(.flex-nowrap) > [class*="col-"] { flex: 0 0 100% !important; max-width: 100% !important; }
+    /* let toolbars, button rows and long titles wrap instead of overflowing */
+    .single-col-content .d-flex:not(.flex-nowrap) { flex-wrap: wrap; }
+    .single-col-content .d-flex.text-nowrap { white-space: normal !important; }
+    .single-col-content pre { white-space: pre-wrap; overflow-wrap: anywhere; }
+    /* wide tables scroll within their card rather than widening the page */
+    .siris-container .table { display: block; width: 100%; overflow-x: auto; }
+}
