@@ -60,3 +60,31 @@
     --bs-btn-hover-bg: #0879ae;
     --bs-btn-hover-border-color: #0879ae;
 }
+
+/* --- Mobile / small-screen layout (phones) --- */
+@media (max-width: 575.98px) {
+    /* Stack and center the wizard header so the brand and title stop crowding. */
+    .wizard-header {
+        flex-direction: column;
+        align-items: center;
+        text-align: center;
+        gap: .25rem;
+    }
+    .wizard-header #wizardTitle { font-size: 1.15rem; }
+    .recovera-wizard-brand { margin-right: 0; }
+
+    /* The 5-step progress bar cannot fit full labels on a phone, so show the
+       numbered circles and only the active step's label, centered below. */
+    .wizard-progress-bar { position: relative; padding-bottom: 1.7rem; }
+    .wizard-progress-bar .step-link-label { display: none !important; }
+    .wizard-progress-bar .step-link.active .step-link-label {
+        display: flex !important;
+        position: absolute;
+        left: 0;
+        right: 0;
+        bottom: 0;
+        justify-content: center;
+        font-weight: 600;
+        white-space: nowrap;
+    }
+}

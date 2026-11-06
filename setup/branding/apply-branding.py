@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import re
 import shutil
 import sys
@@ -12,6 +13,15 @@ from pathlib import Path
 
 ROOT = Path("/usr/lib/datto/device")
 WEB = Path("/datto/web")
+
+# Cache-bust the branding stylesheet so updated CSS reaches browsers that
+# already cached the previous copy (phones in particular).
+BRAND_CSS_SOURCE = Path(__file__).with_name("recovera-brand.css")
+CSS_VERSION = (
+    hashlib.sha1(BRAND_CSS_SOURCE.read_bytes()).hexdigest()[:10]
+    if BRAND_CSS_SOURCE.is_file()
+    else "1"
+)
 
 
 def update(path: Path, transform) -> bool:
@@ -27,11 +37,19 @@ def update(path: Path, transform) -> bool:
 
 def add_global_branding(text: str) -> str:
     needle = "</head>"
-    additions = ""
     css = "/commonlookandfeel/UI/css/recovera-brand.css"
+    css_link = f"{css}?v={CSS_VERSION}"
     device_settings = "/commonlookandfeel/js/App/Configure/RecoveraDeviceSettings.js"
-    if css not in text:
-        additions += f'    <link rel="stylesheet" href="{css}" />\n'
+    # Replace any existing recovera-brand.css link (any version) with the
+    # current cache-busted one; inject it if it is not present yet.
+    text, replaced = re.subn(
+        r'<link rel="stylesheet" href="/commonlookandfeel/UI/css/recovera-brand\.css(?:\?v=[^"]*)?" />',
+        f'<link rel="stylesheet" href="{css_link}" />',
+        text,
+    )
+    additions = ""
+    if replaced == 0:
+        additions += f'    <link rel="stylesheet" href="{css_link}" />\n'
     if device_settings not in text:
         additions += f'    <script defer src="{device_settings}"></script>\n'
     return text.replace(needle, additions + needle, 1) if additions else text
