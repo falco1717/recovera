@@ -61,6 +61,32 @@ derived value is unchanged) and `/datto/config/deviceID = <N>`, and re-pair.
    agent log; reissue the device cert CN=`<N>` with the same key; write `<N>` to
    `/datto/config/deviceID`; re-run `agent:add`.
 
+## Moving an agent between Recovera appliances
+
+Updated agents run `recovera-agent-transfer.service` on TCP 25569. The service
+uses the existing mutual-TLS pairing certificates, so only the appliance that
+currently owns an agent can release it. The Recovera removal dialog performs
+that release before it deletes the appliance asset. The service refuses to
+release while a dattobd backup snapshot is active, backs up `agent.sqlite`, and
+removes only the old `device` and `sirisAssetId` ownership records.
+
+Install the transfer service on an already protected Linux system without
+changing its pairing certificates:
+
+```bash
+sudo agents/linux/install-recovera-agent-transfer.sh
+```
+
+If an agent was force-removed or its old appliance no longer exists, release it
+locally before protecting it from the replacement appliance:
+
+```bash
+sudo recovera-agent-transfer release
+```
+
+The appliance removal dialog warns before allowing a removal to continue when
+the agent is offline or does not yet have the transfer service.
+
 ## Files I changed on the live hosts (2026-11-04, reversible)
 
 - **jprod-sb** `/etc/datto/dla/config.json` (`certCheck`/`checkin` off, backup at

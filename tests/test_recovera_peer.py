@@ -52,6 +52,8 @@ def load_module(root: Path):
     os.environ["RECOVERA_UPGRADE_CONFIG"] = str(root / "upgrade.conf")
     os.environ["RECOVERA_UPGRADE_TOKEN"] = str(root / "github-token")
     os.environ["RECOVERA_UPGRADE_POLICY"] = str(root / "update-policy.json")
+    os.environ["RECOVERA_AGENT_CERT_DIR"] = str(root / "certs")
+    os.environ["RECOVERA_DEVICE_ID"] = str(root / "deviceID")
     loader = importlib.machinery.SourceFileLoader("recovera_peer_test", str(SCRIPT))
     spec = importlib.util.spec_from_loader(loader.name, loader)
     module = importlib.util.module_from_spec(spec)
@@ -80,6 +82,18 @@ class RecoveraPeerTests(unittest.TestCase):
         self.assertNotIn("ThreadingHTTPServer", source)
         self.assertNotIn("9443", source)
         self.assertIn("Use /configure/offsite-target on the Recovera WebUI", source)
+        controller = CONTROLLER.read_text(encoding="utf-8")
+        self.assertIn("'agent-release' => ['POST', '/v1/admin/agent/release']", controller)
+
+    def test_agent_address_uses_exact_asset_row_not_duplicate_display_name(self):
+        asset = "a" * 32
+        output = (
+            "+---+---+\n"
+            f"| {asset} | 10.0.3.44 | uuid | rj-or-sb | DLA | no | no | no | path |\n"
+        ).encode()
+        completed = mock.Mock(returncode=0, stdout=output, stderr=b"")
+        with mock.patch.object(self.peer, "run", return_value=completed):
+            self.assertEqual(self.peer.agent_address(asset), "10.0.3.44")
 
     def test_peer_service_defaults_to_unix_socket_without_tcp_listener(self):
         config = self.peer.default_config()

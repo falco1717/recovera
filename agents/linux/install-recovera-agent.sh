@@ -54,6 +54,14 @@ sleep 3
 systemctl is-active --quiet dlad && echo "dlad active; agent ready for pairing." \
   || { echo "dlad failed to start — check journalctl -u dlad" >&2; exit 1; }
 
+TRANSFER_INSTALLER="$SCRIPT_DIR/install-recovera-agent-transfer.sh"
+if [ -s "$TRANSFER_INSTALLER" ]; then
+  echo "Installing Recovera agent ownership transfer service"
+  bash "$TRANSFER_INSTALLER"
+else
+  echo "WARNING: Recovera transfer-service files were not found next to the installer; agent moves will require 'recovera-agent-transfer release' locally." >&2
+fi
+
 # --- COW reserved-space watcher -------------------------------------------
 # dlad configures the dattobd snapshot driver to keep ~15% of the volume free
 # before it will auto-expand the COW file. On a volume that is more than half

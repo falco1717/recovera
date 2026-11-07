@@ -73,6 +73,27 @@ class RecoveraUpgradeTests(unittest.TestCase):
         with self.assertRaises(self.module.UpgradeError):
             self.module.validate_manifest(self.manifest(), pointer, config)
 
+    def test_appliance_package_carries_agent_transfer_installer(self):
+        builder = (ROOT / "tools" / "build-recovera-appliance-deb.sh").read_text()
+        self.assertIn('install -m 0755 "$ROOT/agents/linux/$file"', builder)
+        self.assertIn("$stage/usr/share/recovera/agents/linux/", builder)
+
+    def test_status_hides_cached_release_after_that_sequence_is_installed(self):
+        state = {
+            "installed_sequence": 24,
+            "available": {
+                "available": True,
+                "version": "0.6.24",
+                "sequence": 24,
+                "current_version": "0.6.23",
+            },
+        }
+        with mock.patch.object(self.module, "read_json", return_value=state):
+            result = self.module.status_state({"version": "0.6.24", "sequence": 24})
+        self.assertFalse(result["available"]["available"])
+        self.assertEqual(result["available"]["current_version"], "0.6.24")
+        self.assertTrue(state["available"]["available"])
+
     def test_manifest_rejects_path_traversal_asset(self):
         manifest = self.manifest()
         manifest["image"]["parts"][0]["name"] = "../image.part"

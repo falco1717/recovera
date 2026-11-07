@@ -1,0 +1,150 @@
+#!/usr/bin/env python3
+"""Safely release a Linux agent from its current Recovera appliance."""
+from __future__ import annotations
+
+import argparse
+import fcntl
+import http.server
+import json
+import os
+import shutil
+import socket
+import sqlite3
+import ssl
+import subprocess
+import time
+from pathlib import Path
+
+
+DB = Path(os.environ.get("RECOVERA_AGENT_DB", "/etc/datto/dla/agent.sqlite"))
+CERT_DIR = Path(os.environ.get("RECOVERA_AGENT_CERTS", "/etc/datto/dla/certs"))
+LOCK = Path(os.environ.get("RECOVERA_AGENT_TRANSFER_LOCK", "/run/recovera-agent-transfer.lock"))
+PORT = int(os.environ.get("RECOVERA_AGENT_TRANSFER_PORT", "25569"))
+
+
+class ReleaseError(RuntimeError):
+    pass
+
+
+def run(command: list[str], *, check: bool = True) -> subprocess.CompletedProcess[bytes]:
+    return subprocess.run(command, check=check, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+
+def paired_device() -> int | None:
+    with sqlite3.connect(DB) as database:
+        row = database.execute("SELECT id FROM device LIMIT 1").fetchone()
+    return int(row[0]) if row else None
+
+
+def active_snapshots() -> bool:
+    try:
+        value = json.loads(Path("/proc/datto-info").read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return False
+    except (json.JSONDecodeError, OSError) as exc:
+        raise ReleaseError("could not verify whether a backup snapshot is active") from exc
+    devices = value.get("devices", []) if isinstance(value, dict) else []
+    return bool(devices)
+
+
+def release_enrollment(expected_device: int | None = None) -> dict[str, object]:
+    if os.geteuid() != 0:
+        raise ReleaseError("this command must run as root")
+    LOCK.parent.mkdir(parents=True, exist_ok=True)
+    with LOCK.open("a+", encoding="ascii") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        current = paired_device()
+        if current is None:
+            return {"released": True, "previous_device_id": None, "already_released": True}
+        if expected_device is not None and current != expected_device:
+            raise ReleaseError("the requesting appliance does not own this agent")
+        if active_snapshots():
+            raise ReleaseError("the agent has an active backup snapshot; finish or cancel it before removal")
+
+        backup = DB.with_name(f"{DB.name}.before-release-{int(time.time())}")
+        shutil.copy2(DB, backup)
+        was_active = run(["systemctl", "is-active", "--quiet", "dlad"], check=False).returncode == 0
+        if was_active:
+            run(["systemctl", "stop", "dlad"])
+        try:
+            with sqlite3.connect(DB) as database:
+                database.execute("BEGIN IMMEDIATE")
+                database.execute("DELETE FROM device")
+                database.execute("DELETE FROM config WHERE key = 'sirisAssetId'")
+                database.commit()
+        finally:
+            if was_active:
+                run(["systemctl", "start", "dlad"])
+        return {"released": True, "previous_device_id": current,
+                "backup": str(backup), "already_released": False}
+
+
+def certificate_common_name(handler: http.server.BaseHTTPRequestHandler) -> str | None:
+    certificate = handler.connection.getpeercert()
+    for relative_name in certificate.get("subject", ()):  # type: ignore[union-attr]
+        for key, value in relative_name:
+            if key == "commonName":
+                return str(value)
+    return None
+
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    server_version = "RecoveraAgentTransfer/1"
+
+    def log_message(self, message: str, *args: object) -> None:
+        print(f"{self.client_address[0]} - {message % args}", flush=True)
+
+    def reply(self, status: int, value: dict[str, object]) -> None:
+        payload = json.dumps(value, sort_keys=True).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def do_GET(self) -> None:
+        if self.path != "/v1/status":
+            self.reply(404, {"error": "not found"})
+            return
+        self.reply(200, {"service": "recovera-agent-transfer", "device_id": paired_device()})
+
+    def do_POST(self) -> None:
+        if self.path != "/v1/release":
+            self.reply(404, {"error": "not found"})
+            return
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+            if not 0 < length <= 4096:
+                raise ReleaseError("invalid request size")
+            value = json.loads(self.rfile.read(length))
+            device_id = int(value["device_id"])
+            if certificate_common_name(self) != str(device_id):
+                raise ReleaseError("client certificate does not match the requesting appliance")
+            self.reply(200, release_enrollment(device_id))
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError, ReleaseError) as exc:
+            self.reply(409, {"error": str(exc)})
+
+
+def serve() -> None:
+    if os.geteuid() != 0:
+        raise ReleaseError("this command must run as root")
+    context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH, cafile=str(CERT_DIR / "ca.crt"))
+    context.verify_mode = ssl.CERT_REQUIRED
+    context.check_hostname = False
+    context.load_cert_chain(str(CERT_DIR / "server.pem"), str(CERT_DIR / "server.key"))
+    server = http.server.ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
+    server.socket = context.wrap_socket(server.socket, server_side=True)
+    server.serve_forever()
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(prog="recovera-agent-transfer")
+    parser.add_argument("command", choices=("serve", "release"))
+    arguments = parser.parse_args()
+    try:
+        if arguments.command == "serve":
+            serve()
+        else:
+            print(json.dumps(release_enrollment(), sort_keys=True))
+    except ReleaseError as error:
+        parser.error(str(error))

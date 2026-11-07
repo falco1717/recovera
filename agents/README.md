@@ -28,6 +28,11 @@ sudo recovera/provision-agent-pki.sh ./pki/recovera
 sudo snapctl agent:add <agent_ip> --offsiteTarget noOffsite
 ```
 
+For existing protected Linux systems, install the ownership-transfer helper
+once with `sudo agents/linux/install-recovera-agent-transfer.sh`. Future
+removals then release the agent automatically so another Recovera appliance can
+protect it without clearing its local database by hand.
+
 The private CA key (`pki/ca/ca.key`) and all `*.key` files are secrets — keep
 them off the appliances and out of git (see `.gitignore`). The CA impersonates
 the *name* `dla.ca.datto.com` for one isolated lab only; it is not a production
