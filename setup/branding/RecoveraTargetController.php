@@ -62,6 +62,7 @@ final class RecoveraTargetController extends AbstractController
             'update-policy' => [$request->isMethod('POST') ? 'POST' : 'GET', '/v1/admin/update/policy'],
             'storage-status' => ['GET', '/v1/admin/storage/status'],
             'storage-expand' => ['POST', '/v1/admin/storage/expand'],
+            'replication-activity' => ['GET', '/v1/admin/replication-activity'],
         ];
         if (!isset($map[$operation])) {
             return new JsonResponse(['error' => 'Unknown operation'], 404);

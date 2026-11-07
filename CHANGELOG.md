@@ -1,5 +1,20 @@
 # Changelog
 
+## v0.6.29 - 2026-11-07
+
+- The native **Synchronize** page now shows Recovera appliance-to-appliance
+  replication, which runs outside SpeedSync and was previously invisible
+  there. A live panel lists each active transfer in either direction with the
+  protected system, the paired appliance (name and address), recovery point,
+  transfer type, bytes moved, total size and percentage when known, current
+  speed, and estimated time remaining, plus interrupted transfers and the last
+  completed or failed replication per asset. It refreshes every five seconds.
+- `recovera-peer` records in-flight sends and receives and serves them at the
+  admin-only `/v1/admin/replication-activity` endpoint. Progress is read from
+  the `zfs send`/`zfs receive` process I/O counters, so the replication stream
+  itself is unchanged. Transfers started by older versions are discovered too,
+  and a resumed send counts the bytes already on the target.
+
 ## v0.6.28 - 2026-11-07
 
 - Backup-storage expansion now reconciles an already-expanded GPT with the

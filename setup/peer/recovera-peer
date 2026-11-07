@@ -26,10 +26,11 @@ import ssl
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import uuid
 from pathlib import Path
-from typing import Any, BinaryIO
+from typing import Any, BinaryIO, Callable
 
 VERSION_PATH = Path(os.environ.get(
     "RECOVERA_VERSION_PATH", "/usr/local/share/recovera/VERSION"
@@ -104,6 +105,13 @@ MIN_RETENTION_HOURS = 24
 MAX_RETENTION_HOURS = 240_000
 ZFS_RESERVED_PARTITION_TYPE = "6a945a3b-1dd2-11b2-99a6-080020736631"
 MIN_STORAGE_GROWTH = 16 * 1024 * 1024
+# Live transfer records let the WebUI show replication that is still in
+# flight; byte counters are read from the zfs send/receive processes.
+TRANSFER_DIR = STATE_DIR / "transfers"
+PROC_ROOT = Path(os.environ.get("RECOVERA_PROC_ROOT", "/proc"))
+TRANSFER_RECORD_MAX_AGE = 24 * 3600
+_RATE_SAMPLES: dict[tuple[int, str], tuple[float, int]] = {}
+_RATE_LOCK = threading.Lock()
 
 
 class PeerError(RuntimeError):
@@ -472,19 +480,33 @@ def asset_identifiers(asset: str) -> set[str]:
     return {str(value).strip().casefold() for value in values if value}
 
 
-def asset_display_name(asset: str) -> str:
-    path = KEYS_DIR / f"{validate_asset(asset)}.agentInfo"
-    try:
-        raw = path.read_bytes()
-    except OSError:
-        return asset
+def agent_info_display_name(raw: bytes) -> str | None:
     with contextlib.suppress(json.JSONDecodeError, UnicodeDecodeError):
         document = json.loads(raw.decode("utf-8"))
         if isinstance(document, dict):
             for key in ("name", "hostname"):
                 if document.get(key):
                     return str(document[key])
-    return serialized_string(raw, "name") or serialized_string(raw, "hostname") or asset
+    return serialized_string(raw, "name") or serialized_string(raw, "hostname")
+
+
+def asset_display_name(asset: str) -> str:
+    path = KEYS_DIR / f"{validate_asset(asset)}.agentInfo"
+    try:
+        raw = path.read_bytes()
+    except OSError:
+        return asset
+    return agent_info_display_name(raw) or asset
+
+
+def metadata_display_name(metadata: dict[str, Any]) -> str | None:
+    """Name a replicated asset from its incoming agentInfo before installation."""
+    encoded = (metadata.get("files") or {}).get("agentInfo")
+    if not isinstance(encoded, str):
+        return None
+    with contextlib.suppress(ValueError):
+        return agent_info_display_name(base64.b64decode(encoded))
+    return None
 
 
 def agent_address(asset: str) -> str:
@@ -1132,9 +1154,14 @@ def encode_metadata(metadata: dict[str, Any]) -> str:
 
 
 def transfer_stream(send_command: list[str], peer: dict[str, Any], remote_command: list[str],
-                    speed_kbps: int = 0) -> None:
+                    speed_kbps: int = 0,
+                    on_start: Callable[[int], None] | None = None) -> None:
     sender = subprocess.Popen(send_command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     assert sender.stdout is not None
+    if on_start:
+        # Progress reporting must never interrupt the replication stream.
+        with contextlib.suppress(Exception):
+            on_start(sender.pid)
     stream = sender.stdout
     limiter = None
     if speed_kbps > 0:
@@ -1210,24 +1237,44 @@ def replicate(asset: str, peer_id: str, snapshot: str | None = None,
         )
     metadata = encode_metadata(collect_metadata(asset, cfg))
     resume_token = remote.get("resume_token")
+    base: str | None = None
+    bytes_before = 0
     if resume_token:
-        transfer_stream(["zfs", "send", "-t", str(resume_token)], peer,
-                        ["receive-resume", asset, snapshot, metadata], speed_kbps)
+        send_command = ["zfs", "send", "-t", str(resume_token)]
+        remote_command = ["receive-resume", asset, snapshot, metadata]
         mode = "resumed"
+        remaining = zfs_send_resume_estimate(str(resume_token))
+        if estimate and 0 < remaining < estimate:
+            bytes_before = estimate - remaining
     else:
         common = [value for value in local if value in remote_snaps]
         if remote_snaps and not common:
             raise PeerError("target has no common base snapshot; a controlled reseed is required")
         if common:
             base = common[-1]
-            transfer_stream(["zfs", "send", "-I", f"{dataset}@{base}", f"{dataset}@{snapshot}"],
-                            peer, ["receive", asset, snapshot, base, metadata], speed_kbps)
+            send_command = ["zfs", "send", "-I", f"{dataset}@{base}", f"{dataset}@{snapshot}"]
+            remote_command = ["receive", asset, snapshot, base, metadata]
             mode = f"incremental-from-{base}"
         else:
-            transfer_stream(["zfs", "send", f"{dataset}@{snapshot}"], peer,
-                            ["receive", asset, snapshot, "-", metadata], speed_kbps)
+            send_command = ["zfs", "send", f"{dataset}@{snapshot}"]
+            remote_command = ["receive", asset, snapshot, "-", metadata]
             mode = "full"
     key = f"{peer_id}:{asset}"
+    record = {
+        "direction": "outbound", "asset": asset, "name": asset_display_name(asset),
+        "peer_id": peer_id, "peer_name": str(peer.get("name") or peer.get("host") or peer_id),
+        "snapshot": snapshot, "base": base, "mode": mode, "bytes_total": estimate,
+        "bytes_before": bytes_before, "started": int(time.time()), "pid": None,
+    }
+
+    def started(pid: int) -> None:
+        record["pid"] = pid
+        write_transfer_record("outbound", key, record)
+
+    try:
+        transfer_stream(send_command, peer, remote_command, speed_kbps, on_start=started)
+    finally:
+        clear_transfer_record("outbound", key)
     with locked_state() as value:
         value.setdefault("assets", {})[key] = {"last_success": int(time.time()),
             "last_snapshot": snapshot, "mode": mode, "error": None,
@@ -1250,6 +1297,14 @@ def zfs_send_estimate(dataset: str, snapshot: str, local: list[str],
         command += ["-I", f"{dataset}@{common[-1]}"]
     command.append(f"{dataset}@{snapshot}")
     result = run(command, check=False, timeout=60)
+    text = (result.stdout + result.stderr).decode(errors="replace")
+    matches = re.findall(r"(?:size|total estimated size is)\s+([0-9]+)", text)
+    return int(matches[-1]) if result.returncode == 0 and matches else 0
+
+
+def zfs_send_resume_estimate(token: str) -> int:
+    """Estimate the bytes still to send for a resumable stream (0 if unknown)."""
+    result = run(["zfs", "send", "-nP", "-t", token], check=False, timeout=60)
     text = (result.stdout + result.stderr).decode(errors="replace")
     matches = re.findall(r"(?:size|total estimated size is)\s+([0-9]+)", text)
     return int(matches[-1]) if result.returncode == 0 and matches else 0
@@ -1298,10 +1353,25 @@ def receive_dataset(source_id: str, asset: str, snapshot: str, base: str,
             "source_id": source_id, "snapshot": snapshot,
             "status": "receiving", "updated": int(time.time()),
         }
-    proc = subprocess.run(["zfs", "receive", "-u", "-s", dataset], stdin=stream,
-                          stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    record = {
+        "direction": "inbound", "asset": asset,
+        "name": metadata_display_name(metadata) or asset_display_name(asset),
+        "source_id": source_id, "source_name": metadata["source_name"],
+        "snapshot": snapshot, "base": None if base == "-" else base,
+        "mode": "resumed" if resume else ("full" if base == "-" else f"incremental-from-{base}"),
+        "started": int(time.time()), "pid": None,
+    }
+    proc = subprocess.Popen(["zfs", "receive", "-u", "-s", dataset], stdin=stream,
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    record["pid"] = proc.pid
+    with contextlib.suppress(Exception):
+        write_transfer_record("inbound", asset, record)
+    try:
+        _, receive_err = proc.communicate()
+    finally:
+        clear_transfer_record("inbound", asset)
     if proc.returncode != 0:
-        raise PeerError(f"zfs receive failed: {proc.stderr.decode(errors='replace').strip()}")
+        raise PeerError(f"zfs receive failed: {receive_err.decode(errors='replace').strip()}")
     run(["zfs", "set", "canmount=on", dataset])
     run(["zfs", "set", f"mountpoint=/home/agents/{asset}", dataset])
     run(["zfs", "set", "readonly=on", dataset])
@@ -1686,6 +1756,222 @@ def recovery_readiness(cfg: dict[str, Any], item: dict[str, Any]) -> dict[str, A
                            "mountpoint": values.get("mountpoint")}}
 
 
+def _transfer_record_path(direction: str, key: str) -> Path:
+    safe = re.sub(r"[^A-Za-z0-9_.-]", "_", key)
+    return TRANSFER_DIR / f"{direction}-{safe}.json"
+
+
+def write_transfer_record(direction: str, key: str, record: dict[str, Any]) -> None:
+    atomic_json(_transfer_record_path(direction, key), record | {"updated": int(time.time())})
+
+
+def clear_transfer_record(direction: str, key: str) -> None:
+    with contextlib.suppress(OSError):
+        _transfer_record_path(direction, key).unlink()
+
+
+def _proc_cmdline(pid: int) -> list[str]:
+    try:
+        raw = (PROC_ROOT / str(pid) / "cmdline").read_bytes()
+    except OSError:
+        return []
+    return [part.decode("utf-8", "replace") for part in raw.split(b"\0") if part]
+
+
+def _proc_io(pid: int) -> dict[str, int]:
+    values: dict[str, int] = {}
+    try:
+        text = (PROC_ROOT / str(pid) / "io").read_text(encoding="ascii", errors="replace")
+    except OSError:
+        return values
+    for line in text.splitlines():
+        name, _, number = line.partition(":")
+        with contextlib.suppress(ValueError):
+            values[name.strip()] = int(number)
+    return values
+
+
+def _proc_start(pid: int) -> tuple[str, float | None]:
+    """Return a stable start token and the start time (epoch) of a process."""
+    try:
+        stat = (PROC_ROOT / str(pid) / "stat").read_text(encoding="ascii", errors="replace")
+        ticks = stat.rsplit(")", 1)[1].split()[19]
+    except (OSError, IndexError):
+        return "", None
+    boot = None
+    with contextlib.suppress(OSError, ValueError):
+        for line in (PROC_ROOT / "stat").read_text(encoding="ascii").splitlines():
+            if line.startswith("btime "):
+                boot = int(line.split()[1])
+    hertz = 100
+    with contextlib.suppress(AttributeError, ValueError, OSError):
+        hertz = int(os.sysconf("SC_CLK_TCK"))
+    if boot is None or not ticks.isdigit():
+        return ticks, None
+    return ticks, boot + int(ticks) / hertz
+
+
+def _zfs_transfer_process(argv: list[str]) -> tuple[str, str, str] | None:
+    """Classify a zfs send/receive command line as (direction, dataset, mode)."""
+    if len(argv) < 3 or Path(argv[0]).name != "zfs":
+        return None
+    options = [value for value in argv[2:] if value.startswith("-") and not value.startswith("--")]
+    if argv[1] == "send":
+        # zfs send -n is a size estimate, not a transfer.
+        if any("n" in value[1:] for value in options if value not in ("-I", "-i", "-t")):
+            return None
+        target = next((value for value in reversed(argv[2:]) if "@" in value), "")
+        mode = "resumed" if "-t" in argv else ("incremental" if "-I" in argv or "-i" in argv else "full")
+        return "outbound", target.split("@", 1)[0], mode
+    if argv[1] in ("receive", "recv"):
+        # -s only makes a receive resumable; whether it is a seed, an increment
+        # or a resume is known from the transfer record, not the command line.
+        return "inbound", argv[-1], ""
+    return None
+
+
+def _transfer_rate(pid: int, token: str, moved: int, started: float | None) -> float:
+    """Bytes per second since the previous poll, or the average since start."""
+    now = time.time()
+    with _RATE_LOCK:
+        previous = _RATE_SAMPLES.get((pid, token))
+        _RATE_SAMPLES[(pid, token)] = (now, moved)
+        if len(_RATE_SAMPLES) > 64:
+            for stale in sorted(_RATE_SAMPLES, key=lambda key: _RATE_SAMPLES[key][0])[:-32]:
+                _RATE_SAMPLES.pop(stale, None)
+    if previous and 1 <= now - previous[0] <= 120 and moved >= previous[1]:
+        return (moved - previous[1]) / (now - previous[0])
+    if started and now > started:
+        return moved / (now - started)
+    return 0.0
+
+
+def _transfer_records() -> list[dict[str, Any]]:
+    found: list[dict[str, Any]] = []
+    with contextlib.suppress(OSError):
+        for path in sorted(TRANSFER_DIR.glob("*.json")):
+            with contextlib.suppress(PeerError, OSError):
+                value = load_json(path, None)
+                if isinstance(value, dict):
+                    found.append(value | {"_path": path})
+    return found
+
+
+def replication_activity() -> dict[str, Any]:
+    """Describe in-flight and recent appliance replication for the WebUI."""
+    cfg = config()
+    root = cfg["source_root"].rstrip("/") + "/"
+    current = state()
+    received = current.get("received", {})
+    sources = cfg.get("sources", {})
+    peers = cfg.get("peers", {})
+    records = _transfer_records()
+    by_pid = {int(item["pid"]): item for item in records if str(item.get("pid") or "").isdigit()}
+    active: dict[str, list[dict[str, Any]]] = {"outbound": [], "inbound": []}
+    live_pids: set[int] = set()
+    try:
+        pids = sorted(int(entry.name) for entry in PROC_ROOT.iterdir() if entry.name.isdigit())
+    except OSError:
+        pids = []
+    for pid in pids:
+        found = _zfs_transfer_process(_proc_cmdline(pid))
+        if not found:
+            continue
+        direction, dataset, discovered_mode = found
+        record = by_pid.get(pid, {})
+        if record.get("direction") not in (None, direction):
+            record = {}
+        asset = str(record.get("asset") or (dataset[len(root):] if dataset.startswith(root) else ""))
+        if not ASSET_RE.fullmatch(asset):
+            continue
+        live_pids.add(pid)
+        token, process_started = _proc_start(pid)
+        counters = _proc_io(pid)
+        moved = counters.get("wchar" if direction == "outbound" else "rchar", 0)
+        done = int(record.get("bytes_before") or 0) + moved
+        total = int(record.get("bytes_total") or 0)
+        rate = _transfer_rate(pid, token, moved, process_started)
+        item: dict[str, Any] = {
+            "status": "transferring", "asset": asset,
+            "name": record.get("name") or asset_display_name(asset),
+            "snapshot": record.get("snapshot"), "mode": record.get("mode") or discovered_mode or None,
+            "started": record.get("started") or (int(process_started) if process_started else None),
+            "bytes_done": done, "bytes_total": total or None,
+            "percent": round(min(100.0, done * 100 / total), 1) if total else None,
+            "rate_bps": int(rate),
+            "eta_seconds": int((total - done) / rate) if total > done and rate > 0 else None,
+        }
+        if direction == "outbound":
+            peer_id = str(record.get("peer_id") or "")
+            item |= {"peer_id": peer_id or None,
+                     "peer_name": record.get("peer_name") or peers.get(peer_id, {}).get("name"),
+                     "peer_address": peers.get(peer_id, {}).get("host")}
+        else:
+            receiving = received.get(asset, {})
+            source_id = str(record.get("source_id") or receiving.get("source_id") or "")
+            source = sources.get(source_id, {})
+            item |= {"source_id": source_id or None,
+                     "source_name": record.get("source_name") or source.get("name")
+                     or source.get("address"),
+                     "source_address": source.get("address"),
+                     "snapshot": item["snapshot"] or receiving.get("snapshot")}
+        active[direction].append(item)
+
+    now = int(time.time())
+    for record in records:
+        pid = record.get("pid")
+        if str(pid or "").isdigit() and int(pid) in live_pids:
+            continue
+        if now - int(record.get("updated") or 0) > TRANSFER_RECORD_MAX_AGE:
+            with contextlib.suppress(OSError):
+                record["_path"].unlink()
+            continue
+        direction = record.get("direction")
+        if direction in active and not any(item["asset"] == record.get("asset")
+                                           for item in active[direction]):
+            active[direction].append({key: value for key, value in record.items()
+                                      if not key.startswith("_") and key != "pid"}
+                                     | {"status": "interrupted"})
+    for asset, item in received.items():
+        if (item.get("status") == "receiving" and ASSET_RE.fullmatch(str(asset))
+                and not any(entry["asset"] == asset for entry in active["inbound"])):
+            source = sources.get(str(item.get("source_id")), {})
+            active["inbound"].append({
+                "status": "interrupted", "asset": asset, "name": asset_display_name(asset),
+                "snapshot": item.get("snapshot"), "source_id": item.get("source_id"),
+                "source_name": source.get("name") or source.get("address"),
+                "source_address": source.get("address"), "updated": item.get("updated"),
+            })
+
+    recent_outbound = []
+    for key, item in current.get("assets", {}).items():
+        peer_id, _, asset = str(key).partition(":")
+        if not ASSET_RE.fullmatch(asset):
+            continue
+        recent_outbound.append({
+            "asset": asset, "name": asset_display_name(asset), "peer_id": peer_id,
+            "peer_name": peers.get(peer_id, {}).get("name") or peer_id,
+            "peer_address": peers.get(peer_id, {}).get("host"),
+            **{field: item.get(field) for field in (
+                "last_success", "last_snapshot", "mode", "error", "consecutive_failures",
+                "next_retry")},
+        })
+    recent_inbound = []
+    for asset, item in received.items():
+        if item.get("status") != "ready" or not ASSET_RE.fullmatch(str(asset)):
+            continue
+        source = sources.get(str(item.get("source_id")), {})
+        recent_inbound.append({
+            "asset": asset, "name": asset_display_name(asset),
+            "source_name": source.get("name") or source.get("address"),
+            "source_address": source.get("address"),
+            "snapshot": item.get("snapshot"), "updated": item.get("updated"),
+        })
+    return {"generated": now, "appliance": cfg.get("name"), "active": active,
+            "recent_outbound": recent_outbound, "recent_inbound": recent_inbound,
+            "paired": {"targets": len(peers), "sources": len(sources)}}
+
+
 def status_document() -> dict[str, Any]:
     cfg = config()
     local_assets = assets_local(cfg)
@@ -1888,7 +2174,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             elif self.path in ("/v1/admin/status", "/v1/admin/queue-status", "/v1/admin/offsite",
                                 "/v1/admin/backup-admin-credential", "/v1/admin/update/status",
                                 "/v1/admin/update/check", "/v1/admin/update/policy",
-                                "/v1/admin/storage/status"):
+                                "/v1/admin/storage/status", "/v1/admin/replication-activity"):
                 if not self.admin():
                     return
                 if self.path == "/v1/admin/status":
@@ -1905,6 +2191,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     self.reply(200, {"policy": upgrade_policy()})
                 elif self.path == "/v1/admin/storage/status":
                     self.reply(200, storage_expand_status())
+                elif self.path == "/v1/admin/replication-activity":
+                    self.reply(200, replication_activity())
                 else:
                     self.reply(200, {"schedules": offsite()["schedules"],
                                      "averages": weekly_averages()})

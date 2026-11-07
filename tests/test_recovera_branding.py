@@ -120,6 +120,39 @@ canOffsite: {{ canOffsite|json_encode|raw }}
         self.assertIn("inWizard or feature.isSupported('FEATURE_OFFSITE')", patched)
         self.assertEqual(branding.patch_replication_pane(patched), patched)
 
+    def test_synchronize_page_shows_recovera_replication_once(self):
+        branding = load_module()
+        modern = """{% block scripts %}
+    <script type="text/javascript" src="{{ asset('commonlookandfeel/js/App/Synchronize/SynchronizeView.js') }}"></script>
+    <script type="text/javascript" src="{{ asset('commonlookandfeel/js/App/Synchronize/ReplicationStatusView.js') }}"></script>
+{% endblock %}
+{% block content %}
+    <div id="synchronizeBody">
+        <div class="row">
+"""
+        vintage = """{% block scripts %}
+    <script>var x = 1;</script>
+{% endblock %}
+{% block content %}
+    <div class="row"></div>
+{% endblock %}
+"""
+        for source in (modern, vintage):
+            patched = branding.patch_synchronize_template(source)
+            self.assertEqual(patched.count("RecoveraSynchronize.js"), 1)
+            self.assertEqual(patched.count('id="recovera-sync-panel"'), 1)
+            self.assertEqual(branding.patch_synchronize_template(patched), patched)
+            self.assertIn("RecoveraSynchronize.js", patched.split("{% block content %}")[0])
+        patched = branding.patch_synchronize_template(modern)
+        self.assertLess(patched.index("ReplicationStatusView.js"), patched.index("RecoveraSynchronize.js"))
+        self.assertLess(patched.index('id="synchronizeBody"'), patched.index('id="recovera-sync-panel"'))
+        installer = SCRIPT.read_text(encoding="utf-8")
+        self.assertIn("templates/vintage/Synchronize/index.html.twig", installer)
+        self.assertIn('(resources / "RecoveraSynchronize.js", synchronize_js)', installer)
+        panel = (ROOT / "setup" / "branding" / "RecoveraSynchronize.js").read_text(encoding="utf-8")
+        self.assertIn("/api/recovera/offsite-target/replication-activity", panel)
+        self.assertNotIn("innerHTML", panel)
+
     def test_home_page_replaces_native_universal_with_recovera_target(self):
         branding = load_module()
         source = """{% set numOffsiteTargets = deviceInfo.offsiteTargets|length %}
