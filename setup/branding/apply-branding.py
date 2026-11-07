@@ -120,49 +120,96 @@ def add_target_visibility(text: str) -> str:
         additions.append("{% set showRecoveraTarget = is_granted('PERMISSION_OFFSITE_WRITE') %}")
     if "showRecoveraAccess" not in text:
         additions.append("{% set showRecoveraAccess = is_granted('PERMISSION_OFFSITE_WRITE') %}")
-    return text.replace(needle, needle + "\n" + "\n".join(additions), 1) if additions else text
+    if not additions:
+        return text
+    if needle in text:
+        return text.replace(needle, needle + "\n" + "\n".join(additions), 1)
+    # Image releases occasionally rearrange the stock visibility declarations.
+    # Defining our flags at the start of the shared menu context is safe and avoids
+    # silently losing the Recovera links when that exact stock line changes.
+    return "\n".join(additions) + "\n" + text
+
+
+def _menu_item_end(text: str, anchor_position: int) -> int:
+    """Return a safe insertion point immediately after a stock menu item."""
+    position = text.find("</li>", anchor_position)
+    if position < 0:
+        return -1
+    position += len("</li>")
+    trailing = re.match(r"(?P<space>\s*)(?P<endif>{%\s*endif\s*%})?", text[position:])
+    if trailing:
+        position += trailing.end()
+    return position
 
 
 def add_target_menu(text: str) -> str:
-    text = text.replace(
-        "if showConfigureNetworking or showConfigureOffsiteSync or showConfigureDeviceSettings",
-        "if showConfigureNetworking or showConfigureOffsiteSync or showRecoveraTarget or showRecoveraAccess or showConfigureDeviceSettings",
-    )
-    text = text.replace(
-        "if showConfigureNetworking or showConfigureOffsiteSync or showRecoveraTarget or showConfigureDeviceSettings",
-        "if showConfigureNetworking or showConfigureOffsiteSync or showRecoveraTarget or showRecoveraAccess or showConfigureDeviceSettings",
-    )
-    end = "                            {% endif %}\n"
-    anchor = "{{ \"menu.configure.offsite\"|trans }}"
-    position = text.find(anchor)
+    # Keep the Configure dropdown visible even on images where its stock entries
+    # are all disabled. Match the condition by the variables it contains instead
+    # of depending on exact whitespace or ordering from one image release.
+    configure_if = re.compile(r"({%\s*if\s+)([^%\n]+)(\s*%})")
+
+    def include_recovera(match: re.Match) -> str:
+        condition = match.group(2).strip()
+        stock_flags = (
+            "showConfigureNetworking",
+            "showConfigureOffsiteSync",
+            "showConfigureDeviceSettings",
+        )
+        if sum(flag in condition for flag in stock_flags) < 2:
+            return match.group(0)
+        for flag in ("showRecoveraTarget", "showRecoveraAccess"):
+            if flag not in condition:
+                condition += f" or {flag}"
+        return f"{match.group(1)}{condition}{match.group(3)}"
+
+    text = configure_if.sub(include_recovera, text)
+
+    # Prefer the native Off-site Sync entry so the Recovera additions sit beside
+    # the related setting. Fall back to another Configure item, and finally the
+    # Configure dropdown itself, for image versions that omit Off-site Sync.
+    position = -1
+    for anchor in (
+        "menu.configure.offsite",
+        "path('configure_offsite')",
+        'path("configure_offsite")',
+        "menu.configure.device",
+        "path('configure_device')",
+        'path("configure_device")',
+    ):
+        anchor_position = text.find(anchor)
+        if anchor_position >= 0:
+            position = _menu_item_end(text, anchor_position)
+            if position >= 0:
+                break
     if position < 0:
-        return text
-    position = text.find(end, position)
-    if position < 0:
-        return text
-    position += len(end)
+        configure_position = text.find("menu.configure")
+        submenu_position = text.find("<ul", configure_position)
+        position = text.find("</ul>", submenu_position)
+        if configure_position < 0 or submenu_position < 0 or position < 0:
+            return text
     mobile = "ps-5 py-1 pe-0" in text
     classes = ' class="dropdown-item ps-5 py-1 pe-0"' if mobile else ' class="dropdown-item"'
+    indent = "                            "
     block = ""
     if "path('recovera_target')" not in text:
         block += (
-            "                            {% if showRecoveraTarget %}\n"
-            "                                <li>\n"
-            f"                                    <a{classes} href=\"{{{{ path('recovera_target') }}}}\">\n"
-            "                                        Off-site Target\n"
-            "                                    </a>\n"
-            "                                </li>\n"
-            "                            {% endif %}\n"
+            f"\n{indent}{{% if showRecoveraTarget %}}\n"
+            f"{indent}    <li>\n"
+            f"{indent}        <a{classes} href=\"{{{{ path('recovera_target') }}}}\">\n"
+            f"{indent}            Off-site Target\n"
+            f"{indent}        </a>\n"
+            f"{indent}    </li>\n"
+            f"{indent}{{% endif %}}"
         )
     if "path('recovera_access')" not in text:
         block += (
-            "                            {% if showRecoveraAccess %}\n"
-            "                                <li>\n"
-            f"                                    <a{classes} href=\"{{{{ path('recovera_access') }}}}\">\n"
-            "                                        Appliance Access\n"
-            "                                    </a>\n"
-            "                                </li>\n"
-            "                            {% endif %}\n"
+            f"\n{indent}{{% if showRecoveraAccess %}}\n"
+            f"{indent}    <li>\n"
+            f"{indent}        <a{classes} href=\"{{{{ path('recovera_access') }}}}\">\n"
+            f"{indent}            Appliance Access\n"
+            f"{indent}        </a>\n"
+            f"{indent}    </li>\n"
+            f"{indent}{{% endif %}}"
         )
     return text[:position] + block + text[position:]
 

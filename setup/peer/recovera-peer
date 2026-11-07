@@ -31,7 +31,17 @@ import uuid
 from pathlib import Path
 from typing import Any, BinaryIO
 
-VERSION = "0.6.12"
+VERSION_PATH = Path(os.environ.get(
+    "RECOVERA_VERSION_PATH", "/usr/local/share/recovera/VERSION"
+))
+try:
+    VERSION = VERSION_PATH.read_text(encoding="ascii").strip() or "0.6.23"
+except OSError:
+    VERSION = "0.6.23"
+SUPPORTED_SSH_HOST_KEY_TYPES = frozenset((
+    "ssh-ed25519", "ssh-rsa", "rsa-sha2-256", "rsa-sha2-512",
+    "ecdsa-sha2-nistp256", "ecdsa-sha2-nistp384", "ecdsa-sha2-nistp521",
+))
 ETC = Path(os.environ.get("RECOVERA_PEER_ETC", "/etc/recovera-peer"))
 STATE_DIR = Path(os.environ.get("RECOVERA_PEER_STATE", "/var/lib/recovera-peer"))
 CONFIG_PATH = ETC / "config.json"
@@ -335,7 +345,7 @@ def ssh_host_keys() -> list[str]:
     keys: list[str] = []
     for path in sorted(Path("/etc/ssh").glob("ssh_host_*_key.pub")):
         parts = path.read_text(encoding="ascii").strip().split()
-        if len(parts) >= 2:
+        if len(parts) >= 2 and parts[0] in SUPPORTED_SSH_HOST_KEY_TYPES:
             keys.append(f"{parts[0]} {parts[1]}")
     return keys
 
@@ -740,11 +750,18 @@ def known_host_lines(host: str, port: int, keys: list[str]) -> list[str]:
     lines = []
     for key in keys:
         parts = key.split()
-        if ("\n" in key or "\r" in key or len(parts) < 2 or not re.fullmatch(
-                r"(?:ssh-ed25519|ssh-rsa|rsa-sha2-[0-9]+|ecdsa-sha2-nistp[0-9]+)", parts[0])
-                or not re.fullmatch(r"[A-Za-z0-9+/=]+", parts[1])):
+        if "\n" in key or "\r" in key or len(parts) < 2:
+            raise PeerError("target returned an invalid SSH host key")
+        # Older Recovera images may still advertise an ssh-dss host key beside
+        # their modern keys. OpenSSH no longer accepts DSS, so ignore unsupported
+        # algorithms without discarding the valid ED25519/ECDSA/RSA keys.
+        if parts[0] not in SUPPORTED_SSH_HOST_KEY_TYPES:
+            continue
+        if not re.fullmatch(r"[A-Za-z0-9+/=]+", parts[1]):
             raise PeerError("target returned an invalid SSH host key")
         lines.append(f"{prefix} {parts[0]} {parts[1]}")
+    if not lines:
+        raise PeerError("target did not provide a supported SSH host key")
     return lines
 
 

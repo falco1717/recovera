@@ -1,5 +1,21 @@
 # Changelog
 
+## v0.6.23 - 2026-11-06
+
+- Added **Off-site Target** and **Appliance Access** reliably to both desktop
+  and mobile Configure menus. The branding patch now tolerates navigation and
+  whitespace changes between appliance image versions instead of depending on
+  one exact stock-template layout.
+- Added regression coverage that renders representative desktop and mobile
+  Configure dropdowns and verifies both Recovera links are present exactly
+  once.
+- Pairing now ignores obsolete `ssh-dss` host keys advertised by older target
+  appliances while still requiring and pinning at least one supported modern
+  key, fixing the "target returned an invalid SSH host key" error with 0.6.12
+  targets.
+- The peer discovery API now reports the installed Recovera package version
+  instead of the stale hard-coded 0.6.12 value.
+
 ## v0.6.22 - 2026-11-04
 
 - Protect-a-System wizard: when no replication peer is paired, the

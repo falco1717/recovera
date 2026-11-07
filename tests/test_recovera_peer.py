@@ -571,6 +571,17 @@ class RecoveraPeerTests(unittest.TestCase):
         lines = self.peer.known_host_lines("10.0.0.2", 2222, ["ssh-ed25519 AAAATEST comment"])
         self.assertEqual(lines, ["[10.0.0.2]:2222 ssh-ed25519 AAAATEST"])
 
+    def test_known_hosts_ignores_legacy_dss_when_modern_key_is_available(self):
+        lines = self.peer.known_host_lines("10.0.0.2", 22, [
+            "ssh-dss AAAALEGACY",
+            "ssh-ed25519 AAAAMODERN",
+        ])
+        self.assertEqual(lines, ["10.0.0.2 ssh-ed25519 AAAAMODERN"])
+
+    def test_known_hosts_requires_at_least_one_supported_key(self):
+        with self.assertRaisesRegex(self.peer.PeerError, "supported SSH host key"):
+            self.peer.known_host_lines("10.0.0.2", 22, ["ssh-dss AAAALEGACY"])
+
     def test_known_hosts_rejects_key_injection(self):
         with self.assertRaises(self.peer.PeerError):
             self.peer.known_host_lines("10.0.0.2", 22, [
