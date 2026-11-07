@@ -393,10 +393,11 @@
         document.getElementById('recovera-storage-size').textContent =
             bytes(value.pool_size) + ' (' + bytes(value.free) + ' free)';
         document.getElementById('recovera-storage-disk').textContent =
-            (value.disk || 'Unknown') + ' — ' + bytes(value.disk_size);
-        document.getElementById('recovera-storage-available').textContent = value.expandable
-            ? bytes(Math.max(0, Number(value.disk_size) - Number(value.partition_size))) + ' detected'
-            : 'No additional guest-visible capacity currently detected';
+            value.disk ? value.disk + ' — ' + bytes(value.disk_size) : 'Not eligible for automatic expansion';
+        document.getElementById('recovera-storage-available').textContent = value.reason ||
+            (value.expandable
+                ? bytes(Math.max(0, Number(value.disk_size) - Number(value.partition_size))) + ' detected'
+                : 'No additional guest-visible capacity currently detected');
         document.getElementById('recovera-storage-expand').disabled = !value.supported;
     }
 

@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.6.28 - 2026-11-07
+
+- Backup-storage expansion now reconciles an already-expanded GPT with the
+  kernel's stale partition view using `partx`, allowing expansion to continue
+  when `growpart` changed the disk successfully but reported an `lp_update`
+  failure for the live ZFS partition.
+- Appliances with multi-device or otherwise unsupported `homePool` layouts now
+  show a disabled, explanatory **not eligible** state instead of repeatedly
+  displaying a red "exactly one data device" status error.
+
 ## v0.6.27 - 2026-11-07
 
 - Fixed backup-disk expansion failing with `Read-only file system` when writing

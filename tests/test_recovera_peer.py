@@ -112,34 +112,56 @@ class RecoveraPeerTests(unittest.TestCase):
              mock.patch.object(self.peer, "_partition_number", return_value=1), \
              mock.patch.object(self.peer, "_backing_disk",
                                side_effect=[Path("/dev/sdb"), Path("/dev/sda")]), \
-             mock.patch.object(self.peer, "_disk_partitions", return_value=partitions):
+             mock.patch.object(self.peer, "_disk_partition_table", return_value=partitions):
             status = self.peer.storage_expand_status()
         self.assertTrue(status["supported"])
         self.assertTrue(status["expandable"])
         self.assertEqual(status["reserved_partition"], "/dev/sdb9")
         self.assertEqual(status["disk"], "/dev/sdb")
 
+    def test_storage_status_reports_unsupported_topology_without_http_error(self):
+        with mock.patch.object(self.peer, "_command_text",
+                               return_value="107374182400 1 107374182399 ONLINE"), \
+             mock.patch.object(self.peer, "_pool_leaf",
+                               side_effect=self.peer.PeerError(
+                                   "automatic expansion requires homePool to contain exactly one data device"
+                               )):
+            status = self.peer.storage_expand_status()
+        self.assertFalse(status["supported"])
+        self.assertFalse(status["expandable"])
+        self.assertIn("exactly one data device", status["reason"])
+
     def test_expand_storage_rescans_grows_partition_and_expands_zfs(self):
+        gib = 1024**3
         before = {
-            "pool": "homePool", "pool_size": 100, "health": "ONLINE",
+            "pool": "homePool", "pool_size": 100 * gib, "health": "ONLINE",
             "supported": True, "unsupported_partitions": [], "disk": "/dev/sdb",
         }
         detected = before | {
-            "disk_size": 200, "partition_size": 100, "expandable": True,
+            "disk_size": 200 * gib, "partition_size": 100 * gib, "expandable": True,
+            "partition_table_size": 100 * gib,
             "partition_number": 1, "reserved_partition": "/dev/sdb9",
             "device": "/dev/sdb1",
         }
-        after = detected | {"pool_size": 190, "free": 180, "expandable": False}
+        kernel_ready = detected | {"partition_size": 190 * gib,
+                                   "partition_table_size": 190 * gib}
+        after = kernel_ready | {"pool_size": 190 * gib, "free": 180 * gib,
+                                "expandable": False}
         commands = []
 
         def fake_run(argv, **_kwargs):
             commands.append(argv)
+            if argv[0] == "growpart":
+                return mock.Mock(returncode=1, stdout=b"",
+                                 stderr=b"failed [pt_update:1] error updating partition 1")
             return mock.Mock(returncode=0, stdout=b"", stderr=b"")
 
         with mock.patch.object(self.peer, "storage_expand_status",
-                               side_effect=[before, detected, after]), \
+                               side_effect=[before, detected, kernel_ready, after]), \
              mock.patch.object(self.peer, "_rescan_storage_disk") as rescan, \
              mock.patch.object(self.peer, "run", side_effect=fake_run), \
+             mock.patch.object(self.peer, "_disk_partition_table",
+                               return_value=[{"number": 1, "size": 190 * gib}]), \
              mock.patch.object(self.peer, "event") as event, \
              mock.patch.object(self.peer.os, "chmod"), \
              mock.patch.object(self.peer, "storage_expand_lock",
@@ -149,8 +171,40 @@ class RecoveraPeerTests(unittest.TestCase):
         rescan.assert_called_once_with(Path("/dev/sdb"))
         self.assertIn(["sgdisk", "--delete=9", "/dev/sdb"], commands)
         self.assertIn(["growpart", "/dev/sdb", "1"], commands)
+        self.assertIn(["partx", "--update", "--nr", "1", "/dev/sdb"], commands)
         self.assertIn(["zpool", "online", "-e", "homePool", "/dev/sdb1"], commands)
         event.assert_called_once()
+
+    def test_expand_storage_recovers_when_gpt_is_already_larger_than_kernel(self):
+        before = {
+            "pool": "homePool", "pool_size": 100, "health": "ONLINE",
+            "supported": True, "unsupported_partitions": [], "disk": "/dev/sdb",
+        }
+        detected = before | {
+            "disk_size": 400, "partition_size": 100, "partition_table_size": 400,
+            "expandable": True, "partition_number": 1, "reserved_partition": None,
+            "device": "/dev/sdb1",
+        }
+        kernel_ready = detected | {"partition_size": 400}
+        after = kernel_ready | {"pool_size": 399, "free": 390, "expandable": False}
+        commands = []
+
+        def fake_run(argv, **_kwargs):
+            commands.append(argv)
+            return mock.Mock(returncode=0, stdout=b"", stderr=b"")
+
+        with mock.patch.object(self.peer, "storage_expand_status",
+                               side_effect=[before, detected, kernel_ready, after]), \
+             mock.patch.object(self.peer, "_rescan_storage_disk"), \
+             mock.patch.object(self.peer, "run", side_effect=fake_run), \
+             mock.patch.object(self.peer, "event"), \
+             mock.patch.object(self.peer, "storage_expand_lock",
+                               return_value=contextlib.nullcontext()):
+            result = self.peer.expand_storage()
+        self.assertTrue(result["changed"])
+        self.assertIn(["partx", "--update", "--nr", "1", "/dev/sdb"], commands)
+        self.assertNotIn(["growpart", "/dev/sdb", "1"], commands)
+        self.assertFalse(any(command[0] == "sgdisk" for command in commands))
 
     def test_storage_rescan_uses_narrow_transient_systemd_unit(self):
         calls = []

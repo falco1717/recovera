@@ -593,6 +593,31 @@ def _disk_partitions(disk: Path) -> list[dict[str, Any]]:
     return partitions
 
 
+def _disk_partition_table(disk: Path) -> list[dict[str, Any]]:
+    """Read the on-disk GPT, which can be newer than the live kernel view."""
+    try:
+        table = json.loads(_command_text(["sfdisk", "--json", str(disk)]))["partitiontable"]
+        sector_size = int(table["sectorsize"])
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise PeerError(f"could not read the partition table on {disk}") from exc
+    result = []
+    prefix = disk.name
+    for item in table.get("partitions", []):
+        path = Path(str(item.get("node", "")))
+        name = path.name
+        suffix = name[len(prefix):] if name.startswith(prefix) else ""
+        if suffix.startswith("p"):
+            suffix = suffix[1:]
+        if not suffix.isdigit():
+            raise PeerError(f"could not identify partition number for {path}")
+        result.append({
+            "path": str(path), "number": int(suffix),
+            "type": str(item.get("type", "")).casefold(),
+            "size": int(item["size"]) * sector_size,
+        })
+    return result
+
+
 def _partition_number(path: Path) -> int:
     value = Path("/sys/class/block") / path.name / "partition"
     try:
@@ -623,41 +648,51 @@ def storage_expand_status() -> dict[str, Any]:
                             "size,alloc,free,health", pool]).split()
     if len(fields) != 4:
         raise PeerError(f"could not read {pool} capacity")
-    leaf = _pool_leaf(pool)
-    if _command_text(["lsblk", "-d", "-n", "-r", "-o", "TYPE", str(leaf)]) != "part":
-        raise PeerError(f"automatic expansion requires {pool} to use a disk partition")
-    part_number = _partition_number(leaf)
-    disk = _backing_disk(leaf)
-    root_source = _command_text(["findmnt", "-n", "-o", "SOURCE", "/"])
-    root_disk = _backing_disk(Path(root_source))
-    if disk == root_disk:
-        raise PeerError("refusing to expand the operating-system disk")
-    partitions = _disk_partitions(disk)
-    selected = next((item for item in partitions
-                     if item["number"] == part_number), None)
-    if not selected:
-        raise PeerError(f"could not inspect {leaf}")
-    other = [item for item in partitions if item["number"] != part_number]
-    supported_reserved = [item for item in other if
-                          item["number"] == 9 and
-                          item["type"] == ZFS_RESERVED_PARTITION_TYPE and
-                          item["size"] <= 32 * 1024 * 1024]
-    unsupported = [item for item in other if item not in supported_reserved]
-    disk_size = int(_command_text(["blockdev", "--getsize64", str(disk)]))
-    partition_size = int(_command_text(["blockdev", "--getsize64", str(leaf)]))
-    return {
+    base = {
         "pool": pool,
         "pool_size": int(fields[0]), "allocated": int(fields[1]),
         "free": int(fields[2]), "health": fields[3],
+        "device": None, "disk": None, "disk_size": 0, "partition_size": 0,
+        "partition_table_size": 0, "partition_number": None,
+        "expandable": False, "supported": False,
+        "unsupported_partitions": [], "reserved_partition": None,
+    }
+    try:
+        leaf = _pool_leaf(pool)
+        if _command_text(["lsblk", "-d", "-n", "-r", "-o", "TYPE", str(leaf)]) != "part":
+            raise PeerError(f"automatic expansion requires {pool} to use a disk partition")
+        part_number = _partition_number(leaf)
+        disk = _backing_disk(leaf)
+        root_source = _command_text(["findmnt", "-n", "-o", "SOURCE", "/"])
+        root_disk = _backing_disk(Path(root_source))
+        if disk == root_disk:
+            raise PeerError("refusing to expand the operating-system disk")
+        table = _disk_partition_table(disk)
+        selected = next((item for item in table if item["number"] == part_number), None)
+        if not selected:
+            raise PeerError(f"could not inspect {leaf}")
+        other = [item for item in table if item["number"] != part_number]
+        supported_reserved = [item for item in other if
+                              item["number"] == 9 and
+                              item["type"] == ZFS_RESERVED_PARTITION_TYPE and
+                              item["size"] <= 32 * 1024 * 1024]
+        unsupported = [item for item in other if item not in supported_reserved]
+        disk_size = int(_command_text(["blockdev", "--getsize64", str(disk)]))
+        partition_size = int(_command_text(["blockdev", "--getsize64", str(leaf)]))
+    except PeerError as exc:
+        return base | {"reason": str(exc)}
+    return base | {
         "device": str(leaf), "disk": str(disk),
         "disk_size": disk_size, "partition_size": partition_size,
+        "partition_table_size": selected["size"],
         "partition_number": part_number,
         "expandable": disk_size - partition_size >= MIN_STORAGE_GROWTH,
         "supported": fields[3] == "ONLINE" and part_number == 1
             and not unsupported,
         "unsupported_partitions": [item["path"] for item in unsupported],
-        "reserved_partition": supported_reserved[0]["path"]
-            if supported_reserved else None,
+        "reserved_partition": supported_reserved[0]["path"] if supported_reserved else None,
+        "reason": None if fields[3] == "ONLINE" and part_number == 1 and not unsupported
+            else "Automatic expansion is available only for an ONLINE, single-disk Recovera backup pool.",
     }
 
 
@@ -692,9 +727,8 @@ def expand_storage() -> dict[str, Any]:
         if before["health"] != "ONLINE":
             raise PeerError("backup storage must be ONLINE before it can be expanded")
         if not before["supported"]:
-            detail = ", ".join(before["unsupported_partitions"])
-            raise PeerError("this backup-storage layout cannot be expanded automatically" +
-                            (f": unexpected partition(s) {detail}" if detail else ""))
+            raise PeerError(before.get("reason") or
+                            "this backup-storage layout cannot be expanded automatically")
         disk = Path(before["disk"])
         _rescan_storage_disk(disk)
         detected = storage_expand_status()
@@ -704,18 +738,36 @@ def expand_storage() -> dict[str, Any]:
                 "message": "No additional disk capacity was detected. Increase the backup disk in the hypervisor, then try again.",
             }
 
-        backup_dir = STATE_DIR / "storage-gpt-backups"
-        backup_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-        backup = backup_dir / (time.strftime("%Y%m%d-%H%M%S", time.gmtime()) +
-                               f"-{disk.name}.gpt")
-        run(["sgdisk", f"--backup={backup}", str(disk)], timeout=30)
-        os.chmod(backup, 0o600)
-        run(["sgdisk", "--move-second-header", str(disk)], timeout=30)
-        if detected["reserved_partition"]:
-            run(["sgdisk", "--delete=9", str(disk)], timeout=30)
-        run(["growpart", str(disk), str(detected["partition_number"])], timeout=120)
+        if detected["disk_size"] - detected["partition_table_size"] >= MIN_STORAGE_GROWTH:
+            backup_dir = STATE_DIR / "storage-gpt-backups"
+            backup_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+            backup = backup_dir / (time.strftime("%Y%m%d-%H%M%S", time.gmtime()) +
+                                   f"-{disk.name}.gpt")
+            run(["sgdisk", f"--backup={backup}", str(disk)], timeout=30)
+            os.chmod(backup, 0o600)
+            run(["sgdisk", "--move-second-header", str(disk)], timeout=30)
+            if detected["reserved_partition"]:
+                run(["sgdisk", "--delete=9", str(disk)], timeout=30)
+            growth = run(["growpart", str(disk), str(detected["partition_number"])],
+                         check=False, timeout=120)
+            refreshed = _disk_partition_table(disk)
+            table_partition = next((item for item in refreshed
+                                    if item["number"] == detected["partition_number"]), None)
+            if (not table_partition or
+                    table_partition["size"] <= detected["partition_table_size"]):
+                detail = growth.stderr.decode("utf-8", "replace").strip()
+                raise PeerError(f"could not expand the backup partition: {detail or growth.returncode}")
+
+        # growpart may have updated the GPT successfully but failed to refresh
+        # an in-use partition in the kernel. Reconcile that state explicitly.
+        run(["partx", "--update", "--nr", str(detected["partition_number"]), str(disk)],
+            timeout=30)
         run(["partprobe", str(disk)], check=False, timeout=30)
         run(["udevadm", "settle"], timeout=30)
+        kernel_ready = storage_expand_status()
+        if (kernel_ready["partition_table_size"] - kernel_ready["partition_size"] >=
+                MIN_STORAGE_GROWTH):
+            raise PeerError("the partition table was expanded, but the running kernel still reports the old size; reboot the appliance and try again")
         run(["zpool", "online", "-e", detected["pool"], detected["device"]],
             timeout=120)
         run(["zpool", "set", "autoexpand=on", detected["pool"]], timeout=30)
