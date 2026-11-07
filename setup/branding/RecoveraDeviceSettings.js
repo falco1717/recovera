@@ -6,11 +6,57 @@
         'datto relay forced login',
         'recovera relay forced login'
     ]);
+    const AGENT_PAIR_EMPTY_REPLY = /Pairing failed:\s*CURL Error:\s*https:\/\/[^\s/:]+:25567\/pair:\s*Empty reply from server/i;
+    const AGENT_PAIR_EXPLANATION = 'Pairing failed: the agent rejected this appliance\'s certificate. ' +
+        'The agent is probably already paired with another Recovera appliance or was installed with a different ' +
+        'Recovera pairing CA. An agent can be protected by only one appliance. Keep it paired to its current ' +
+        'appliance and use Configure → Off-site Target to replicate its backups.';
     let availableRelease = null;
     let currentPolicy = {channel: 'stable', window: {start: 21, end: 5}};
 
     function normalizedText(element) {
         return (element.textContent || '').replace(/\s+/g, ' ').trim().toLowerCase();
+    }
+
+    function explainAgentPairingFailure(root) {
+        if (!root) return;
+        const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+        const matches = [];
+        while (walker.nextNode()) {
+            if (AGENT_PAIR_EMPTY_REPLY.test(walker.currentNode.nodeValue || '')) {
+                matches.push(walker.currentNode);
+            }
+        }
+        matches.forEach(function (node) {
+            node.nodeValue = (node.nodeValue || '').replace(AGENT_PAIR_EMPTY_REPLY, AGENT_PAIR_EXPLANATION);
+        });
+    }
+
+    function installAgentPairingErrorExplanation() {
+        if (!document.body || document.body.dataset.recoveraPairErrorObserver) return;
+        document.body.dataset.recoveraPairErrorObserver = 'true';
+        explainAgentPairingFailure(document.body);
+        new MutationObserver(function (mutations) {
+            mutations.forEach(function (mutation) {
+                if (mutation.type === 'characterData') {
+                    const value = mutation.target.nodeValue || '';
+                    if (AGENT_PAIR_EMPTY_REPLY.test(value)) {
+                        mutation.target.nodeValue = value.replace(AGENT_PAIR_EMPTY_REPLY, AGENT_PAIR_EXPLANATION);
+                    }
+                    return;
+                }
+                mutation.addedNodes.forEach(function (node) {
+                    if (node.nodeType === Node.TEXT_NODE) {
+                        const value = node.nodeValue || '';
+                        if (AGENT_PAIR_EMPTY_REPLY.test(value)) {
+                            node.nodeValue = value.replace(AGENT_PAIR_EMPTY_REPLY, AGENT_PAIR_EXPLANATION);
+                        }
+                    } else if (node.nodeType === Node.ELEMENT_NODE) {
+                        explainAgentPairingFailure(node);
+                    }
+                });
+            });
+        }).observe(document.body, {childList: true, subtree: true, characterData: true});
     }
 
     function sectionFor(title) {
@@ -292,6 +338,7 @@
 
     function initialize() {
         initializeUpdateBanner();
+        installAgentPairingErrorExplanation();
         if (!/^\/configure\/device\/?$/.test(window.location.pathname)) return;
         removeLegacyRelayControl();
         const oldPanel = document.getElementById('recovera-update-panel');

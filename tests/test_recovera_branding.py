@@ -37,6 +37,12 @@ class RecoveraBrandingTests(unittest.TestCase):
         self.assertIn("recovera.upgrade.available", cleanup)
         self.assertIn("globalAlertTemplate", cleanup)
         self.assertIn("updater.state.available", cleanup)
+        self.assertIn("AGENT_PAIR_EMPTY_REPLY", cleanup)
+        self.assertIn("agent rejected this appliance\\'s certificate", cleanup)
+        self.assertIn("already paired with another Recovera appliance", cleanup)
+        self.assertIn("An agent can be protected by only one appliance", cleanup)
+        self.assertIn("Configure → Off-site Target", cleanup)
+        self.assertIn("MutationObserver", cleanup)
 
         home = (ROOT / "setup" / "branding" / "RecoveraHome.js").read_text()
         self.assertIn("replication-success", home)

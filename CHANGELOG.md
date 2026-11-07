@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.6.24 - 2026-11-06
+
+- Protect-a-System now translates the agent's otherwise opaque
+  `:25567/pair: Empty reply from server` failure into an actionable explanation:
+  the agent rejected this appliance's certificate, normally because it is
+  already paired with another Recovera appliance or uses a different pairing
+  CA. The message explains that an agent can be protected by only one appliance
+  and directs administrators to Off-site Target replication for the second
+  appliance.
+
 ## v0.6.23 - 2026-11-06
 
 - Added **Off-site Target** and **Appliance Access** reliably to both desktop
