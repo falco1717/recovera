@@ -152,6 +152,26 @@ class RecoveraPeerTests(unittest.TestCase):
         self.assertIn(["zpool", "online", "-e", "homePool", "/dev/sdb1"], commands)
         event.assert_called_once()
 
+    def test_storage_rescan_uses_narrow_transient_systemd_unit(self):
+        calls = []
+
+        def fake_run(argv, **kwargs):
+            calls.append((argv, kwargs))
+            return mock.Mock(returncode=0, stdout=b"", stderr=b"")
+
+        with mock.patch.object(Path, "is_file", return_value=True), \
+             mock.patch.object(self.peer, "run", side_effect=fake_run):
+            self.peer._rescan_storage_disk(Path("/dev/sdb"))
+        command, options = calls[0]
+        self.assertEqual(command[0], "systemd-run")
+        self.assertIn("--property=ProtectKernelTunables=true", command)
+        self.assertIn(
+            "--property=ReadWritePaths=/sys/class/block/sdb/device/rescan", command
+        )
+        self.assertEqual(command[-2:], ["/usr/bin/tee", "/sys/class/block/sdb/device/rescan"])
+        self.assertEqual(options["input_data"], b"1\n")
+        self.assertEqual(calls[1][0], ["udevadm", "settle"])
+
     def test_expand_storage_does_not_modify_disk_without_new_capacity(self):
         before = {
             "pool": "homePool", "pool_size": 100, "health": "ONLINE",

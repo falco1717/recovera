@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.6.27 - 2026-11-07
+
+- Fixed backup-disk expansion failing with `Read-only file system` when writing
+  the SCSI rescan control. Rescans now run through a short-lived systemd unit
+  that exposes only the validated disk's rescan file as writable, preserving
+  the stricter kernel-tunable sandbox on the long-running Recovera WebUI
+  service.
+
 ## v0.6.26 - 2026-11-07
 
 - Added **Configure → Device → Expand Backup Storage**. The authenticated UI
