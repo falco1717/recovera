@@ -35,9 +35,9 @@ VERSION_PATH = Path(os.environ.get(
     "RECOVERA_VERSION_PATH", "/usr/local/share/recovera/VERSION"
 ))
 try:
-    VERSION = VERSION_PATH.read_text(encoding="ascii").strip() or "0.6.23"
+    VERSION = VERSION_PATH.read_text(encoding="ascii").strip() or "0.6.24"
 except OSError:
-    VERSION = "0.6.23"
+    VERSION = "0.6.24"
 SUPPORTED_SSH_HOST_KEY_TYPES = frozenset((
     "ssh-ed25519", "ssh-rsa", "rsa-sha2-256", "rsa-sha2-512",
     "ecdsa-sha2-nistp256", "ecdsa-sha2-nistp384", "ecdsa-sha2-nistp521",
