@@ -121,6 +121,41 @@ canOffsite: {{ canOffsite|json_encode|raw }}
         self.assertIn("showRecoveraAccess", visibility)
         self.assertEqual(branding.add_target_visibility(visibility), visibility)
 
+        desktop = """{% if showConfigureNetworking or showConfigureOffsiteSync or showConfigureDeviceSettings %}
+<ul class="dropdown-menu">
+{% if showConfigureOffsiteSync %}
+<li><a class="dropdown-item" href="{{ path('configure_offsite') }}">{{ "menu.configure.offsite"|trans }}</a></li>
+{% endif %}
+</ul>
+{% endif %}
+"""
+        desktop = branding.add_target_menu(desktop)
+        self.assertIn("path('recovera_target')", desktop)
+        self.assertIn("path('recovera_access')", desktop)
+        self.assertIn("showRecoveraTarget", desktop.splitlines()[0])
+        self.assertIn("showRecoveraAccess", desktop.splitlines()[0])
+        self.assertEqual(branding.add_target_menu(desktop), desktop)
+
+        mobile = """{% if showConfigureDeviceSettings or showConfigureNetworking %}
+<ul class="dropdown-menu">
+<li><a class="dropdown-item ps-5 py-1 pe-0" href="{{ path('configure_device') }}">{{ "menu.configure.device"|trans }}</a></li>
+</ul>
+{% endif %}
+"""
+        mobile = branding.add_target_menu(mobile)
+        self.assertIn('class="dropdown-item ps-5 py-1 pe-0"', mobile)
+        self.assertIn("Off-site Target", mobile)
+        self.assertIn("Appliance Access", mobile)
+        self.assertEqual(branding.add_target_menu(mobile), mobile)
+
+    def test_target_visibility_survives_stock_template_changes(self):
+        branding = load_module()
+        visibility = "{% set showConfigureDeviceSettings = true %}\n"
+        patched = branding.add_target_visibility(visibility)
+        self.assertTrue(patched.startswith("{% set showRecoveraTarget"))
+        self.assertIn("showRecoveraAccess", patched)
+        self.assertEqual(branding.add_target_visibility(patched), patched)
+
     def test_appliance_access_copy_supports_self_signed_local_pages(self):
         access = (ROOT / "setup" / "branding" / "RecoveraAccess.js").read_text()
         self.assertIn("navigator.clipboard.writeText", access)

@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.6.23 - 2026-11-06
+
+- Added **Off-site Target** and **Appliance Access** reliably to both desktop
+  and mobile Configure menus. The branding patch now tolerates navigation and
+  whitespace changes between appliance image versions instead of depending on
+  one exact stock-template layout.
+- Added regression coverage that renders representative desktop and mobile
+  Configure dropdowns and verifies both Recovera links are present exactly
+  once.
+
 ## v0.6.22 - 2026-11-04
 
 - Protect-a-System wizard: when no replication peer is paired, the
