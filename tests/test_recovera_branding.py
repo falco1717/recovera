@@ -57,6 +57,11 @@ class RecoveraBrandingTests(unittest.TestCase):
         self.assertIn("chmod a-x /etc/update-motd.d/25-datto", installer)
         self.assertIn("/etc/update-motd.d/25-recovera", installer)
 
+        peer = (ROOT / "setup" / "peer" / "recovera-peer").read_text()
+        package_builder = (ROOT / "tools" / "build-recovera-appliance-deb.sh").read_text()
+        self.assertIn("RECOVERA_VERSION_PATH", peer)
+        self.assertIn('"$ROOT/VERSION" "$stage/usr/local/share/recovera/VERSION"', package_builder)
+
     def test_recovery_points_bridge_is_injected_once_after_native_view(self):
         branding = load_module()
         source = """{% block scripts %}

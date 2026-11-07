@@ -62,6 +62,7 @@ install -m 0644 "$ROOT/setup/peer/recovera-firewall-service.conf" \
 cp -a "$ROOT/setup/branding/." "$stage/usr/lib/recovera/branding/"
 install -m 0644 "$ROOT/setup/branding/recovera-logo.png" "$stage/usr/local/share/recovera/recovera-logo.png"
 install -m 0644 "$ROOT/setup/branding/recovera-ascii.logo" "$stage/usr/local/share/recovera/recovera-ascii.logo"
+install -m 0644 "$ROOT/VERSION" "$stage/usr/local/share/recovera/VERSION"
 install -m 0755 "$ROOT/setup/branding/recovera-motd" "$stage/etc/update-motd.d/25-recovera"
 install -m 0755 "$ROOT/setup/migrate-layout.sh" "$stage/usr/local/lib/recovera/migrate-layout"
 install -m 0755 "$ROOT/setup/setup.sh" "$stage/usr/share/recovera/setup/setup.sh"
