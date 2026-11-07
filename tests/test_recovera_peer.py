@@ -40,6 +40,7 @@ def load_module(root: Path):
     os.environ["RECOVERA_PEER_STATE"] = str(root / "state")
     os.environ["RECOVERA_PEER_KEYS"] = str(root / "keys")
     os.environ["RECOVERA_PEER_LOCK"] = str(root / "lock")
+    os.environ["RECOVERA_STORAGE_EXPAND_LOCK"] = str(root / "storage-expand.lock")
     os.environ["RECOVERA_PEER_STATE_LOCK"] = str(root / "state.lock")
     os.environ["RECOVERA_PEER_OFFSITE"] = str(root / "offsite.json")
     os.environ["RECOVERA_PEER_WEB_TOKEN"] = str(root / "web.token")
@@ -84,6 +85,87 @@ class RecoveraPeerTests(unittest.TestCase):
         self.assertIn("Use /configure/offsite-target on the Recovera WebUI", source)
         controller = CONTROLLER.read_text(encoding="utf-8")
         self.assertIn("'agent-release' => ['POST', '/v1/admin/agent/release']", controller)
+        self.assertIn("'storage-status' => ['GET', '/v1/admin/storage/status']", controller)
+        self.assertIn("'storage-expand' => ['POST', '/v1/admin/storage/expand']", controller)
+
+    def test_storage_status_accepts_only_dedicated_single_disk_zfs_layout(self):
+        def command(argv, **_kwargs):
+            if argv[:3] == ["zpool", "list", "-H"]:
+                return "107374182400 1073741824 106300440576 ONLINE"
+            if argv[:2] == ["lsblk", "-d"] and argv[-2:] == ["TYPE", "/dev/sdb1"]:
+                return "part"
+            if argv[:2] == ["findmnt", "-n"]:
+                return "/dev/sda1"
+            if argv[-2:] == ["--getsize64", "/dev/sdb"]:
+                return str(200 * 1024**3)
+            if argv[-2:] == ["--getsize64", "/dev/sdb1"]:
+                return str(100 * 1024**3)
+            raise AssertionError(argv)
+
+        partitions = [
+            {"path": "/dev/sdb1", "number": 1, "type": "zfs", "size": 100 * 1024**3},
+            {"path": "/dev/sdb9", "number": 9,
+             "type": self.peer.ZFS_RESERVED_PARTITION_TYPE, "size": 8 * 1024**2},
+        ]
+        with mock.patch.object(self.peer, "_command_text", side_effect=command), \
+             mock.patch.object(self.peer, "_pool_leaf", return_value=Path("/dev/sdb1")), \
+             mock.patch.object(self.peer, "_partition_number", return_value=1), \
+             mock.patch.object(self.peer, "_backing_disk",
+                               side_effect=[Path("/dev/sdb"), Path("/dev/sda")]), \
+             mock.patch.object(self.peer, "_disk_partitions", return_value=partitions):
+            status = self.peer.storage_expand_status()
+        self.assertTrue(status["supported"])
+        self.assertTrue(status["expandable"])
+        self.assertEqual(status["reserved_partition"], "/dev/sdb9")
+        self.assertEqual(status["disk"], "/dev/sdb")
+
+    def test_expand_storage_rescans_grows_partition_and_expands_zfs(self):
+        before = {
+            "pool": "homePool", "pool_size": 100, "health": "ONLINE",
+            "supported": True, "unsupported_partitions": [], "disk": "/dev/sdb",
+        }
+        detected = before | {
+            "disk_size": 200, "partition_size": 100, "expandable": True,
+            "partition_number": 1, "reserved_partition": "/dev/sdb9",
+            "device": "/dev/sdb1",
+        }
+        after = detected | {"pool_size": 190, "free": 180, "expandable": False}
+        commands = []
+
+        def fake_run(argv, **_kwargs):
+            commands.append(argv)
+            return mock.Mock(returncode=0, stdout=b"", stderr=b"")
+
+        with mock.patch.object(self.peer, "storage_expand_status",
+                               side_effect=[before, detected, after]), \
+             mock.patch.object(self.peer, "_rescan_storage_disk") as rescan, \
+             mock.patch.object(self.peer, "run", side_effect=fake_run), \
+             mock.patch.object(self.peer, "event") as event, \
+             mock.patch.object(self.peer.os, "chmod"), \
+             mock.patch.object(self.peer, "storage_expand_lock",
+                               return_value=contextlib.nullcontext()):
+            result = self.peer.expand_storage()
+        self.assertTrue(result["changed"])
+        rescan.assert_called_once_with(Path("/dev/sdb"))
+        self.assertIn(["sgdisk", "--delete=9", "/dev/sdb"], commands)
+        self.assertIn(["growpart", "/dev/sdb", "1"], commands)
+        self.assertIn(["zpool", "online", "-e", "homePool", "/dev/sdb1"], commands)
+        event.assert_called_once()
+
+    def test_expand_storage_does_not_modify_disk_without_new_capacity(self):
+        before = {
+            "pool": "homePool", "pool_size": 100, "health": "ONLINE",
+            "supported": True, "unsupported_partitions": [], "disk": "/dev/sdb",
+        }
+        detected = before | {"expandable": False}
+        with mock.patch.object(self.peer, "storage_expand_status", side_effect=[before, detected]), \
+             mock.patch.object(self.peer, "_rescan_storage_disk"), \
+             mock.patch.object(self.peer, "run") as runner, \
+             mock.patch.object(self.peer, "storage_expand_lock",
+                               return_value=contextlib.nullcontext()):
+            result = self.peer.expand_storage()
+        self.assertFalse(result["changed"])
+        runner.assert_not_called()
 
     def test_agent_address_uses_exact_asset_row_not_duplicate_display_name(self):
         asset = "a" * 32

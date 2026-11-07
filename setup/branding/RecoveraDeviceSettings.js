@@ -141,6 +141,16 @@
         channelLink.parentElement.insertBefore(link, channelLink.nextSibling);
     }
 
+    function addStorageNavigation() {
+        if (document.querySelector('a[href="#settingRecoveraStorageExpand"]')) return;
+        const filesystemLink = document.querySelector('a[href="#integrityCheckTimeoutNtfsresize"]');
+        if (!filesystemLink || !filesystemLink.parentElement) return;
+        const link = filesystemLink.cloneNode(false);
+        link.href = '#settingRecoveraStorageExpand';
+        link.textContent = 'Expand Backup Storage';
+        filesystemLink.parentElement.insertBefore(link, filesystemLink.nextSibling);
+    }
+
     function findRebootSection() {
         for (const title of document.querySelectorAll('h1, h2, h3, h4, h5, h6, legend, .card-title')) {
             if (normalizedText(title) === 'reboot now') return sectionFor(title);
@@ -170,6 +180,28 @@
         return panel;
     }
 
+    function createStoragePanel() {
+        const panel = document.createElement('div');
+        panel.id = 'settingRecoveraStorageExpand';
+        panel.className = 'card my-3';
+        panel.innerHTML = [
+            '<div class="card-body">',
+            '<h3 class="text-secondary fw-medium mb-3">Expand Backup Storage</h3>',
+            '<p>Use all additional capacity assigned to this appliance\'s backup disk. Existing backups remain in place.</p>',
+            '<div id="recovera-storage-message" class="alert d-none" role="alert"></div>',
+            '<dl class="row mb-3">',
+            '<dt class="col-sm-4">Storage pool</dt><dd id="recovera-storage-pool" class="col-sm-8">Loading…</dd>',
+            '<dt class="col-sm-4">Current pool size</dt><dd id="recovera-storage-size" class="col-sm-8">Loading…</dd>',
+            '<dt class="col-sm-4">Detected backup disk</dt><dd id="recovera-storage-disk" class="col-sm-8">Loading…</dd>',
+            '<dt class="col-sm-4">Additional capacity</dt><dd id="recovera-storage-available" class="col-sm-8">Scanning…</dd>',
+            '</dl>',
+            '<button id="recovera-storage-expand" class="btn btn-primary" type="button" disabled>Scan and expand to maximum</button>',
+            '<p class="text-secondary mt-3 mb-0">The appliance rescans only the dedicated backup disk and refuses unsupported, unhealthy, or operating-system disk layouts.</p>',
+            '</div>'
+        ].join('');
+        return panel;
+    }
+
     function setMessage(message, success) {
         const box = document.getElementById('recovera-update-message');
         box.className = 'alert ' + (success ? 'alert-success' : 'alert-danger');
@@ -179,7 +211,7 @@
     function bytes(value) {
         const size = Number(value || 0);
         if (!size) return '0 B';
-        const units = ['B', 'KB', 'MB', 'GB'];
+        const units = ['B', 'KB', 'MB', 'GB', 'TB', 'PB'];
         const unit = Math.min(units.length - 1, Math.floor(Math.log(size) / Math.log(1024)));
         return (size / Math.pow(1024, unit)).toFixed(unit ? 1 : 0) + ' ' + units[unit];
     }
@@ -348,6 +380,76 @@
             'Stable, ' + hour(currentPolicy.window.start) + '–' + hour(currentPolicy.window.end);
     }
 
+    function setStorageMessage(message, success) {
+        const box = document.getElementById('recovera-storage-message');
+        if (!box) return;
+        box.className = 'alert ' + (success ? 'alert-success' : 'alert-danger');
+        box.textContent = message;
+    }
+
+    function showStorageStatus(value) {
+        document.getElementById('recovera-storage-pool').textContent =
+            (value.pool || 'Unknown') + ' (' + (value.health || 'Unknown') + ')';
+        document.getElementById('recovera-storage-size').textContent =
+            bytes(value.pool_size) + ' (' + bytes(value.free) + ' free)';
+        document.getElementById('recovera-storage-disk').textContent =
+            (value.disk || 'Unknown') + ' — ' + bytes(value.disk_size);
+        document.getElementById('recovera-storage-available').textContent = value.expandable
+            ? bytes(Math.max(0, Number(value.disk_size) - Number(value.partition_size))) + ' detected'
+            : 'No additional guest-visible capacity currently detected';
+        document.getElementById('recovera-storage-expand').disabled = !value.supported;
+    }
+
+    async function loadStorageStatus() {
+        const button = document.getElementById('recovera-storage-expand');
+        if (!button) return;
+        try {
+            showStorageStatus(await request('storage-status'));
+        } catch (error) {
+            button.disabled = true;
+            setStorageMessage(error.message, false);
+        }
+    }
+
+    async function expandStorage() {
+        if (!window.confirm(
+            'Rescan the dedicated backup disk and expand its ZFS pool to the maximum available size? Existing backups will remain online.'
+        )) return;
+        const button = document.getElementById('recovera-storage-expand');
+        button.disabled = true;
+        button.textContent = 'Scanning and expanding…';
+        setStorageMessage('Scanning the backup disk for additional capacity…', true);
+        try {
+            const value = await request('storage-expand', 'POST', {confirm: 'expand-to-maximum'});
+            showStorageStatus(value);
+            setStorageMessage(value.message || 'Backup storage expansion completed.', true);
+        } catch (error) {
+            setStorageMessage(error.message, false);
+        } finally {
+            button.textContent = 'Scan and expand to maximum';
+            await loadStorageStatus();
+        }
+    }
+
+    function installStoragePanel() {
+        if (document.getElementById('settingRecoveraStorageExpand')) return;
+        let filesystem = document.getElementById('integrityCheckTimeoutNtfsresize');
+        if (!filesystem) {
+            for (const title of document.querySelectorAll('h1, h2, h3, h4, h5, h6, legend, .card-title')) {
+                if (normalizedText(title) === 'filesystem') {
+                    filesystem = sectionFor(title);
+                    break;
+                }
+            }
+        }
+        if (!filesystem || !filesystem.parentElement) return;
+        const panel = createStoragePanel();
+        filesystem.parentElement.insertBefore(panel, filesystem.nextSibling);
+        addStorageNavigation();
+        document.getElementById('recovera-storage-expand').addEventListener('click', expandStorage);
+        window.setTimeout(loadStorageStatus, 0);
+    }
+
     function showStatus(value) {
         currentPolicy = value.policy || currentPolicy;
         document.getElementById('recovera-installed-version').textContent = value.installed_version || 'Unknown';
@@ -413,6 +515,7 @@
         }
         if (!/^\/configure\/device\/?$/.test(window.location.pathname)) return;
         removeLegacyRelayControl();
+        installStoragePanel();
         const oldPanel = document.getElementById('recovera-update-panel');
         if (oldPanel) oldPanel.remove();
         const channel = document.getElementById('settingUpgradeChannel');

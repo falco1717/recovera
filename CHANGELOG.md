@@ -1,5 +1,16 @@
 # Changelog
 
+## v0.6.26 - 2026-11-07
+
+- Added **Configure → Device → Expand Backup Storage**. The authenticated UI
+  rescans the dedicated backup disk and expands the single-disk `homePool` ZFS
+  volume to all newly assigned virtual-disk capacity without deleting or
+  recreating existing backups.
+- Storage expansion validates that the pool is ONLINE, refuses the operating
+  system disk and unsupported multi-device/partition layouts, serializes
+  concurrent requests, saves a private GPT backup before changing the
+  partition table, and enables future ZFS auto-expansion.
+
 ## v0.6.25 - 2026-11-06
 
 - The global update banner now compares the cached release with the installed

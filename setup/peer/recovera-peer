@@ -57,6 +57,9 @@ APACHE_TLS_CERT_PATH = Path(os.environ.get(
 ))
 KEYS_DIR = Path(os.environ.get("RECOVERA_PEER_KEYS", "/datto/config/keys"))
 LOCK_PATH = Path(os.environ.get("RECOVERA_PEER_LOCK", "/run/recovera-peer-sync.lock"))
+STORAGE_EXPAND_LOCK_PATH = Path(os.environ.get(
+    "RECOVERA_STORAGE_EXPAND_LOCK", "/run/recovera-storage-expand.lock"
+))
 STATE_LOCK_PATH = Path(os.environ.get(
     "RECOVERA_PEER_STATE_LOCK", "/run/recovera-peer-state.lock"
 ))
@@ -99,6 +102,8 @@ METADATA_SUFFIXES = (
 MAX_METADATA_BYTES = 512 * 1024
 MIN_RETENTION_HOURS = 24
 MAX_RETENTION_HOURS = 240_000
+ZFS_RESERVED_PARTITION_TYPE = "6a945a3b-1dd2-11b2-99a6-080020736631"
+MIN_STORAGE_GROWTH = 16 * 1024 * 1024
 
 
 class PeerError(RuntimeError):
@@ -545,6 +550,171 @@ def release_agent(asset: str) -> dict[str, Any]:
         raise PeerError(str(value.get("error") or "the agent refused its ownership release"))
     event("agent-released", f"Released protected agent {asset}", asset=asset, address=address)
     return value | {"asset": asset, "address": address}
+
+
+def _command_text(argv: list[str], *, timeout: int = 15) -> str:
+    return run(argv, timeout=timeout).stdout.decode("utf-8", "replace").strip()
+
+
+def _pool_leaf(pool: str) -> Path:
+    output = _command_text(["zpool", "status", "-P", "-L", pool])
+    devices = []
+    for line in output.splitlines():
+        fields = line.split()
+        if fields and fields[0].startswith("/dev/"):
+            devices.append(Path(os.path.realpath(fields[0])))
+    if len(devices) != 1:
+        raise PeerError(
+            f"automatic expansion requires {pool} to contain exactly one data device"
+        )
+    if not devices[0].is_block_device():
+        raise PeerError(f"{pool} has an invalid backing device: {devices[0]}")
+    return devices[0]
+
+
+def _disk_partitions(disk: Path) -> list[dict[str, Any]]:
+    output = _command_text(["lsblk", "-n", "-r", "-p", "-o", "PATH,TYPE", str(disk)])
+    partitions = []
+    for line in output.splitlines():
+        fields = line.split()
+        if len(fields) != 2 or fields[1] != "part":
+            continue
+        path = Path(fields[0])
+        number = _partition_number(path)
+        type_result = run(
+            ["blkid", "-p", "-s", "PART_ENTRY_TYPE", "-o", "value", str(path)],
+            check=False, timeout=15,
+        )
+        partitions.append({
+            "path": str(path), "number": number,
+            "type": type_result.stdout.decode("ascii", "replace").strip().casefold(),
+            "size": int(_command_text(["blockdev", "--getsize64", str(path)])),
+        })
+    return partitions
+
+
+def _partition_number(path: Path) -> int:
+    value = Path("/sys/class/block") / path.name / "partition"
+    try:
+        number = value.read_text(encoding="ascii").strip()
+    except OSError as exc:
+        raise PeerError(f"could not identify partition number for {path}") from exc
+    if not number.isdigit():
+        raise PeerError(f"invalid partition number for {path}")
+    return int(number)
+
+
+def _backing_disk(path: Path) -> Path:
+    output = _command_text([
+        "lsblk", "-s", "-n", "-r", "-p", "-o", "PATH,TYPE", str(path),
+    ])
+    disks = [Path(fields[0]) for line in output.splitlines()
+             if len(fields := line.split()) == 2 and fields[1] == "disk"]
+    if len(disks) != 1:
+        raise PeerError(f"could not resolve one physical disk behind {path}")
+    return disks[0]
+
+
+def storage_expand_status() -> dict[str, Any]:
+    """Describe the supported Recovera backup pool without changing storage."""
+    require_root()
+    pool = str(config().get("pool") or "homePool")
+    fields = _command_text(["zpool", "list", "-H", "-p", "-o",
+                            "size,alloc,free,health", pool]).split()
+    if len(fields) != 4:
+        raise PeerError(f"could not read {pool} capacity")
+    leaf = _pool_leaf(pool)
+    if _command_text(["lsblk", "-d", "-n", "-r", "-o", "TYPE", str(leaf)]) != "part":
+        raise PeerError(f"automatic expansion requires {pool} to use a disk partition")
+    part_number = _partition_number(leaf)
+    disk = _backing_disk(leaf)
+    root_source = _command_text(["findmnt", "-n", "-o", "SOURCE", "/"])
+    root_disk = _backing_disk(Path(root_source))
+    if disk == root_disk:
+        raise PeerError("refusing to expand the operating-system disk")
+    partitions = _disk_partitions(disk)
+    selected = next((item for item in partitions
+                     if item["number"] == part_number), None)
+    if not selected:
+        raise PeerError(f"could not inspect {leaf}")
+    other = [item for item in partitions if item["number"] != part_number]
+    supported_reserved = [item for item in other if
+                          item["number"] == 9 and
+                          item["type"] == ZFS_RESERVED_PARTITION_TYPE and
+                          item["size"] <= 32 * 1024 * 1024]
+    unsupported = [item for item in other if item not in supported_reserved]
+    disk_size = int(_command_text(["blockdev", "--getsize64", str(disk)]))
+    partition_size = int(_command_text(["blockdev", "--getsize64", str(leaf)]))
+    return {
+        "pool": pool,
+        "pool_size": int(fields[0]), "allocated": int(fields[1]),
+        "free": int(fields[2]), "health": fields[3],
+        "device": str(leaf), "disk": str(disk),
+        "disk_size": disk_size, "partition_size": partition_size,
+        "partition_number": part_number,
+        "expandable": disk_size - partition_size >= MIN_STORAGE_GROWTH,
+        "supported": fields[3] == "ONLINE" and part_number == 1
+            and not unsupported,
+        "unsupported_partitions": [item["path"] for item in unsupported],
+        "reserved_partition": supported_reserved[0]["path"]
+            if supported_reserved else None,
+    }
+
+
+def _rescan_storage_disk(disk: Path) -> None:
+    rescan = Path("/sys/class/block") / disk.name / "device" / "rescan"
+    if not rescan.is_file():
+        raise PeerError(f"the storage controller does not support rescanning {disk}")
+    rescan.write_text("1\n", encoding="ascii")
+    run(["udevadm", "settle"], timeout=30)
+
+
+def expand_storage() -> dict[str, Any]:
+    """Grow the single-disk Recovera ZFS pool into newly provisioned space."""
+    require_root()
+    with storage_expand_lock():
+        before = storage_expand_status()
+        if before["health"] != "ONLINE":
+            raise PeerError("backup storage must be ONLINE before it can be expanded")
+        if not before["supported"]:
+            detail = ", ".join(before["unsupported_partitions"])
+            raise PeerError("this backup-storage layout cannot be expanded automatically" +
+                            (f": unexpected partition(s) {detail}" if detail else ""))
+        disk = Path(before["disk"])
+        _rescan_storage_disk(disk)
+        detected = storage_expand_status()
+        if not detected["expandable"]:
+            return detected | {
+                "changed": False,
+                "message": "No additional disk capacity was detected. Increase the backup disk in the hypervisor, then try again.",
+            }
+
+        backup_dir = STATE_DIR / "storage-gpt-backups"
+        backup_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        backup = backup_dir / (time.strftime("%Y%m%d-%H%M%S", time.gmtime()) +
+                               f"-{disk.name}.gpt")
+        run(["sgdisk", f"--backup={backup}", str(disk)], timeout=30)
+        os.chmod(backup, 0o600)
+        run(["sgdisk", "--move-second-header", str(disk)], timeout=30)
+        if detected["reserved_partition"]:
+            run(["sgdisk", "--delete=9", str(disk)], timeout=30)
+        run(["growpart", str(disk), str(detected["partition_number"])], timeout=120)
+        run(["partprobe", str(disk)], check=False, timeout=30)
+        run(["udevadm", "settle"], timeout=30)
+        run(["zpool", "online", "-e", detected["pool"], detected["device"]],
+            timeout=120)
+        run(["zpool", "set", "autoexpand=on", detected["pool"]], timeout=30)
+        after = storage_expand_status()
+        if after["pool_size"] <= before["pool_size"]:
+            raise PeerError(
+                "the disk partition was expanded, but ZFS did not report additional capacity"
+            )
+        event("storage-expanded", f"Expanded {detected['pool']} to {after['pool_size']} bytes",
+              pool=detected["pool"], before=before["pool_size"], after=after["pool_size"])
+        return after | {
+            "changed": True, "previous_pool_size": before["pool_size"],
+            "message": "Backup storage expanded successfully.",
+        }
 
 
 def protected_asset_keys() -> list[str]:
@@ -1650,7 +1820,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.reply(404, {"error": "Use /configure/offsite-target on the Recovera WebUI"})
             elif self.path in ("/v1/admin/status", "/v1/admin/queue-status", "/v1/admin/offsite",
                                 "/v1/admin/backup-admin-credential", "/v1/admin/update/status",
-                                "/v1/admin/update/check", "/v1/admin/update/policy"):
+                                "/v1/admin/update/check", "/v1/admin/update/policy",
+                                "/v1/admin/storage/status"):
                 if not self.admin():
                     return
                 if self.path == "/v1/admin/status":
@@ -1665,6 +1836,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     self.reply(200, upgrade_status(check=True))
                 elif self.path == "/v1/admin/update/policy":
                     self.reply(200, {"policy": upgrade_policy()})
+                elif self.path == "/v1/admin/storage/status":
+                    self.reply(200, storage_expand_status())
                 else:
                     self.reply(200, {"schedules": offsite()["schedules"],
                                      "averages": weekly_averages()})
@@ -1728,6 +1901,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.reply(200, upgrade_install())
             elif self.path == "/v1/admin/update/policy":
                 self.reply(200, set_upgrade_policy(body))
+            elif self.path == "/v1/admin/storage/expand":
+                if body.get("confirm") != "expand-to-maximum":
+                    raise PeerError("storage expansion confirmation is required")
+                self.reply(200, expand_storage())
             else: self.reply(404, {"error": "not found"})
         except Exception as exc: self.reply(400, {"error": str(exc)})
 
@@ -1767,11 +1944,23 @@ def sync_lock() -> Any:
         yield
 
 
+@contextlib.contextmanager
+def storage_expand_lock() -> Any:
+    STORAGE_EXPAND_LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with STORAGE_EXPAND_LOCK_PATH.open("w") as handle:
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise PeerError("another backup-storage expansion is already active") from exc
+        yield
+
+
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(description="Offline Recovera appliance replication")
     result.add_argument("--version", action="version", version=VERSION)
     sub = result.add_subparsers(dest="command", required=True)
     sub.add_parser("init"); sub.add_parser("serve"); sub.add_parser("status")
+    sub.add_parser("storage-status"); sub.add_parser("storage-expand")
     code = sub.add_parser("pairing-code"); code.add_argument("--minutes", type=int, default=15)
     discover = sub.add_parser("discover"); discover.add_argument("host"); discover.add_argument("--port", type=int, default=443)
     add = sub.add_parser("peer-add"); add.add_argument("host"); add.add_argument("--port", type=int, default=443); add.add_argument("--code", required=True); add.add_argument("--fingerprint"); add.add_argument("--yes", action="store_true")
@@ -1791,6 +1980,8 @@ def main() -> int:
         if args.command == "init": init()
         elif args.command == "serve": serve()
         elif args.command == "status": print(json.dumps(status_document(), indent=2))
+        elif args.command == "storage-status": print(json.dumps(storage_expand_status(), indent=2))
+        elif args.command == "storage-expand": print(json.dumps(expand_storage(), indent=2))
         elif args.command == "pairing-code": print(pairing_code(args.minutes)); print(f"Pairing HTTPS fingerprint: {gateway_tls_fingerprint()}")
         elif args.command == "discover":
             prefix = "/recovera-peer"
