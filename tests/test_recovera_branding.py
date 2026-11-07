@@ -37,6 +37,7 @@ class RecoveraBrandingTests(unittest.TestCase):
         self.assertIn("recovera.upgrade.available", cleanup)
         self.assertIn("globalAlertTemplate", cleanup)
         self.assertIn("updater.state.available", cleanup)
+        self.assertIn("releaseIsNewer(release.version, value.installed_version)", cleanup)
         self.assertIn("AGENT_PAIR_EMPTY_REPLY", cleanup)
         self.assertIn("agent rejected this appliance\\'s certificate", cleanup)
         self.assertIn("already paired with another Recovera appliance", cleanup)
@@ -98,6 +99,9 @@ canOffsite: {{ canOffsite|json_encode|raw }}
         self.assertIn("canOffsite: true", patched)
         self.assertNotIn("FEATURE_PEER_REPLICATION", patched)
         self.assertEqual(branding.patch_protect_system_index(patched), patched)
+        bridge = (ROOT / "setup" / "branding" / "RecoveraProtectSystem.js").read_text()
+        self.assertIn("function deduplicateSystems(systems)", bridge)
+        self.assertIn("systems = deduplicateSystems(systems)", bridge)
 
     def test_replication_pane_is_enabled_only_for_wizard_without_nesting(self):
         branding = load_module()

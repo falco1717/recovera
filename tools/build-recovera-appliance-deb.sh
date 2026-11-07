@@ -23,6 +23,7 @@ stage=$work/stage
 mkdir -p "$stage/DEBIAN" "$stage/usr/local/sbin" "$stage/usr/local/lib/recovera" \
   "$stage/usr/local/lib/recovera-upgrade" "$stage/usr/local/share/recovera-upgrade" \
   "$stage/usr/local/share/recovera" "$stage/usr/local/share/recovera/isolation" \
+  "$stage/usr/share/recovera/agents/linux" \
   "$stage/usr/lib/recovera/branding" \
   "$stage/usr/share/recovera/defaults" "$stage/usr/share/recovera/setup" \
   "$stage/etc/systemd/system" \
@@ -68,6 +69,13 @@ install -m 0755 "$ROOT/setup/migrate-layout.sh" "$stage/usr/local/lib/recovera/m
 install -m 0755 "$ROOT/setup/setup.sh" "$stage/usr/share/recovera/setup/setup.sh"
 install -m 0755 "$ROOT/setup/migrate-layout.sh" "$stage/usr/share/recovera/setup/migrate-layout.sh"
 install -m 0644 "$ROOT/setup/README.txt" "$stage/usr/share/recovera/setup/README.txt"
+for file in install-recovera-agent.sh install-recovera-agent-transfer.sh \
+            datto-cow-reserve-fix.sh recovera-agent-transfer; do
+  install -m 0755 "$ROOT/agents/linux/$file" "$stage/usr/share/recovera/agents/linux/$file"
+done
+for file in datto-cow-reserve-fix.service recovera-agent-transfer.service; do
+  install -m 0644 "$ROOT/agents/linux/$file" "$stage/usr/share/recovera/agents/linux/$file"
+done
 
 install -m 0755 "$ROOT/upgrade/recovera-upgrade" "$stage/usr/local/sbin/recovera-upgrade"
 install -m 0755 "$ROOT/upgrade/recovera-upgrade-schedule" "$stage/usr/local/sbin/recovera-upgrade-schedule"

@@ -35,9 +35,9 @@ VERSION_PATH = Path(os.environ.get(
     "RECOVERA_VERSION_PATH", "/usr/local/share/recovera/VERSION"
 ))
 try:
-    VERSION = VERSION_PATH.read_text(encoding="ascii").strip() or "0.6.24"
+    VERSION = VERSION_PATH.read_text(encoding="ascii").strip() or "0.6.25"
 except OSError:
-    VERSION = "0.6.24"
+    VERSION = "0.6.25"
 SUPPORTED_SSH_HOST_KEY_TYPES = frozenset((
     "ssh-ed25519", "ssh-rsa", "rsa-sha2-256", "rsa-sha2-512",
     "ecdsa-sha2-nistp256", "ecdsa-sha2-nistp384", "ecdsa-sha2-nistp521",
@@ -84,6 +84,9 @@ UPGRADE_TOKEN_PATH = Path(os.environ.get(
 UPGRADE_POLICY_PATH = Path(os.environ.get(
     "RECOVERA_UPGRADE_POLICY", "/etc/recovera/update-policy.json"
 ))
+AGENT_TRANSFER_PORT = int(os.environ.get("RECOVERA_AGENT_TRANSFER_PORT", "25569"))
+AGENT_CERT_DIR = Path(os.environ.get("RECOVERA_AGENT_CERT_DIR", "/datto/config/certs"))
+DEVICE_ID_PATH = Path(os.environ.get("RECOVERA_DEVICE_ID", "/datto/config/deviceID"))
 ASSET_RE = re.compile(r"^[0-9a-fA-F]{32}$")
 SNAPSHOT_RE = re.compile(r"^[0-9]{1,20}$")
 ID_RE = re.compile(r"^[0-9a-fA-F-]{8,64}$")
@@ -477,6 +480,71 @@ def asset_display_name(asset: str) -> str:
                 if document.get(key):
                     return str(document[key])
     return serialized_string(raw, "name") or serialized_string(raw, "hostname") or asset
+
+
+def agent_address(asset: str) -> str:
+    """Resolve an active agent address without trusting a display name."""
+    asset = validate_asset(asset)
+    path = KEYS_DIR / f"{asset}.agentInfo"
+    try:
+        raw = path.read_bytes()
+    except OSError:
+        raw = b""
+    with contextlib.suppress(json.JSONDecodeError, UnicodeDecodeError):
+        document = json.loads(raw.decode("utf-8"))
+        if isinstance(document, dict):
+            for key in ("ipv4Address", "ipAddress", "ip", "pairedBy"):
+                candidate = str(document.get(key, "")).strip()
+                if candidate and HOST_RE.fullmatch(candidate):
+                    return candidate
+    for key in ("ipv4Address", "ipAddress", "ip", "pairedBy"):
+        candidate = serialized_string(raw, key)
+        if candidate and HOST_RE.fullmatch(candidate):
+            return candidate
+    result = run(["snapctl", "agent:list"], check=False, timeout=15)
+    for line in result.stdout.decode("utf-8", "replace").splitlines():
+        columns = [column.strip() for column in line.strip().strip("|").split("|")]
+        if len(columns) >= 2 and columns[0].casefold() == asset.casefold():
+            candidate = columns[1]
+            if HOST_RE.fullmatch(candidate):
+                return candidate
+    raise PeerError("could not determine the protected agent's network address")
+
+
+def release_agent(asset: str) -> dict[str, Any]:
+    """Ask the currently owned agent to forget this appliance before removal."""
+    require_root()
+    address = agent_address(asset)
+    certs = AGENT_CERT_DIR
+    certificates = sorted(certs.glob("*_device.pem"))
+    keys = sorted(certs.glob("*_device.key"))
+    authorities = sorted(certs.glob("*_dattoAgentCaCert.crt"))
+    if not certificates or not keys or not authorities:
+        raise PeerError("Recovera agent pairing certificates are not installed")
+    try:
+        device_id = int(DEVICE_ID_PATH.read_text(encoding="ascii").strip())
+        context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH, cafile=str(authorities[-1]))
+        context.check_hostname = False
+        context.load_cert_chain(str(certificates[-1]), str(keys[-1]))
+        connection = http.client.HTTPSConnection(
+            address, AGENT_TRANSFER_PORT, context=context, timeout=15
+        )
+        payload = json.dumps({"device_id": device_id}).encode("utf-8")
+        connection.request("POST", "/v1/release", body=payload,
+                           headers={"Content-Type": "application/json"})
+        response = connection.getresponse()
+        raw = response.read(65536)
+        connection.close()
+        value = json.loads(raw.decode("utf-8"))
+    except (OSError, ssl.SSLError, http.client.HTTPException, json.JSONDecodeError) as exc:
+        raise PeerError(
+            "the agent could not be released automatically; update its Recovera agent tools "
+            "or run 'sudo recovera-agent-transfer release' on the protected system before removing it"
+        ) from exc
+    if response.status != 200:
+        raise PeerError(str(value.get("error") or "the agent refused its ownership release"))
+    event("agent-released", f"Released protected agent {asset}", asset=asset, address=address)
+    return value | {"asset": asset, "address": address}
 
 
 def protected_asset_keys() -> list[str]:
@@ -1634,6 +1702,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     int(body["retention_hours"]), str(body.get("schedule_mode", "interval")),
                     str(body.get("priority", "normal")),
                 )})
+            elif self.path == "/v1/admin/agent/release":
+                self.reply(200, release_agent(str(body["asset"])))
             elif self.path == "/v1/admin/sync":
                 with sync_lock():
                     self.reply(200, {"results": configured_sync()})

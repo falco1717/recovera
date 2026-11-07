@@ -1,5 +1,19 @@
 # Changelog
 
+## v0.6.25 - 2026-11-06
+
+- The global update banner now compares the cached release with the installed
+  package and sequence, and package installation clears the cached available
+  release. An already-installed update is no longer advertised indefinitely.
+- Protect-a-System removes duplicate agent or VM selections by stable identity
+  before submitting the native pairing request, while preserving different VMs
+  that happen to share a display name.
+- Added mutually authenticated agent ownership transfer. Updated Linux agents
+  can be released safely by their owning appliance before removal, allowing a
+  replacement Recovera appliance to pair them without manually editing the
+  agent database. Active backup snapshots block release, the database is backed
+  up first, and forced/offline removal shows an explicit recovery path.
+
 ## v0.6.24 - 2026-11-06
 
 - Protect-a-System now translates the agent's otherwise opaque

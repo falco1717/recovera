@@ -59,6 +59,50 @@
         }).observe(document.body, {childList: true, subtree: true, characterData: true});
     }
 
+    function installAgentRemovalRelease() {
+        const assets = window.Datto && Datto.App && Datto.App.Assets;
+        const View = assets && assets.RemoveView;
+        if (!View || View.prototype.recoveraReleaseInstalled) return false;
+        const prototype = View.prototype;
+        const nativeRenderView = prototype.renderView;
+        prototype.recoveraReleaseInstalled = true;
+        prototype.renderView = function () {
+            const result = nativeRenderView.apply(this, arguments);
+            if (this.context.isShare || !this.$confirmButton || !this.$confirmButton.length) return result;
+            const self = this;
+            const button = this.$confirmButton.get(0);
+            if (button.dataset.recoveraReleaseBound) return result;
+            button.dataset.recoveraReleaseBound = 'true';
+            button.addEventListener('click', function (event) {
+                if (button.dataset.recoveraReleased === 'true' ||
+                    button.dataset.recoveraRemoveAnyway === 'true') return;
+                event.preventDefault();
+                event.stopImmediatePropagation();
+                button.disabled = true;
+                const originalText = button.textContent;
+                button.textContent = 'Releasing agent…';
+                request('agent-release', 'POST', {asset: self.context.assetKey}).then(function () {
+                    button.dataset.recoveraReleased = 'true';
+                    button.disabled = false;
+                    button.textContent = originalText;
+                    button.click();
+                }).catch(function (error) {
+                    button.disabled = false;
+                    button.dataset.recoveraRemoveAnyway = 'true';
+                    button.textContent = 'Remove anyway';
+                    let warning = self.$removeModal.find('.recovera-agent-release-warning');
+                    if (!warning.length) {
+                        warning = window.jQuery('<div class="alert alert-warning recovera-agent-release-warning mt-3">');
+                        self.$confirmInput.closest('.modal-body').append(warning);
+                    }
+                    warning.text(error.message + ' Removing anyway will require a local agent release before another appliance can protect it.');
+                });
+            }, true);
+            return result;
+        };
+        return true;
+    }
+
     function sectionFor(title) {
         const direct = title.closest('.card, .panel, fieldset');
         if (direct) return direct;
@@ -159,7 +203,28 @@
 
     function cachedRelease(value) {
         const release = value && value.updater && value.updater.state && value.updater.state.available;
-        return release && release.available ? release : null;
+        return release && release.available && releaseIsNewer(release.version, value.installed_version)
+            ? release : null;
+    }
+
+    function versionParts(value) {
+        const base = String(value || '').replace(/^\d+:/, '').split('-')[0];
+        const matches = base.match(/\d+/g);
+        return matches ? matches.map(Number) : [];
+    }
+
+    function releaseIsNewer(candidate, installed) {
+        const next = versionParts(candidate);
+        const current = versionParts(installed);
+        if (!next.length || !current.length) {
+            return String(candidate || '') !== String(installed || '');
+        }
+        const length = Math.max(next.length, current.length);
+        for (let index = 0; index < length; index += 1) {
+            const difference = (next[index] || 0) - (current[index] || 0);
+            if (difference) return difference > 0;
+        }
+        return false;
     }
 
     function showGlobalUpdateBanner(release) {
@@ -339,6 +404,13 @@
     function initialize() {
         initializeUpdateBanner();
         installAgentPairingErrorExplanation();
+        if (!installAgentRemovalRelease()) {
+            let attempts = 0;
+            const timer = window.setInterval(function () {
+                attempts += 1;
+                if (installAgentRemovalRelease() || attempts >= 40) window.clearInterval(timer);
+            }, 250);
+        }
         if (!/^\/configure\/device\/?$/.test(window.location.pathname)) return;
         removeLegacyRelayControl();
         const oldPanel = document.getElementById('recovera-update-panel');

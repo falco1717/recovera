@@ -460,6 +460,27 @@ def current_release():
         raise UpgradeError("installed release state contains an invalid sequence")
 
 
+def status_state(current):
+    """Return updater state without advertising an already-installed release."""
+    state = read_json(state_path(), {})
+    cached = state.get("available")
+    if not isinstance(cached, dict) or not cached.get("available"):
+        return state
+    try:
+        installed_sequence = max(
+            int(current.get("sequence", 0)), int(state.get("installed_sequence", 0))
+        )
+        cached_sequence = int(cached.get("sequence", 0))
+    except (TypeError, ValueError):
+        return state
+    if (cached_sequence <= installed_sequence
+            or cached.get("version") == current.get("version")):
+        state = dict(state)
+        state["available"] = dict(cached, available=False,
+                                  current_version=current.get("version"))
+    return state
+
+
 def state_path():
     return Path(os.environ.get("RECOVERA_UPGRADE_STATE", DEFAULT_STATE))
 
@@ -775,6 +796,13 @@ def commit_package_transaction(config, state):
     }
     state["installed_sequence"] = int(pending["sequence"])
     state["installed"] = installed
+    state["available"] = {
+        "available": False,
+        "channel": config["CHANNEL"],
+        "current_version": installed["version"],
+        "version": installed["version"],
+        "sequence": installed["sequence"],
+    }
     state["last_transaction"] = pending
     state["pending"] = None
     atomic_json(state_path(), state)
@@ -971,10 +999,11 @@ def command_rollback(config, args):
 
 
 def command_status(config, args):
+    current = current_release()
     value = {
         "updater_version": UPDATER_VERSION,
-        "current": current_release(),
-        "state": read_json(state_path(), {}),
+        "current": current,
+        "state": status_state(current),
         "image_layout": read_json(layout_path(), None),
         "activation_supported": layout_path().exists() and BOOT_HELPER.exists(),
         "package_updates_supported": shutil.which("apt-get") is not None and shutil.which("dpkg-deb") is not None,

@@ -1,0 +1,19 @@
+[Unit]
+Description=Recovera agent ownership transfer service
+After=network-online.target dlad.service
+Wants=network-online.target dlad.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/recovera-agent-transfer serve
+Restart=on-failure
+RestartSec=5
+User=root
+Group=root
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/etc/datto/dla /run
+
+[Install]
+WantedBy=multi-user.target

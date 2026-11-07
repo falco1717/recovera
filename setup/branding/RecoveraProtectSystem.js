@@ -46,6 +46,31 @@
         });
     }
 
+    function deduplicateSystems(systems) {
+        var result = Object.assign({}, systems);
+        var seen = new Set();
+        if (systems.type === 'agent') {
+            result.agentNames = (systems.agentNames || []).filter(function (name) {
+                var identity = String(name || '').trim().toLowerCase();
+                if (!identity || seen.has(identity)) return false;
+                seen.add(identity);
+                return true;
+            });
+        } else if (systems.type === 'agentless') {
+            result.vms = (systems.vms || []).filter(function (vm, index) {
+                var strong = String(vm.uuid || vm.keyName || '').trim().toLowerCase();
+                var weak = [vm.name, vm.hostname].map(function (value) {
+                    return String(value || '').trim().toLowerCase();
+                }).filter(Boolean).join('|');
+                var identity = strong ? 'id:' + strong : (weak ? 'name:' + weak : 'row:' + index);
+                if (seen.has(identity)) return false;
+                seen.add(identity);
+                return true;
+            });
+        }
+        return result;
+    }
+
     function installWizardBridge() {
         if (!Datto.App.WizardSystem || Datto.App.WizardSystem.prototype.recoveraInstalled) {
             return;
@@ -54,6 +79,7 @@
         var nativeAddSystems = prototype.addSystems;
         prototype.recoveraInstalled = true;
         prototype.addSystems = function (systems, doneCallback, statusCallback) {
+            systems = deduplicateSystems(systems);
             var model = systems.model;
             if (!model || model.replicationType !== 'siris') {
                 return nativeAddSystems.call(this, systems, doneCallback, statusCallback);
