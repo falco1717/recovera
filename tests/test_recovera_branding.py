@@ -44,6 +44,12 @@ class RecoveraBrandingTests(unittest.TestCase):
         self.assertIn("An agent can be protected by only one appliance", cleanup)
         self.assertIn("Configure → Off-site Target", cleanup)
         self.assertIn("MutationObserver", cleanup)
+        self.assertIn("Expand Backup Storage", cleanup)
+        self.assertIn("settingRecoveraStorageExpand", cleanup)
+        self.assertIn("integrityCheckTimeoutNtfsresize", cleanup)
+        self.assertIn("storage-status", cleanup)
+        self.assertIn("storage-expand", cleanup)
+        self.assertIn("expand-to-maximum", cleanup)
 
         home = (ROOT / "setup" / "branding" / "RecoveraHome.js").read_text()
         self.assertIn("replication-success", home)

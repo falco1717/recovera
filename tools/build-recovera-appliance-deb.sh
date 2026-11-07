@@ -39,7 +39,7 @@ Section: admin
 Priority: optional
 Architecture: all
 Maintainer: Recovera Project <noreply@recovera.local>
-Depends: python3, openssh-client, openssh-server, sudo, apache2, php8.1-fpm, xz-utils
+Depends: python3, openssh-client, openssh-server, sudo, apache2, php8.1-fpm, xz-utils, zfsutils-linux, gdisk, cloud-guest-utils, parted, util-linux, udev
 Description: Recovera appliance control plane
  Recovera branding, private replication, administrator integration, and signed
  package/image upgrade client for an already provisioned Recovera appliance.
