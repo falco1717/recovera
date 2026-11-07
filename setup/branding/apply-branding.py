@@ -282,6 +282,35 @@ def patch_replication_pane(text: str) -> str:
     return text
 
 
+SYNCHRONIZE_SCRIPT = (
+    "<script type=\"text/javascript\" "
+    "src=\"{{ asset('commonlookandfeel/js/App/Synchronize/RecoveraSynchronize.js') }}\"></script>"
+)
+SYNCHRONIZE_PANEL = '<div id="recovera-sync-panel" class="recovera-sync-panel"></div>'
+
+
+def patch_synchronize_template(text: str) -> str:
+    """Show Recovera appliance replication on the native Synchronize page."""
+    if "RecoveraSynchronize.js" not in text:
+        pattern = re.compile(r"(?P<script><script[^>]+Synchronize/ReplicationStatusView\.js[^>]*></script>)")
+        patched, count = pattern.subn(lambda match: match.group("script") + "\n    " + SYNCHRONIZE_SCRIPT,
+                                      text, count=1)
+        if not count:
+            start = text.find("{% block scripts %}")
+            end = text.find("{% endblock %}", start) if start >= 0 else -1
+            if end >= 0:
+                patched = text[:end] + "    " + SYNCHRONIZE_SCRIPT + "\n" + text[end:]
+        text = patched
+    if 'id="recovera-sync-panel"' not in text:
+        body = '<div id="synchronizeBody">'
+        if body in text:
+            text = text.replace(body, body + "\n        " + SYNCHRONIZE_PANEL, 1)
+        elif "{% block content %}" in text:
+            text = text.replace("{% block content %}",
+                                "{% block content %}\n    " + SYNCHRONIZE_PANEL, 1)
+    return text
+
+
 def patch_home_device_info(text: str) -> str:
     if "RecoveraHome.js" not in text:
         text = text.replace(
@@ -350,6 +379,7 @@ def main() -> int:
     protect_system_js = WEB / "commonlookandfeel/js/App/Agents/RecoveraProtectSystem.js"
     home_js = WEB / "commonlookandfeel/js/App/Home/RecoveraHome.js"
     device_settings_js = WEB / "commonlookandfeel/js/App/Configure/RecoveraDeviceSettings.js"
+    synchronize_js = WEB / "commonlookandfeel/js/App/Synchronize/RecoveraSynchronize.js"
     for source, target in (
         (resources / "RecoveraTargetController.php", controller),
         (resources / "recovera-target.html.twig", target_template),
@@ -361,6 +391,7 @@ def main() -> int:
         (resources / "RecoveraProtectSystem.js", protect_system_js),
         (resources / "RecoveraHome.js", home_js),
         (resources / "RecoveraDeviceSettings.js", device_settings_js),
+        (resources / "RecoveraSynchronize.js", synchronize_js),
     ):
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(source, target)
@@ -394,6 +425,11 @@ def main() -> int:
     update(ROOT / "templates/commonlookandfeel/Agents/Add/index.html.twig", patch_protect_system_index)
     update(ROOT / "templates/commonlookandfeel/Assets/Configure/cloud.backup.html.twig", patch_replication_pane)
     update(ROOT / "templates/commonlookandfeel/Home/deviceInfo.block.html.twig", patch_home_device_info)
+    for path in (
+        ROOT / "templates/commonlookandfeel/Synchronize/index.html.twig",
+        ROOT / "templates/vintage/Synchronize/index.html.twig",
+    ):
+        update(path, patch_synchronize_template)
     update(ROOT / "config/routes.yaml", add_routes)
 
     update(ROOT / "templates/commonlookandfeel/Authentication/index.login.html.twig", brand_login)

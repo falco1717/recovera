@@ -842,5 +842,227 @@ class RecoveraPeerTests(unittest.TestCase):
                 self.peer.receive_dataset(source, asset, "1791756980", "-", encoded, True, mock.Mock())
 
 
+    # --- Live replication activity (Synchronize page) -------------------------
+
+    def fake_proc(self, processes, *, boot_age=100000):
+        """Build a fake /proc with {pid: (argv, io_counters, seconds_since_start)}."""
+        proc = self.root / "proc"
+        proc.mkdir(exist_ok=True)
+        boot = int(self.peer.time.time()) - boot_age
+        (proc / "stat").write_text(f"cpu 1 2 3\nbtime {boot}\n", encoding="ascii")
+        hertz = 100
+        with contextlib.suppress(AttributeError, ValueError, OSError):
+            hertz = int(os.sysconf("SC_CLK_TCK"))
+        for pid, (argv, counters, age) in processes.items():
+            entry = proc / str(pid)
+            entry.mkdir()
+            (entry / "cmdline").write_bytes(b"\0".join(arg.encode() for arg in argv) + b"\0")
+            (entry / "io").write_text(
+                "".join(f"{name}: {value}\n" for name, value in counters.items()), encoding="ascii")
+            ticks = int((boot_age - age) * hertz)
+            fields = ["S"] + ["0"] * 18 + [str(ticks)] + ["0"] * 5
+            (entry / "stat").write_text(f"{pid} (zfs) " + " ".join(fields) + "\n", encoding="ascii")
+        return proc
+
+    def test_replication_activity_reports_tracked_outbound_progress(self):
+        peer_id = "12345678-1234-1234-1234-123456789abc"
+        asset = "4" * 32
+        cfg = self.peer.config()
+        cfg["peers"][peer_id] = {"name": "Backup-Bitches", "enabled": True}
+        self.peer.save_config(cfg)
+        self.peer.write_transfer_record("outbound", f"{peer_id}:{asset}", {
+            "direction": "outbound", "asset": asset, "name": "jprod-sb", "peer_id": peer_id,
+            "peer_name": "Backup-Bitches", "snapshot": "1794086526", "mode": "resumed",
+            "bytes_total": 1000, "bytes_before": 100, "started": int(self.peer.time.time()) - 10,
+            "pid": 4242,
+        })
+        proc = self.fake_proc({4242: (["zfs", "send", "-t", "1-abc-def"], {"wchar": 400}, 10)})
+        with mock.patch.object(self.peer, "PROC_ROOT", proc):
+            activity = self.peer.replication_activity()
+        self.assertEqual(activity["active"]["inbound"], [])
+        item = activity["active"]["outbound"][0]
+        self.assertEqual(item["status"], "transferring")
+        self.assertEqual(item["name"], "jprod-sb")
+        self.assertEqual(item["peer_name"], "Backup-Bitches")
+        self.assertEqual(item["mode"], "resumed")
+        self.assertEqual(item["bytes_done"], 500)
+        self.assertEqual(item["percent"], 50.0)
+        self.assertGreater(item["rate_bps"], 0)
+        self.assertGreater(item["eta_seconds"], 0)
+
+    def test_replication_activity_discovers_receive_started_by_older_code(self):
+        source_id = "ab15e185-157d-487b-abe4-6a064c26decc"
+        asset = "47f5020e4d344b0cac8cdb1f193c0f9b"
+        cfg = self.peer.config()
+        cfg["sources"][source_id] = {"name": "recovera", "address": "10.10.20.10"}
+        self.peer.save_config(cfg)
+        with self.peer.locked_state() as value:
+            value["received"] = {asset: {"source_id": source_id, "snapshot": "1794086526",
+                                         "status": "receiving", "updated": 1}}
+        dataset = f"homePool/home/agents/{asset}"
+        proc = self.fake_proc({
+            77: (["zfs", "receive", "-u", "-s", dataset], {"rchar": 8_000_000}, 100),
+            78: (["zfs", "send", "-nP", f"{dataset}@1794086526"], {"wchar": 5}, 1),
+            79: (["python3", "/usr/local/sbin/recovera-peer", "serve"], {"rchar": 1}, 1),
+        })
+        with mock.patch.object(self.peer, "PROC_ROOT", proc):
+            activity = self.peer.replication_activity()
+        self.assertEqual(activity["active"]["outbound"], [])
+        self.assertEqual(len(activity["active"]["inbound"]), 1)
+        item = activity["active"]["inbound"][0]
+        self.assertEqual(item["status"], "transferring")
+        self.assertEqual(item["asset"], asset)
+        self.assertEqual(item["bytes_done"], 8_000_000)
+        self.assertIsNone(item["bytes_total"])
+        self.assertEqual(item["source_name"], "recovera")
+        self.assertEqual(item["source_address"], "10.10.20.10")
+        self.assertIsNone(item["mode"])
+        self.assertEqual(item["snapshot"], "1794086526")
+        self.assertEqual(activity["paired"], {"targets": 0, "sources": 1})
+
+    def test_zfs_transfer_process_ignores_dry_runs_and_classifies_streams(self):
+        classify = self.peer._zfs_transfer_process
+        self.assertIsNone(classify(["zfs", "send", "-nP", "pool/a@1"]))
+        self.assertIsNone(classify(["zfs", "send", "-nvP", "-t", "token"]))
+        self.assertIsNone(classify(["zfs", "list", "-H"]))
+        self.assertEqual(classify(["zfs", "send", "pool/a@1"]), ("outbound", "pool/a", "full"))
+        self.assertEqual(classify(["zfs", "send", "-I", "pool/a@1", "pool/a@2"]),
+                         ("outbound", "pool/a", "incremental"))
+        self.assertEqual(classify(["zfs", "send", "-t", "token"]), ("outbound", "", "resumed"))
+        self.assertEqual(classify(["/usr/sbin/zfs", "receive", "-u", "-s", "pool/a"]),
+                         ("inbound", "pool/a", ""))
+
+    def test_replication_activity_marks_dead_transfers_interrupted_and_expires_old_records(self):
+        peer_id = "12345678-1234-1234-1234-123456789abc"
+        source_id = "87654321-4321-4321-4321-cba987654321"
+        fresh, old, paused = "5" * 32, "6" * 32, "7" * 32
+        self.peer.write_transfer_record("outbound", f"{peer_id}:{fresh}", {
+            "direction": "outbound", "asset": fresh, "name": "fresh", "pid": 999,
+            "mode": "full", "bytes_total": 10, "bytes_before": 0, "started": 1})
+        self.peer.write_transfer_record("outbound", f"{peer_id}:{old}", {
+            "direction": "outbound", "asset": old, "name": "old", "pid": 998})
+        old_path = self.peer._transfer_record_path("outbound", f"{peer_id}:{old}")
+        record = json.loads(old_path.read_text(encoding="utf-8"))
+        record["updated"] = int(self.peer.time.time()) - 3 * 24 * 3600
+        old_path.write_text(json.dumps(record), encoding="utf-8")
+        with self.peer.locked_state() as value:
+            value["received"] = {paused: {"source_id": source_id, "snapshot": "1",
+                                          "status": "receiving", "updated": 1}}
+        proc = self.fake_proc({})
+        with mock.patch.object(self.peer, "PROC_ROOT", proc):
+            activity = self.peer.replication_activity()
+        outbound = activity["active"]["outbound"]
+        self.assertEqual([item["asset"] for item in outbound], [fresh])
+        self.assertEqual(outbound[0]["status"], "interrupted")
+        self.assertNotIn("pid", outbound[0])
+        self.assertFalse(old_path.exists())
+        inbound = activity["active"]["inbound"]
+        self.assertEqual([(item["asset"], item["status"]) for item in inbound],
+                         [(paused, "interrupted")])
+
+    def test_receive_dataset_records_live_transfer_and_clears_it(self):
+        source = "12345678-1234-1234-1234-123456789abc"
+        asset = "8" * 32
+        cfg = self.peer.config()
+        cfg["sources"][source] = {"name": "Bitches-DC"}
+        self.peer.save_config(cfg)
+        agent_info = json.dumps({"hostname": "jprod-sb"}).encode()
+        metadata = {
+            "asset": asset, "source_id": source, "source_numeric_id": 1234567890,
+            "source_name": "Bitches-DC",
+            "files": {"agentInfo": self.peer.base64.b64encode(agent_info).decode()},
+        }
+        seen = {}
+
+        def communicate():
+            path = self.peer._transfer_record_path("inbound", asset)
+            seen.update(json.loads(path.read_text(encoding="utf-8")))
+            return b"", b""
+
+        process = mock.Mock(pid=555, returncode=0, communicate=communicate)
+        with mock.patch.object(self.peer, "zfs_exists", return_value=False), \
+             mock.patch.object(self.peer, "load_origin", return_value={}), \
+             mock.patch.object(self.peer, "zfs_snapshots", return_value=[]), \
+             mock.patch.object(self.peer, "install_metadata"), \
+             mock.patch.object(self.peer, "prune_received_snapshots", return_value=[]), \
+             mock.patch.object(self.peer, "run", return_value=mock.Mock(returncode=0, stdout=b"", stderr=b"")), \
+             mock.patch.object(self.peer.subprocess, "Popen", return_value=process):
+            answer = self.peer.receive_dataset(source, asset, "1794086526", "-",
+                                               self.peer.encode_metadata(metadata), False, mock.Mock())
+        self.assertTrue(answer["ok"])
+        self.assertEqual(seen["pid"], 555)
+        self.assertEqual(seen["name"], "jprod-sb")
+        self.assertEqual(seen["source_name"], "Bitches-DC")
+        self.assertEqual(seen["mode"], "full")
+        self.assertFalse(self.peer._transfer_record_path("inbound", asset).exists())
+
+    def replicate_fixture(self, remote):
+        peer_id = "12345678-1234-1234-1234-123456789abc"
+        asset = "9" * 32
+        cfg = self.peer.config()
+        cfg["peers"][peer_id] = {"name": "Backup-Bitches", "host": "10.0.3.187", "enabled": True}
+        self.peer.save_config(cfg)
+        patches = [
+            mock.patch.object(self.peer, "zfs_exists", return_value=True),
+            mock.patch.object(self.peer, "load_origin", return_value={}),
+            mock.patch.object(self.peer, "zfs_snapshots", return_value=["1794086526"]),
+            mock.patch.object(self.peer, "remote_json", return_value=remote),
+            mock.patch.object(self.peer, "zfs_send_estimate", return_value=1000),
+            mock.patch.object(self.peer, "collect_metadata", return_value={}),
+            mock.patch.object(self.peer, "encode_metadata", return_value="meta"),
+            mock.patch.object(self.peer, "asset_display_name", return_value="jprod-sb"),
+        ]
+        return peer_id, asset, patches
+
+    def test_replicate_records_outbound_transfer_and_clears_it_on_failure(self):
+        peer_id, asset, patches = self.replicate_fixture({"snapshots": [], "storage": {}})
+        seen = {}
+
+        def transfer(send, peer, remote, speed, on_start=None):
+            on_start(321)
+            path = self.peer._transfer_record_path("outbound", f"{peer_id}:{asset}")
+            seen.update(json.loads(path.read_text(encoding="utf-8")))
+            raise self.peer.PeerError("link dropped")
+
+        with contextlib.ExitStack() as stack:
+            for patch in patches:
+                stack.enter_context(patch)
+            stack.enter_context(mock.patch.object(self.peer, "transfer_stream", side_effect=transfer))
+            with self.assertRaises(self.peer.PeerError):
+                self.peer.replicate(asset, peer_id)
+        self.assertEqual(seen["pid"], 321)
+        self.assertEqual(seen["mode"], "full")
+        self.assertEqual(seen["bytes_total"], 1000)
+        self.assertEqual(seen["peer_name"], "Backup-Bitches")
+        self.assertFalse(list((self.peer.TRANSFER_DIR).glob("*.json")))
+
+    def test_replicate_resume_counts_bytes_already_on_target(self):
+        peer_id, asset, patches = self.replicate_fixture(
+            {"snapshots": [], "storage": {}, "resume_token": "1-abc"})
+        seen = {}
+
+        def transfer(send, peer, remote, speed, on_start=None):
+            on_start(654)
+            path = self.peer._transfer_record_path("outbound", f"{peer_id}:{asset}")
+            seen.update(json.loads(path.read_text(encoding="utf-8")))
+            seen["send"] = send
+
+        with contextlib.ExitStack() as stack:
+            for patch in patches:
+                stack.enter_context(patch)
+            stack.enter_context(mock.patch.object(self.peer, "transfer_stream", side_effect=transfer))
+            stack.enter_context(mock.patch.object(self.peer, "zfs_send_resume_estimate", return_value=300))
+            result = self.peer.replicate(asset, peer_id)
+        self.assertEqual(result["status"], "resumed")
+        self.assertEqual(seen["send"], ["zfs", "send", "-t", "1-abc"])
+        self.assertEqual(seen["bytes_before"], 700)
+        self.assertFalse(list((self.peer.TRANSFER_DIR).glob("*.json")))
+
+    def test_replication_activity_route_is_proxied_for_the_webui(self):
+        controller = CONTROLLER.read_text(encoding="utf-8")
+        self.assertIn("'replication-activity' => ['GET', '/v1/admin/replication-activity']", controller)
+        source = SCRIPT.read_text(encoding="utf-8")
+        self.assertIn('"/v1/admin/replication-activity"', source)
+
 if __name__ == "__main__":
     unittest.main()
