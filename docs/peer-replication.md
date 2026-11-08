@@ -89,6 +89,46 @@ replication policy still references it.
 - Target retention is enforced after a successful receive. Points older than
   the selected horizon are removed through the appliance's supported local
   recovery-point deletion command, and the newest point is always retained.
+- Transfers always run in `recovera-peer-sync.service`, both from the schedule
+  and from **Configure → Off-site Target → Synchronize now**, which starts that
+  service in the background and returns immediately. Updates restart the WebUI
+  service (`recovera-peer.service`) but never the sync service, and the updater
+  suspends Ubuntu's `needrestart` during package installs, so a long seed keeps
+  running through an update.
+
+## Monitoring progress
+
+The native **Synchronize** page shows a **Recovera appliance replication**
+panel, because Recovera transfers do not go through SpeedSync and never appear
+in its charts. It refreshes every five seconds and lists:
+
+- each active transfer in either direction, with the protected system, the
+  paired appliance (name and address), recovery point, type (full seed,
+  incremental or resumed), bytes moved, total and percentage when known, speed
+  and estimated time remaining;
+- interrupted transfers (they resume from the receive token on the next run);
+- the last completed or failed replication per asset.
+
+Progress is read from the `zfs send`/`zfs receive` process I/O counters, so it
+costs nothing on the stream. A resumed transfer counts the bytes already on
+the target (from the `receive_resume_token`), and the sender passes its size
+estimate so the target can show a percentage. The same data is available to
+administrators at `GET /api/recovera/offsite-target/replication-activity`.
+
+Appliances identify each other by their current device name (the hostname set
+by **Name the Device**), refreshed on every transfer, followed by their
+address.
+
+## Connectivity check
+
+**Configure → Networking → Run Outbound Connectivity Check** runs Recovera's
+own check instead of the stock one, which probed vendor endpoints (heartbeat,
+off-site cloud, speedtest and update servers) that an offline appliance must
+not contact. It tests the default gateway, unfragmented 1472-byte packets to
+the first off-site target (or the gateway), DNS for the update source, time
+synchronization, the update source itself (GitHub or the configured update
+gateways), and HTTPS and SSH to each paired target and HTTPS to each paired
+source. Hover a result for its detail.
 
 ## Security model
 
