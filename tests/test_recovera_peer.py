@@ -1023,7 +1023,7 @@ class RecoveraPeerTests(unittest.TestCase):
         peer_id, asset, patches = self.replicate_fixture({"snapshots": [], "storage": {}})
         seen = {}
 
-        def transfer(send, peer, remote, speed, on_start=None):
+        def transfer(send, peer, remote, speed, on_start=None, codec=None):
             on_start(321)
             path = self.peer._transfer_record_path("outbound", f"{peer_id}:{asset}")
             seen.update(json.loads(path.read_text(encoding="utf-8")))
@@ -1046,7 +1046,7 @@ class RecoveraPeerTests(unittest.TestCase):
             {"snapshots": [], "storage": {}, "resume_token": "1-abc"})
         seen = {}
 
-        def transfer(send, peer, remote, speed, on_start=None):
+        def transfer(send, peer, remote, speed, on_start=None, codec=None):
             on_start(654)
             path = self.peer._transfer_record_path("outbound", f"{peer_id}:{asset}")
             seen.update(json.loads(path.read_text(encoding="utf-8")))
@@ -1327,7 +1327,7 @@ class RecoveraPeerTests(unittest.TestCase):
         source_text = SCRIPT.read_text(encoding="utf-8")
         self.assertIn('_remember_name("sources", source_id, metadata["source_name"])', source_text)
         self.assertIn('_remember_name("peers", peer_id, remote.get("appliance_name"))', source_text)
-        self.assertIn('"appliance_name": appliance_name(cfg)}', source_text)
+        self.assertIn('"appliance_name": appliance_name(cfg), "stream_codecs": local_stream_codecs()}', source_text)
 
     def test_resumed_send_measures_progress_from_the_token_not_the_estimate(self):
         token = self.resume_token([("bytes", 21_520_000_000)])
@@ -1335,7 +1335,7 @@ class RecoveraPeerTests(unittest.TestCase):
             {"snapshots": [], "storage": {}, "resume_token": token})
         seen = {}
 
-        def transfer(send, peer, remote, speed, on_start=None):
+        def transfer(send, peer, remote, speed, on_start=None, codec=None):
             on_start(777)
             path = self.peer._transfer_record_path("outbound", f"{peer_id}:{asset}")
             seen.update(json.loads(path.read_text(encoding="utf-8")))
@@ -1363,6 +1363,58 @@ class RecoveraPeerTests(unittest.TestCase):
         self.assertIn("net.ipv4.tcp_congestion_control = bbr", sysctl)
         self.assertIn("net.core.default_qdisc = fq", sysctl)
         self.assertIn("tcp_bbr", (SCRIPT.parent / "modules-load-recovera-bbr.conf").read_text(encoding="utf-8"))
+
+    # --- zstd transport compression ---
+
+    def test_sender_uses_zstd_only_when_the_target_offers_it(self):
+        for offered, expected in ((["zstd"], "zstd"), ([], None), (None, None)):
+            remote = {"snapshots": [], "storage": {}}
+            if offered is not None:
+                remote["stream_codecs"] = offered
+            peer_id, asset, patches = self.replicate_fixture(remote)
+            with contextlib.ExitStack() as stack:
+                for patch in patches:
+                    stack.enter_context(patch)
+                stack.enter_context(mock.patch.object(self.peer, "local_stream_codecs", return_value=["zstd"]))
+                transfer = stack.enter_context(mock.patch.object(self.peer, "transfer_stream"))
+                self.peer.replicate(asset, peer_id)
+            remote_command = transfer.call_args.args[2]
+            self.assertEqual(transfer.call_args.kwargs["codec"], expected)
+            if expected:
+                self.assertEqual(remote_command[-1], "zstd")
+                self.assertEqual(len(remote_command), 6)
+            else:
+                self.assertEqual(len(remote_command), 5)
+
+    def test_receiver_accepts_only_supported_codec_arguments(self):
+        source = "12345678-1234-1234-1234-123456789abc"
+        calls = []
+        with mock.patch.object(self.peer, "receive_dataset",
+                               side_effect=lambda *args: calls.append(args) or {"ok": True}), \
+             mock.patch.object(self.peer, "local_stream_codecs", return_value=["zstd"]), \
+             mock.patch.object(self.peer.sys, "stdout"):
+            for command in ("receive " + "a" * 32 + " 1 - meta zstd",
+                            "receive-resume " + "a" * 32 + " 1 meta zstd",
+                            "receive " + "a" * 32 + " 1 - meta"):
+                with mock.patch.dict(os.environ, {"SSH_ORIGINAL_COMMAND": command}):
+                    self.peer.ssh_entry(source)
+            with mock.patch.dict(os.environ, {"SSH_ORIGINAL_COMMAND": "receive " + "a" * 32 + " 1 - meta gzip"}):
+                with self.assertRaises(self.peer.PeerError):
+                    self.peer.ssh_entry(source)
+        self.assertEqual([call[-1] for call in calls], ["zstd", "zstd", None])
+        self.assertEqual([call[5] for call in calls], [False, True, False])
+
+    def test_zstd_pipeline_round_trips_the_stream(self):
+        import shutil
+        if os.name != "posix" or not shutil.which("zstd"):
+            self.skipTest("needs a POSIX host with zstd")
+        payload = self.root / "payload.bin"
+        payload.write_bytes(b"recovera replication " * 50000)
+        received = self.root / "received.bin"
+        remote = f"zstd -q -d -c > {received} && printf '{{\"ok\": true}}'"
+        with mock.patch.object(self.peer, "ssh_base", return_value=["sh", "-c"]):
+            self.peer.transfer_stream(["cat", str(payload)], {}, ["sh", "-c", remote], codec="zstd")
+        self.assertEqual(received.read_bytes(), payload.read_bytes())
 
 if __name__ == "__main__":
     unittest.main()

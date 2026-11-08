@@ -1,5 +1,20 @@
 # Changelog
 
+## v0.6.35 - 2026-11-07
+
+- Replication streams are compressed in transit with zstd when both appliances
+  support it: the target advertises `stream_codecs` in its `asset-info` reply
+  and the source adds the codec to the receive command, so older appliances keep
+  receiving plain streams. `zstd --adapt` raises the level on slow WAN links and
+  lowers it on fast LANs. Compression also applies to resumed streams, so a
+  running seed speeds up after a restart without losing progress. On the
+  Bitches-DC → Backup-Bitches link (~40–45 Mbit/s shared) the jprod-sb stream
+  compresses about 1.5–1.8×.
+- Progress, speed and time remaining stay in ZFS-stream bytes (the receiver
+  decompresses before `zfs receive`), so they show effective backup throughput.
+  The Synchronize panel marks compressed transfers.
+- An upload speed limit applies after compression, so it caps bytes on the wire.
+
 ## v0.6.34 - 2026-11-07
 
 - Faster replication over WAN links: the package enables BBR congestion control
