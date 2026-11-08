@@ -309,9 +309,9 @@ class RecoveraUpgradeTests(unittest.TestCase):
     def test_channel_points_to_current_package_release(self):
         channel = json.loads((ROOT / "upgrade" / "channels" / "stable.json").read_text())
         self.assertEqual(channel["type"], "package")
-        self.assertEqual(channel["release_tag"], "package-v0.6.29")
-        self.assertEqual(channel["version"], "0.6.29")
-        self.assertEqual(channel["sequence"], 28)
+        self.assertEqual(channel["release_tag"], "package-v0.6.31")
+        self.assertEqual(channel["version"], "0.6.31")
+        self.assertEqual(channel["sequence"], 30)
 
     def test_empty_channel_is_a_successful_no_update_check(self):
         with tempfile.TemporaryDirectory() as directory:
