@@ -1,5 +1,22 @@
 # Changelog
 
+## v0.6.33 - 2026-11-07
+
+- **Configure → Networking → Run Outbound Connectivity Check** now runs
+  Recovera's own check instead of probing vendor endpoints (heartbeat, off-site
+  cloud, speedtest and update servers, BMC) that an offline appliance must not
+  contact. It tests the default gateway, unfragmented 1472-byte packets, DNS
+  and reachability of the update source, time synchronization, and HTTPS/SSH
+  to every paired target and HTTPS to every paired source, in parallel. The
+  page shows Recovera's last result, adds failure details on hover, and drops
+  the vendor knowledge-base link.
+- Appliances now advertise their current device name (the hostname set by
+  **Name the Device**) instead of the first-boot name ("recovera" on OVA
+  deployments), and refresh each other's stored names on every transfer, so a
+  target shows its source by its real name.
+- Documented replication monitoring, the background **Synchronize now**, and
+  the new connectivity check in `docs/peer-replication.md`.
+
 ## v0.6.32 - 2026-11-07
 
 - The Synchronize page's replication panel shows an animated progress bar when

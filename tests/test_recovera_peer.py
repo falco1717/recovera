@@ -1204,5 +1204,126 @@ class RecoveraPeerTests(unittest.TestCase):
         self.assertFalse(answer["started"])
         self.assertTrue(answer["running"])
 
+    # --- Recovera network check (replaces Datto's outbound connectivity check) ---
+
+    def test_network_check_probes_recovera_dependencies_not_vendor_endpoints(self):
+        cfg = self.peer.config()
+        cfg["peers"]["12345678-1234-1234-1234-123456789abc"] = {
+            "name": "Backup-Bitches", "host": "10.0.3.187", "port": 443, "ssh_port": 22,
+            "enabled": True}
+        cfg["peers"]["87654321-4321-4321-4321-cba987654321"] = {
+            "name": "Old", "host": "10.0.3.99", "enabled": False}
+        cfg["sources"]["ab15e185-157d-487b-abe4-6a064c26decc"] = {
+            "name": "recovera", "address": "10.10.20.10"}
+        self.peer.save_config(cfg)
+        tcp = []
+
+        def fake_tcp(host, port, timeout=4.0):
+            tcp.append((host, port))
+            return (host, port) != ("10.0.3.187", 22), "probe"
+
+        with mock.patch.object(self.peer, "_default_gateway", return_value="10.0.3.1"), \
+             mock.patch.object(self.peer, "_check_ping", return_value=(True, "2 received")) as ping, \
+             mock.patch.object(self.peer, "_check_dns", return_value=(True, "1.2.3.4")) as dns, \
+             mock.patch.object(self.peer, "_check_time_sync", return_value=(True, "synchronized")), \
+             mock.patch.object(self.peer, "_update_hosts", return_value=["updates.example.net"]), \
+             mock.patch.object(self.peer, "_check_tcp", side_effect=fake_tcp):
+            result = self.peer.network_check()
+        data = result["data"]
+        self.assertEqual(list(data), [
+            "Default gateway (10.0.3.1)",
+            "Full-size packets, 1472 bytes (10.0.3.187)",
+            "DNS resolution (updates.example.net)",
+            "Time synchronization",
+            "Update source (updates.example.net:443)",
+            "Off-site target Backup-Bitches (10.0.3.187) HTTPS 443",
+            "Off-site target Backup-Bitches (10.0.3.187) SSH 22",
+            "Paired source recovera (10.10.20.10) HTTPS 443",
+        ])
+        self.assertFalse(data["Off-site target Backup-Bitches (10.0.3.187) SSH 22"])
+        self.assertTrue(all(value for key, value in data.items() if "SSH" not in key))
+        ping.assert_any_call("10.0.3.187", 1472)
+        dns.assert_called_once_with("updates.example.net")
+        self.assertNotIn(("10.0.3.99", 443), tcp)
+        joined = " ".join(data).lower()
+        for vendor in ("datto", "heartbeat", "speedtest", "bmc"):
+            self.assertNotIn(vendor, joined)
+        self.assertEqual(self.peer.last_network_check()["data"], data)
+
+    def test_network_check_survives_a_failing_probe_and_missing_gateway(self):
+        with mock.patch.object(self.peer, "_default_gateway", return_value=None), \
+             mock.patch.object(self.peer, "_check_dns", side_effect=RuntimeError("resolver crashed")), \
+             mock.patch.object(self.peer, "_check_time_sync", return_value=(False, "not synchronized")), \
+             mock.patch.object(self.peer, "_update_hosts", return_value=["api.github.com"]), \
+             mock.patch.object(self.peer, "_check_tcp", return_value=(False, "timed out")):
+            result = self.peer.network_check()
+        self.assertFalse(result["data"]["Default gateway"])
+        self.assertEqual(result["details"]["Default gateway"], "no IPv4 default route")
+        self.assertFalse(result["data"]["DNS resolution (api.github.com)"])
+        self.assertIn("resolver crashed", result["details"]["DNS resolution (api.github.com)"])
+
+    def test_update_hosts_follow_the_configured_update_gateway(self):
+        config_path = self.root / "upgrade.conf"
+        config_path.write_text("REPOSITORY=falco1717/recovera\n", encoding="utf-8")
+        with mock.patch.object(self.peer, "UPGRADE_CONFIG_PATH", config_path):
+            self.assertEqual(self.peer._update_hosts(), ["api.github.com"])
+            config_path.write_text(
+                "UPDATE_ORIGINS=https://gw-a.example.net, https://gw-b.example.net:8443\n",
+                encoding="utf-8")
+            self.assertEqual(self.peer._update_hosts(), ["gw-a.example.net", "gw-b.example.net"])
+
+    def test_default_gateway_is_read_from_the_kernel_route_table(self):
+        proc = self.root / "proc-route"
+        (proc / "net").mkdir(parents=True)
+        (proc / "net" / "route").write_text(
+            "Iface\tDestination\tGateway \tFlags\n"
+            "br0\t0003000A\t00000000\t0001\n"
+            "br0\t00000000\t0103000A\t0003\n", encoding="ascii")
+        with mock.patch.object(self.peer, "PROC_ROOT", proc):
+            self.assertEqual(self.peer._default_gateway(), "10.0.3.1")
+
+    def test_network_check_routes_are_proxied_for_the_webui(self):
+        controller = CONTROLLER.read_text(encoding="utf-8")
+        self.assertIn("'network-check' => ['GET', '/v1/admin/network-check']", controller)
+        self.assertIn("'network-check-last' => ['GET', '/v1/admin/network-check/last']", controller)
+
+    # --- Device names follow "Name the Device" ---
+
+    def test_appliance_name_follows_the_current_hostname(self):
+        cfg = self.peer.config()
+        cfg["name"] = "recovera"
+        self.peer.save_config(cfg)
+        no_zfs = mock.Mock(returncode=1, stdout=b"", stderr=b"")
+        with mock.patch.object(self.peer.socket, "gethostname", return_value="Bitches-DC.local"), \
+             mock.patch.object(self.peer, "run", return_value=no_zfs), \
+             mock.patch.object(self.peer, "gateway_tls_fingerprint", return_value="SHA256:00"), \
+             mock.patch.object(self.peer, "ssh_host_keys", return_value=[], create=True), \
+             mock.patch.object(self.peer, "ssh_public_key", return_value="ssh-ed25519 AAAA test"):
+            self.assertEqual(self.peer.appliance_name(), "Bitches-DC")
+            self.assertEqual(self.peer.public_info()["name"], "Bitches-DC")
+            self.assertEqual(self.peer.collect_metadata("c" * 32, self.peer.config())["source_name"],
+                             "Bitches-DC")
+        self.assertEqual(self.peer.config()["name"], "Bitches-DC")
+
+    def test_paired_appliance_names_are_refreshed_from_replication(self):
+        source, peer_id = "ab15e185-157d-487b-abe4-6a064c26decc", "12345678-1234-1234-1234-123456789abc"
+        cfg = self.peer.config()
+        cfg["sources"][source] = {"name": "recovera", "address": "10.10.20.10"}
+        cfg["peers"][peer_id] = {"name": "recovera", "host": "10.0.3.187", "enabled": True}
+        self.peer.save_config(cfg)
+        self.peer._remember_name("sources", source, "Bitches-DC")
+        self.peer._remember_name("peers", peer_id, "Backup-Bitches")
+        self.peer._remember_name("peers", peer_id, "")
+        self.peer._remember_name("peers", peer_id, "x" * 200)
+        self.peer._remember_name("peers", "missing", "ignored")
+        cfg = self.peer.config()
+        self.assertEqual(cfg["sources"][source]["name"], "Bitches-DC")
+        self.assertEqual(cfg["peers"][peer_id]["name"], "Backup-Bitches")
+        self.assertNotIn("missing", cfg["peers"])
+        source_text = SCRIPT.read_text(encoding="utf-8")
+        self.assertIn('_remember_name("sources", source_id, metadata["source_name"])', source_text)
+        self.assertIn('_remember_name("peers", peer_id, remote.get("appliance_name"))', source_text)
+        self.assertIn('"appliance_name": appliance_name(cfg)}', source_text)
+
 if __name__ == "__main__":
     unittest.main()

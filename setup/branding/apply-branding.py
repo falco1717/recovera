@@ -311,6 +311,20 @@ def patch_synchronize_template(text: str) -> str:
     return text
 
 
+NETWORK_CHECK_SCRIPT = (
+    "<script type=\"text/javascript\" "
+    "src=\"{{ asset('commonlookandfeel/js/App/Configure/Network/RecoveraNetworkCheck.js') }}\"></script>"
+)
+
+
+def patch_network_status_template(text: str) -> str:
+    """Replace Datto's vendor-endpoint connectivity check with Recovera's."""
+    if "RecoveraNetworkCheck.js" in text:
+        return text
+    pattern = re.compile(r"(?P<script><script[^>]+Configure/Network/ConnectivityView\.js[^>]*></script>)")
+    return pattern.sub(lambda match: match.group("script") + "\n" + NETWORK_CHECK_SCRIPT, text, count=1)
+
+
 def patch_home_device_info(text: str) -> str:
     if "RecoveraHome.js" not in text:
         text = text.replace(
@@ -380,6 +394,7 @@ def main() -> int:
     home_js = WEB / "commonlookandfeel/js/App/Home/RecoveraHome.js"
     device_settings_js = WEB / "commonlookandfeel/js/App/Configure/RecoveraDeviceSettings.js"
     synchronize_js = WEB / "commonlookandfeel/js/App/Synchronize/RecoveraSynchronize.js"
+    network_check_js = WEB / "commonlookandfeel/js/App/Configure/Network/RecoveraNetworkCheck.js"
     for source, target in (
         (resources / "RecoveraTargetController.php", controller),
         (resources / "recovera-target.html.twig", target_template),
@@ -392,6 +407,7 @@ def main() -> int:
         (resources / "RecoveraHome.js", home_js),
         (resources / "RecoveraDeviceSettings.js", device_settings_js),
         (resources / "RecoveraSynchronize.js", synchronize_js),
+        (resources / "RecoveraNetworkCheck.js", network_check_js),
     ):
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(source, target)
@@ -430,6 +446,11 @@ def main() -> int:
         ROOT / "templates/vintage/Synchronize/index.html.twig",
     ):
         update(path, patch_synchronize_template)
+    for path in (
+        ROOT / "templates/commonlookandfeel/Configure/Network/ip.status.html.twig",
+        ROOT / "templates/vintage/Configure/Network/ip.status.html.twig",
+    ):
+        update(path, patch_network_status_template)
     update(ROOT / "config/routes.yaml", add_routes)
 
     update(ROOT / "templates/commonlookandfeel/Authentication/index.login.html.twig", brand_login)

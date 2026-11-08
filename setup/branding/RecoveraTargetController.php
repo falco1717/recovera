@@ -63,6 +63,8 @@ final class RecoveraTargetController extends AbstractController
             'storage-status' => ['GET', '/v1/admin/storage/status'],
             'storage-expand' => ['POST', '/v1/admin/storage/expand'],
             'replication-activity' => ['GET', '/v1/admin/replication-activity'],
+            'network-check' => ['GET', '/v1/admin/network-check'],
+            'network-check-last' => ['GET', '/v1/admin/network-check/last'],
         ];
         if (!isset($map[$operation])) {
             return new JsonResponse(['error' => 'Unknown operation'], 404);

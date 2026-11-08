@@ -158,6 +158,30 @@ canOffsite: {{ canOffsite|json_encode|raw }}
         self.assertIn("prefers-reduced-motion", panel)
         self.assertNotIn("opacity:.35", panel)
 
+    def test_network_page_uses_recovera_connectivity_check(self):
+        branding = load_module()
+        for prefix in ("commonlookandfeel", "vintage"):
+            source = (
+                "<script src=\"{{ asset('" + prefix + "/js/App/Configure/Network/ConnectivityView.js') }}\"></script>\n"
+                "<script type=\"text/javascript\">\n$(function () { view.render(); });\n</script>\n"
+            )
+            patched = branding.patch_network_status_template(source)
+            self.assertEqual(patched.count("RecoveraNetworkCheck.js"), 1)
+            self.assertEqual(branding.patch_network_status_template(patched), patched)
+            self.assertLess(patched.index("ConnectivityView.js"), patched.index("RecoveraNetworkCheck.js"))
+            self.assertLess(patched.index("RecoveraNetworkCheck.js"), patched.index("view.render()"))
+        installer = SCRIPT.read_text(encoding="utf-8")
+        self.assertIn("templates/vintage/Configure/Network/ip.status.html.twig", installer)
+        self.assertIn('(resources / "RecoveraNetworkCheck.js", network_check_js)', installer)
+        override = (ROOT / "setup" / "branding" / "RecoveraNetworkCheck.js").read_text(encoding="utf-8")
+        self.assertIn("View.prototype.renderView = function", override)
+        self.assertIn("/api/recovera/offsite-target/", override)
+        self.assertIn("'network-check'", override)
+        self.assertIn("'network-check-last'", override)
+        self.assertNotIn("v1/device/settings/network/check", override)
+        self.assertIn("help.datto.com", override)
+        self.assertNotIn("innerHTML", override)
+
     def test_home_page_replaces_native_universal_with_recovera_target(self):
         branding = load_module()
         source = """{% set numOffsiteTargets = deviceInfo.offsiteTargets|length %}
