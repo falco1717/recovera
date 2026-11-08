@@ -1,5 +1,23 @@
 # Changelog
 
+## v0.6.34 - 2026-11-07
+
+- Faster replication over WAN links: the package enables BBR congestion control
+  (sysctl drop-in, `tcp_bbr` loaded at boot). On a 133 ms, ~0.7%-loss link the
+  default CUBIC had collapsed to ~100 KB/s; BBR sustains ~3.4 MB/s.
+- New full and incremental replication streams use `zfs send -c`, sending blocks
+  as already compressed on disk. Resumed streams keep their original format, and
+  their progress is now measured from the resume token (bytes already received
+  plus `zfs send -nP -t` remaining), so totals stay exact either way.
+- Cloud isolation retires leftover SpeedSync (vendor off-site) registrations for
+  datasets that no longer exist or whose asset is set to no off-site
+  replication. Their one-minute cron otherwise queried the blocked vendor master
+  server for them and logged about 1,200–1,700 errors an hour. `speedsync remove`
+  cannot finish offline (it needs the master to acknowledge), so the registration
+  folder is moved to `/datto/config/recovera-speedsync-unregistered/`, which keeps
+  it restorable. Registrations are never judged missing unless the agent dataset
+  root is visible.
+
 ## v0.6.33 - 2026-11-07
 
 - **Configure → Networking → Run Outbound Connectivity Check** now runs

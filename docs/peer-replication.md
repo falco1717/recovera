@@ -95,6 +95,14 @@ replication policy still references it.
   service (`recovera-peer.service`) but never the sync service, and the updater
   suspends Ubuntu's `needrestart` during package installs, so a long seed keeps
   running through an update.
+- New full and incremental streams use `zfs send -c`, sending blocks as already
+  compressed on disk. A resumed stream keeps the format it started with.
+- The package enables BBR congestion control (`/etc/sysctl.d/90-recovera-replication.conf`,
+  with `tcp_bbr` loaded at boot). On a lossy, high-latency WAN the default
+  CUBIC collapses its send window; on one 133 ms link with about 0.7% loss it
+  fell to ~100 KB/s, while BBR sustained ~3.4 MB/s. New connections use it; a
+  running transfer can be moved onto it without losing progress by stopping
+  `recovera-peer-sync.service`, which resumes from the receive token.
 
 ## Monitoring progress
 
