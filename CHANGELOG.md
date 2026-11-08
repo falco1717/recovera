@@ -1,5 +1,14 @@
 # Changelog
 
+## v0.6.32 - 2026-11-07
+
+- The Synchronize page's replication panel shows an animated progress bar when
+  a transfer's total size is unknown (for example a transfer started before the
+  sending appliance reported its size estimate), instead of a static, faded
+  full-width bar that looked idle. The amount now reads "received so far" and
+  notes that the total was not reported for that transfer. Users who prefer
+  reduced motion see a static bar.
+
 ## v0.6.31 - 2026-11-07
 
 - Includes all 0.6.30 changes (background **Synchronize now** and total
