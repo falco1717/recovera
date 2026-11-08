@@ -29,6 +29,7 @@ import tempfile
 import threading
 import time
 import uuid
+import zlib
 from pathlib import Path
 from typing import Any, BinaryIO, Callable
 
@@ -1235,7 +1236,10 @@ def replicate(asset: str, peer_id: str, snapshot: str | None = None,
             f"target capacity preflight failed: need {estimate} bytes plus "
             f"{reserve} bytes reserve, only {free} bytes free"
         )
-    metadata = encode_metadata(collect_metadata(asset, cfg))
+    payload = collect_metadata(asset, cfg)
+    # Receivers ignore unknown keys; newer ones use this to show total progress.
+    payload["transfer"] = {"bytes_total": int(estimate)}
+    metadata = encode_metadata(payload)
     resume_token = remote.get("resume_token")
     base: str | None = None
     bytes_before = 0
@@ -1353,12 +1357,18 @@ def receive_dataset(source_id: str, asset: str, snapshot: str, base: str,
             "source_id": source_id, "snapshot": snapshot,
             "status": "receiving", "updated": int(time.time()),
         }
+    transfer = metadata.get("transfer") if isinstance(metadata.get("transfer"), dict) else {}
+    bytes_total = 0
+    with contextlib.suppress(TypeError, ValueError):
+        bytes_total = max(0, int(transfer.get("bytes_total") or 0))
     record = {
         "direction": "inbound", "asset": asset,
         "name": metadata_display_name(metadata) or asset_display_name(asset),
         "source_id": source_id, "source_name": metadata["source_name"],
         "snapshot": snapshot, "base": None if base == "-" else base,
         "mode": "resumed" if resume else ("full" if base == "-" else f"incremental-from-{base}"),
+        "bytes_before": received_bytes_before(dataset) if resume else 0,
+        "bytes_total": bytes_total,
         "started": int(time.time()), "pid": None,
     }
     proc = subprocess.Popen(["zfs", "receive", "-u", "-s", dataset], stdin=stream,
@@ -1756,6 +1766,85 @@ def recovery_readiness(cfg: dict[str, Any], item: dict[str, Any]) -> dict[str, A
                            "mountpoint": values.get("mountpoint")}}
 
 
+def resume_token_bytes(token: str) -> int:
+    """Read the byte count already received from a ZFS receive_resume_token.
+
+    The token is "<version>-<checksum>-<length>-<hex zlib nvlist>"; its uint64
+    "bytes" pair is the stream offset a resumed send starts from. OpenZFS packs
+    the nvlist with native encoding (little endian on these appliances); XDR is
+    accepted too.
+    """
+    try:
+        payload = token.strip().split("-", 3)[3]
+        raw = zlib.decompress(bytes.fromhex(payload))
+    except (IndexError, ValueError, zlib.error):
+        return 0
+    if len(raw) < 12:
+        return 0
+    native = raw[0] == 0
+    order = "little" if native and raw[1] == 1 else "big"
+
+    def number(offset: int, width: int) -> int:
+        return int.from_bytes(raw[offset:offset + width], order)
+
+    position = 12  # nvs header (4) + nvlist version (4) + nvflag (4)
+    while position + 16 <= len(raw):
+        size = number(position, 4)
+        if size <= 0:
+            break
+        if native:
+            # nvpair: size, name_sz (2), reserve (2), nelem, type, name, value (8-aligned)
+            name_size, kind = number(position + 4, 2), number(position + 12, 4)
+            name = raw[position + 16:position + 16 + name_size].rstrip(b"\0")
+            value = position + 16 + (name_size + 7) // 8 * 8
+        else:
+            # XDR: encoded size, decoded size, name length, name (4-aligned), type, nelem, value
+            name_size = number(position + 8, 4)
+            name = raw[position + 12:position + 12 + name_size].rstrip(b"\0")
+            kind_at = position + 12 + (name_size + 3) // 4 * 4
+            kind, value = number(kind_at, 4), kind_at + 8
+        if name == b"bytes" and kind == 8:  # DATA_TYPE_UINT64
+            return number(value, 8)
+        position += size
+    return 0
+
+def received_bytes_before(dataset: str) -> int:
+    """Bytes a resumable partial receive already holds (0 when not resuming)."""
+    try:
+        result = run(["zfs", "get", "-H", "-o", "value", "receive_resume_token", dataset],
+                     check=False, timeout=30)
+    except (PeerError, OSError, subprocess.SubprocessError):
+        return 0
+    token = result.stdout.decode("ascii", "replace").strip() if result.returncode == 0 else ""
+    return resume_token_bytes(token) if token and token != "-" else 0
+
+
+def start_background_sync() -> dict[str, Any]:
+    """Run "Synchronize now" in the dedicated sync service, not the WebUI service.
+
+    A replication can take days; running it inside recovera-peer.service tied
+    it to the web API, so a routine service restart (such as after an update)
+    cut the transfer. recovera-peer-sync.service is never restarted by updates.
+    """
+    running = False
+    LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
+    # Probe the worker lock; closing the file releases the probe immediately.
+    with LOCK_PATH.open("a") as handle:
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            running = True
+    if not running:
+        result = run(["systemctl", "start", "--no-block", "recovera-peer-sync.service"],
+                     check=False, timeout=15)
+        if result.returncode != 0:
+            raise PeerError("could not start the replication service: " +
+                            result.stderr.decode("utf-8", "replace").strip())
+    return {"started": not running, "running": True,
+            "message": ("A replication run is already in progress." if running else
+                        "Replication started in the background.")}
+
+
 def _transfer_record_path(direction: str, key: str) -> Path:
     safe = re.sub(r"[^A-Za-z0-9_.-]", "_", key)
     return TRANSFER_DIR / f"{direction}-{safe}.json"
@@ -1888,6 +1977,10 @@ def replication_activity() -> dict[str, Any]:
         token, process_started = _proc_start(pid)
         counters = _proc_io(pid)
         moved = counters.get("wchar" if direction == "outbound" else "rchar", 0)
+        if direction == "inbound" and "bytes_before" not in record:
+            # Receives started before 0.6.30 did not record their resume offset;
+            # while a resume runs, the token still describes the saved state.
+            record = record | {"bytes_before": received_bytes_before(dataset)}
         done = int(record.get("bytes_before") or 0) + moved
         total = int(record.get("bytes_total") or 0)
         rate = _transfer_rate(pid, token, moved, process_started)
@@ -2233,8 +2326,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             elif self.path == "/v1/admin/agent/release":
                 self.reply(200, release_agent(str(body["asset"])))
             elif self.path == "/v1/admin/sync":
-                with sync_lock():
-                    self.reply(200, {"results": configured_sync()})
+                self.reply(200, start_background_sync())
             elif self.path == "/v1/admin/queue":
                 self.reply(200, queue_snapshot(str(body["assetKey"]), str(body["snapshotEpoch"])))
             elif self.path == "/v1/admin/offsite/schedule-add":

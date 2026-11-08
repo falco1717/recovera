@@ -1,5 +1,19 @@
 # Changelog
 
+## v0.6.30 - 2026-11-07
+
+- **Synchronize now** (Configure → Off-site Target) starts replication in the
+  dedicated `recovera-peer-sync.service` and returns immediately, instead of
+  running the whole transfer inside the WebUI's `recovera-peer.service`. A
+  multi-day seed started from that button was cut off whenever the web
+  service restarted, such as after an update. The scheduled sync service is
+  not restarted by updates, and progress is shown on the Synchronize page.
+- The receiving appliance now shows total progress for a resumed transfer:
+  the bytes already received (read from the ZFS `receive_resume_token`) plus
+  the current run, instead of restarting the count at zero.
+- The sending appliance passes its stream-size estimate with the replication
+  metadata, so the receiving appliance can show percentage and time remaining.
+
 ## v0.6.29 - 2026-11-07
 
 - The native **Synchronize** page now shows Recovera appliance-to-appliance

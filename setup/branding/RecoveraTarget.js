@@ -40,7 +40,7 @@
         byId('rt-discover').onclick = async () => { try { discovered = await api('discover', {host: byId('rt-host').value, port: 443}); text(byId('rt-discovery'), JSON.stringify(discovered, null, 2)); message('Compare the fingerprint with the target before pairing.', true); } catch (e) { message(e.message, false); } };
         byId('rt-pair').onclick = async () => { try { if (!discovered) throw new Error('Discover the target first.'); await api('peer', {host: byId('rt-host').value, port: 443, code: byId('rt-pair-code').value, fingerprint: discovered.observed_fingerprint, appliance_id: discovered.appliance_id}); message('Target paired.', true); await load(); } catch (e) { message(e.message, false); } };
         byId('rt-save').onclick = async () => { try { await api('rule', {asset: byId('rt-asset').value, peer_id: byId('rt-peer').value, schedule_mode: byId('rt-mode').value, interval_minutes: Number(byId('rt-interval').value), priority: byId('rt-priority').value, retention_hours: Number(byId('rt-retention').value)}); message('Replication policy saved.', true); await load(); } catch (e) { message(e.message, false); } };
-        byId('rt-sync').onclick = async () => { try { message('Synchronization is running…', true); const result = await api('sync', {}); message('Synchronization complete: ' + JSON.stringify(result.results), true); await load(); } catch (e) { message(e.message, false); } };
+        byId('rt-sync').onclick = async () => { try { const result = await api('sync', {}); message((result.message || 'Replication started in the background.') + ' Follow its progress on the Synchronize page.', true); await load(); } catch (e) { message(e.message, false); } };
         load(); window.setInterval(load, 30000);
     });
 }());
