@@ -1287,5 +1287,43 @@ class RecoveraPeerTests(unittest.TestCase):
         self.assertIn("'network-check' => ['GET', '/v1/admin/network-check']", controller)
         self.assertIn("'network-check-last' => ['GET', '/v1/admin/network-check/last']", controller)
 
+    # --- Device names follow "Name the Device" ---
+
+    def test_appliance_name_follows_the_current_hostname(self):
+        cfg = self.peer.config()
+        cfg["name"] = "recovera"
+        self.peer.save_config(cfg)
+        no_zfs = mock.Mock(returncode=1, stdout=b"", stderr=b"")
+        with mock.patch.object(self.peer.socket, "gethostname", return_value="Bitches-DC.local"), \
+             mock.patch.object(self.peer, "run", return_value=no_zfs), \
+             mock.patch.object(self.peer, "gateway_tls_fingerprint", return_value="SHA256:00"), \
+             mock.patch.object(self.peer, "ssh_host_keys", return_value=[], create=True), \
+             mock.patch.object(self.peer, "ssh_public_key", return_value="ssh-ed25519 AAAA test"):
+            self.assertEqual(self.peer.appliance_name(), "Bitches-DC")
+            self.assertEqual(self.peer.public_info()["name"], "Bitches-DC")
+            self.assertEqual(self.peer.collect_metadata("c" * 32, self.peer.config())["source_name"],
+                             "Bitches-DC")
+        self.assertEqual(self.peer.config()["name"], "Bitches-DC")
+
+    def test_paired_appliance_names_are_refreshed_from_replication(self):
+        source, peer_id = "ab15e185-157d-487b-abe4-6a064c26decc", "12345678-1234-1234-1234-123456789abc"
+        cfg = self.peer.config()
+        cfg["sources"][source] = {"name": "recovera", "address": "10.10.20.10"}
+        cfg["peers"][peer_id] = {"name": "recovera", "host": "10.0.3.187", "enabled": True}
+        self.peer.save_config(cfg)
+        self.peer._remember_name("sources", source, "Bitches-DC")
+        self.peer._remember_name("peers", peer_id, "Backup-Bitches")
+        self.peer._remember_name("peers", peer_id, "")
+        self.peer._remember_name("peers", peer_id, "x" * 200)
+        self.peer._remember_name("peers", "missing", "ignored")
+        cfg = self.peer.config()
+        self.assertEqual(cfg["sources"][source]["name"], "Bitches-DC")
+        self.assertEqual(cfg["peers"][peer_id]["name"], "Backup-Bitches")
+        self.assertNotIn("missing", cfg["peers"])
+        source_text = SCRIPT.read_text(encoding="utf-8")
+        self.assertIn('_remember_name("sources", source_id, metadata["source_name"])', source_text)
+        self.assertIn('_remember_name("peers", peer_id, remote.get("appliance_name"))', source_text)
+        self.assertIn('"appliance_name": appliance_name(cfg)}', source_text)
+
 if __name__ == "__main__":
     unittest.main()

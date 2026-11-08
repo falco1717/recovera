@@ -207,6 +207,36 @@ def state() -> dict[str, Any]:
     return value
 
 
+def appliance_name(cfg: dict[str, Any] | None = None) -> str:
+    """The appliance's current device name.
+
+    "Name the Device" sets the hostname; the configuration only captured the
+    hostname at first boot ("recovera" on OVA deployments). Keep the stored
+    name in step so pairing, metadata and status show the real name.
+    """
+    cfg = cfg if cfg is not None else config()
+    current = socket.gethostname().split(".")[0].strip()[:128]
+    if current and current != cfg.get("name"):
+        cfg["name"] = current
+        with contextlib.suppress(OSError, PeerError):
+            stored = config()
+            stored["name"] = current
+            save_config(stored)
+    return str(cfg.get("name") or current)
+
+
+def _remember_name(section: str, key: str, name: Any) -> None:
+    """Update the stored display name of a paired appliance when it changes."""
+    if not isinstance(name, str) or not name.strip() or len(name) > 128:
+        return
+    with contextlib.suppress(OSError, PeerError):
+        cfg = config()
+        entry = cfg.get(section, {}).get(key)
+        if entry is not None and entry.get("name") != name:
+            entry["name"] = name
+            save_config(cfg)
+
+
 def save_config(cfg: dict[str, Any]) -> None:
     atomic_json(CONFIG_PATH, cfg)
 
@@ -855,7 +885,7 @@ def collect_metadata(asset: str, cfg: dict[str, Any]) -> dict[str, Any]:
     retention_hours = int(rule.get("retention_hours", MAX_RETENTION_HOURS))
     retention_tiers = rule.get("retention_tiers") or default_retention_tiers(retention_hours)
     return {"schema": 1, "asset": asset, "source_id": cfg["appliance_id"],
-            "source_numeric_id": cfg["numeric_id"], "source_name": cfg["name"],
+            "source_numeric_id": cfg["numeric_id"], "source_name": appliance_name(cfg),
             "source_public_key": ssh_public_key(), "files": files,
             "retention_hours": retention_hours, "retention_tiers": retention_tiers}
 
@@ -1025,7 +1055,7 @@ def public_info() -> dict[str, Any]:
                    "free": int(free), "health": health}
     return {"service": "recovera-peer", "version": VERSION,
             "appliance_id": cfg["appliance_id"], "numeric_id": cfg["numeric_id"],
-            "name": cfg["name"], "ssh_port": cfg["ssh_port"],
+            "name": appliance_name(cfg), "ssh_port": cfg["ssh_port"],
             "tls_fingerprint": gateway_tls_fingerprint(), "ssh_host_keys": ssh_host_keys(),
             "gateway": "/recovera-peer", "gateway_port": 443,
             "storage": storage}
@@ -1106,7 +1136,7 @@ def peer_add(host: str, port: int, code: str, fingerprint: str,
         raise PeerError("peer identity changed between discovery and pairing")
     response, _ = ssl_json(host, port, prefix + "/pair", {
         "code": code.upper(), "source_id": cfg["appliance_id"],
-        "source_name": cfg["name"], "source_public_key": ssh_public_key(),
+        "source_name": appliance_name(cfg), "source_public_key": ssh_public_key(),
     }, expected_fingerprint=actual)
     if response.get("appliance_id") != info.get("appliance_id"):
         raise PeerError("pairing response came from a different appliance")
@@ -1218,6 +1248,9 @@ def replicate(asset: str, peer_id: str, snapshot: str | None = None,
     if snapshot not in local:
         raise PeerError(f"snapshot {snapshot} does not exist for {asset}")
     remote = remote_json(peer, ["asset-info", asset])
+    _remember_name("peers", peer_id, remote.get("appliance_name"))
+    if isinstance(remote.get("appliance_name"), str) and remote["appliance_name"].strip():
+        peer = peer | {"name": remote["appliance_name"]}
     remote_snaps = [str(value) for value in remote.get("snapshots", [])]
     if snapshot in remote_snaps:
         now = int(time.time())
@@ -1337,6 +1370,7 @@ def receive_dataset(source_id: str, asset: str, snapshot: str, base: str,
         raise PeerError("metadata source numeric ID is invalid")
     if not isinstance(metadata.get("source_name"), str) or len(metadata["source_name"]) > 128:
         raise PeerError("metadata source name is invalid")
+    _remember_name("sources", source_id, metadata["source_name"])
     retention_hours = int(metadata.get("retention_hours", MAX_RETENTION_HOURS))
     if not MIN_RETENTION_HOURS <= retention_hours <= MAX_RETENTION_HOURS:
         raise PeerError("replication metadata retention is invalid")
@@ -1425,7 +1459,8 @@ def asset_info_received(source_id: str, asset: str) -> dict[str, Any]:
         if result.returncode == 0 and result.stdout.decode().strip() != "-":
             token = result.stdout.decode().strip()
     return {"ok": True, "exists": zfs_exists(dataset), "snapshots": zfs_snapshots(dataset),
-            "resume_token": token or None, "storage": storage_status(cfg)}
+            "resume_token": token or None, "storage": storage_status(cfg),
+            "appliance_name": appliance_name(cfg)}
 
 
 def storage_status(cfg: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -2195,7 +2230,7 @@ def replication_activity() -> dict[str, Any]:
             "source_address": source.get("address"),
             "snapshot": item.get("snapshot"), "updated": item.get("updated"),
         })
-    return {"generated": now, "appliance": cfg.get("name"), "active": active,
+    return {"generated": now, "appliance": appliance_name(cfg), "active": active,
             "recent_outbound": recent_outbound, "recent_inbound": recent_inbound,
             "paired": {"targets": len(peers), "sources": len(sources)}}
 
@@ -2209,7 +2244,7 @@ def status_document() -> dict[str, Any]:
             received_assets.append(item | recovery_readiness(cfg, item))
     current = state()
     return {"service": "recovera-peer", "version": VERSION,
-            "appliance": {"id": cfg["appliance_id"], "name": cfg["name"]},
+            "appliance": {"id": cfg["appliance_id"], "name": appliance_name(cfg)},
             "peers": cfg.get("peers", {}), "sources": cfg.get("sources", {}),
             "rules": cfg.get("assets", {}), "local_assets": local_assets,
             "received_assets": received_assets, "state": current, "offsite": offsite(),
