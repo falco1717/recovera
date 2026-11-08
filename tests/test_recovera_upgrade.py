@@ -133,6 +133,17 @@ class RecoveraUpgradeTests(unittest.TestCase):
                 with self.assertRaises(self.module.UpgradeError):
                     self.module.validate_manifest(manifest, pointer, {"CHANNEL": "stable"})
 
+    def test_updater_suspends_needrestart_for_package_transactions(self):
+        source = (ROOT / "upgrade" / "recovera-upgrade").read_text(encoding="utf-8")
+        main = source[source.index("def main():"):]
+        self.assertLess(main.index('os.environ["NEEDRESTART_SUSPEND"] = "1"'), main.index("try:"))
+        with mock.patch.dict("os.environ", {}, clear=False),              mock.patch.object(self.module, "parser") as parser,              mock.patch.object(self.module, "read_config", return_value={}),              mock.patch.object(self.module, "command_status", return_value=0) as status:
+            parser.return_value.parse_args.return_value = mock.Mock(
+                command="status", config=Path("/etc/recovera/upgrade.conf"))
+            self.module.main()
+            self.assertEqual(self.module.os.environ.get("NEEDRESTART_SUSPEND"), "1")
+        status.assert_called_once()
+
     def test_package_install_is_offline_and_allows_no_removals(self):
         command = self.module.package_apt_command("install", [Path("/tmp/recovera.deb")])
         self.assertNotIn("--no-download", command)

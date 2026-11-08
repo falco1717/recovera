@@ -1,5 +1,16 @@
 # Changelog
 
+## v0.6.31 - 2026-11-07
+
+- Includes all 0.6.30 changes (background **Synchronize now** and total
+  progress for resumed transfers); 0.6.30 was published but not promoted.
+- The updater suspends Ubuntu's `needrestart` hook during package installs and
+  rollbacks. needrestart restarts services whose Python scripts apt replaced,
+  which could restart `recovera-peer-sync.service` in the middle of a long
+  replication. Recovera already restarts its own services after an update.
+  This protects the updates that follow 0.6.31; the 0.6.31 install itself is
+  performed by the previously installed updater.
+
 ## v0.6.30 - 2026-11-07
 
 - **Synchronize now** (Configure → Off-site Target) starts replication in the
