@@ -96,13 +96,33 @@
         parent.appendChild(row);
     }
 
+    function ensureStyles() {
+        if (document.getElementById('recovera-sync-style')) {
+            return;
+        }
+        var style = el('style');
+        style.id = 'recovera-sync-style';
+        style.textContent =
+            '@keyframes recovera-sync-slide{0%{margin-left:-35%}100%{margin-left:100%}}' +
+            '.recovera-sync-indeterminate{height:100%;width:35%;border-radius:5px;background:#2c7be5;' +
+            'animation:recovera-sync-slide 1.6s ease-in-out infinite}' +
+            '@media (prefers-reduced-motion:reduce){.recovera-sync-indeterminate{animation:none;' +
+            'width:100%;opacity:.5}}';
+        document.head.appendChild(style);
+    }
+
     function progressBar(percent) {
         var track = el('div', 'recovera-sync-progress');
         track.style.cssText = 'height:10px;border-radius:5px;background:#e9ecef;overflow:hidden;margin:6px 0;';
+        if (percent === null || percent === undefined) {
+            // The total is unknown, but the transfer is moving: show activity.
+            ensureStyles();
+            track.appendChild(el('div', 'recovera-sync-indeterminate'));
+            track.title = 'Transfer in progress; the total size is not known';
+            return track;
+        }
         var fill = el('div');
-        var width = percent === null || percent === undefined ? 100 : Math.max(1, Math.min(100, percent));
-        fill.style.cssText = 'height:100%;width:' + width + '%;background:#2c7be5;' +
-            (percent === null || percent === undefined ? 'opacity:.35;' : '');
+        fill.style.cssText = 'height:100%;width:' + Math.max(1, Math.min(100, percent)) + '%;background:#2c7be5;';
         track.appendChild(fill);
         return track;
     }
@@ -127,7 +147,8 @@
             var amount = item.bytes_total
                 ? bytes(item.bytes_done) + ' of ~' + bytes(item.bytes_total) +
                   (item.percent !== null && item.percent !== undefined ? ' (' + item.percent + '%)' : '')
-                : bytes(item.bytes_done) + (direction === 'outbound' ? ' sent' : ' received');
+                : bytes(item.bytes_done) + (direction === 'outbound' ? ' sent so far' : ' received so far') +
+                  ' (total size not reported for this transfer)';
             line(block, 'Progress', amount);
             line(block, 'Speed', item.rate_bps ? bytes(item.rate_bps) + '/s' : 'measuring…');
             if (item.eta_seconds) {

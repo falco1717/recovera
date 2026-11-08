@@ -152,6 +152,11 @@ canOffsite: {{ canOffsite|json_encode|raw }}
         panel = (ROOT / "setup" / "branding" / "RecoveraSynchronize.js").read_text(encoding="utf-8")
         self.assertIn("/api/recovera/offsite-target/replication-activity", panel)
         self.assertNotIn("innerHTML", panel)
+        # An unknown total still shows an animated, clearly active bar.
+        self.assertIn("recovera-sync-indeterminate", panel)
+        self.assertIn("@keyframes recovera-sync-slide", panel)
+        self.assertIn("prefers-reduced-motion", panel)
+        self.assertNotIn("opacity:.35", panel)
 
     def test_home_page_replaces_native_universal_with_recovera_target(self):
         branding = load_module()
