@@ -900,6 +900,7 @@ class RecoveraPeerTests(unittest.TestCase):
             value["received"] = {asset: {"source_id": source_id, "snapshot": "1794086526",
                                          "status": "receiving", "updated": 1}}
         dataset = f"homePool/home/agents/{asset}"
+        self.peer.received_bytes_before = lambda _dataset: 0
         proc = self.fake_proc({
             77: (["zfs", "receive", "-u", "-s", dataset], {"rchar": 8_000_000}, 100),
             78: (["zfs", "send", "-nP", f"{dataset}@1794086526"], {"wchar": 5}, 1),
@@ -1063,6 +1064,145 @@ class RecoveraPeerTests(unittest.TestCase):
         self.assertIn("'replication-activity' => ['GET', '/v1/admin/replication-activity']", controller)
         source = SCRIPT.read_text(encoding="utf-8")
         self.assertIn('"/v1/admin/replication-activity"', source)
+
+    # --- 0.6.30: total progress across resumes, background "Synchronize now" ---
+
+    @staticmethod
+    def resume_token(pairs, *, xdr=False):
+        """Build a ZFS receive_resume_token holding uint64 pairs."""
+        import struct
+        import zlib
+        if xdr:
+            raw = b"\x01\x00\x00\x00" + struct.pack(">ii", 0, 1)
+            for name, value in pairs:
+                encoded = name.encode()
+                padded = encoded + b"\0" * (-len(encoded) % 4)
+                size = 12 + len(padded) + 8 + 8
+                raw += struct.pack(">iii", size, size, len(encoded)) + padded
+                raw += struct.pack(">ii", 8, 1) + struct.pack(">Q", value)
+            raw += b"\0" * 8
+        else:
+            raw = b"\x00\x01\x00\x00" + struct.pack("<ii", 0, 1)
+            for name, value in pairs:
+                encoded = name.encode() + b"\0"
+                padded = encoded + b"\0" * (-len(encoded) % 8)
+                size = 16 + len(padded) + 8
+                raw += struct.pack("<iHHii", size, len(encoded), 0, 1, 8) + padded
+                raw += struct.pack("<Q", value)
+            raw += b"\0" * 4
+        payload = zlib.compress(raw).hex()
+        return f"1-{zlib.crc32(raw):x}-{len(raw):x}-{payload}"
+
+    def test_resume_token_bytes_reads_native_and_xdr_tokens(self):
+        pairs = [("object", 257), ("offset", 24_682_627_072), ("bytes", 18_753_363_320),
+                 ("toguid", 123)]
+        self.assertEqual(self.peer.resume_token_bytes(self.resume_token(pairs)), 18_753_363_320)
+        self.assertEqual(self.peer.resume_token_bytes(self.resume_token(pairs, xdr=True)),
+                         18_753_363_320)
+        self.assertEqual(self.peer.resume_token_bytes(self.resume_token([("object", 1)])), 0)
+        for broken in ("", "-", "1-2-3-zz", "1-2-3-" + "00" * 4):
+            self.assertEqual(self.peer.resume_token_bytes(broken), 0)
+
+    def test_resumed_receive_reports_total_progress_and_sender_estimate(self):
+        source = "12345678-1234-1234-1234-123456789abc"
+        asset = "a" * 32
+        cfg = self.peer.config()
+        cfg["sources"][source] = {"name": "Bitches-DC", "address": "10.10.20.10"}
+        self.peer.save_config(cfg)
+        metadata = {
+            "asset": asset, "source_id": source, "source_numeric_id": 1234567890,
+            "source_name": "Bitches-DC", "files": {},
+            "transfer": {"bytes_total": 217_000_000_000},
+        }
+        token = self.resume_token([("bytes", 18_753_363_320)])
+        seen = {}
+
+        def command(argv, **_kwargs):
+            if argv[:2] == ["zfs", "get"] and "receive_resume_token" in argv:
+                return mock.Mock(returncode=0, stdout=(token + "\n").encode(), stderr=b"")
+            return mock.Mock(returncode=0, stdout=b"", stderr=b"")
+
+        def communicate():
+            path = self.peer._transfer_record_path("inbound", asset)
+            seen.update(json.loads(path.read_text(encoding="utf-8")))
+            return b"", b""
+
+        process = mock.Mock(pid=556, returncode=0, communicate=communicate)
+        with mock.patch.object(self.peer, "zfs_exists", return_value=True), \
+             mock.patch.object(self.peer, "load_origin", return_value={"sourceApplianceId": source}), \
+             mock.patch.object(self.peer, "zfs_snapshots", return_value=[]), \
+             mock.patch.object(self.peer, "install_metadata"), \
+             mock.patch.object(self.peer, "prune_received_snapshots", return_value=[]), \
+             mock.patch.object(self.peer, "run", side_effect=command), \
+             mock.patch.object(self.peer.subprocess, "Popen", return_value=process):
+            self.peer.receive_dataset(source, asset, "1794086526", "-",
+                                      self.peer.encode_metadata(metadata), True, mock.Mock())
+        self.assertEqual(seen["mode"], "resumed")
+        self.assertEqual(seen["bytes_before"], 18_753_363_320)
+        self.assertEqual(seen["bytes_total"], 217_000_000_000)
+
+        # The live view adds this run's bytes to what was already received.
+        self.peer.write_transfer_record("inbound", asset, seen | {"pid": 4343})
+        dataset = f"homePool/home/agents/{asset}"
+        proc = self.fake_proc({4343: (["zfs", "receive", "-u", "-s", dataset],
+                                      {"rchar": 1_000_000_000}, 60)})
+        with mock.patch.object(self.peer, "PROC_ROOT", proc):
+            item = self.peer.replication_activity()["active"]["inbound"][0]
+        self.assertEqual(item["bytes_done"], 19_753_363_320)
+        self.assertEqual(item["bytes_total"], 217_000_000_000)
+        self.assertEqual(item["percent"], 9.1)
+        self.assertEqual(item["source_address"], "10.10.20.10")
+        self.assertIsNotNone(item["eta_seconds"])
+
+    def test_receive_started_without_offset_reads_it_from_the_resume_token(self):
+        asset = "b" * 32
+        self.peer.write_transfer_record("inbound", asset, {
+            "direction": "inbound", "asset": asset, "name": "jprod-sb", "mode": "resumed",
+            "snapshot": "1794086526", "pid": 4444})
+        dataset = f"homePool/home/agents/{asset}"
+        proc = self.fake_proc({4444: (["zfs", "receive", "-u", "-s", dataset], {"rchar": 500}, 5)})
+        with mock.patch.object(self.peer, "PROC_ROOT", proc), \
+             mock.patch.object(self.peer, "received_bytes_before", return_value=1000) as before:
+            item = self.peer.replication_activity()["active"]["inbound"][0]
+        before.assert_called_once_with(dataset)
+        self.assertEqual(item["bytes_done"], 1500)
+
+    def test_replicate_sends_its_size_estimate_to_the_receiver(self):
+        peer_id, asset, patches = self.replicate_fixture({"snapshots": [], "storage": {}})
+        with contextlib.ExitStack() as stack:
+            for patch in patches:
+                stack.enter_context(patch)
+            encode = self.peer.encode_metadata
+            stack.enter_context(mock.patch.object(self.peer, "transfer_stream"))
+            self.peer.replicate(asset, peer_id)
+            sent = encode.call_args.args[0]
+        self.assertEqual(sent["transfer"], {"bytes_total": 1000})
+
+    def test_synchronize_now_starts_the_sync_service_instead_of_running_inline(self):
+        source = SCRIPT.read_text(encoding="utf-8")
+        self.assertIn("self.reply(200, start_background_sync())", source)
+        handler = source[source.index('elif self.path == "/v1/admin/sync":'):]
+        self.assertNotIn("configured_sync()", handler[:200])
+        controller = CONTROLLER.read_text(encoding="utf-8")
+        self.assertIn("in_array($operation, ['update-install', 'storage-expand'], true) ? 3600", controller)
+
+        if os.name != "posix":
+            self.skipTest("the worker-lock probe needs POSIX flock")
+        with mock.patch.object(self.peer, "run", return_value=mock.Mock(returncode=0, stderr=b"")) as run:
+            answer = self.peer.start_background_sync()
+        self.assertTrue(answer["started"])
+        run.assert_called_once_with(
+            ["systemctl", "start", "--no-block", "recovera-peer-sync.service"],
+            check=False, timeout=15)
+
+        import fcntl
+        with self.peer.LOCK_PATH.open("w") as held:
+            fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            with mock.patch.object(self.peer, "run") as run:
+                answer = self.peer.start_background_sync()
+            run.assert_not_called()
+        self.assertFalse(answer["started"])
+        self.assertTrue(answer["running"])
 
 if __name__ == "__main__":
     unittest.main()
