@@ -1036,6 +1036,11 @@ def parser():
 
 def main():
     args = parser().parse_args()
+    # Ubuntu's needrestart hook restarts services whose Python scripts apt just
+    # replaced, which includes recovera-peer-sync.service while it is in the
+    # middle of a long replication. Recovera restarts its own services after an
+    # update, so keep needrestart out of package transactions and rollbacks.
+    os.environ["NEEDRESTART_SUSPEND"] = "1"
     try:
         config = read_config(args.config)
         return {
