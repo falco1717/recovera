@@ -107,5 +107,57 @@ class CloudIsolationTests(unittest.TestCase):
         self.assertIn('cp -a "$ROOT/setup/isolation" "$payload/isolation"', (ROOT / "install.sh").read_text())
 
 
+    def test_leftover_speedsync_registrations_are_retired_with_a_backup(self):
+        from unittest import mock
+        module = load_script()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            sync, keys, backup = root / "sync", root / "keys", root / "backup"
+            sync.mkdir(); keys.mkdir()
+            gone, no_offsite, keep = "1" * 32, "2" * 32, "3" * 32
+            for asset in (gone, no_offsite, keep):
+                folder = sync / f"1356211596+{asset}+agent"
+                folder.mkdir()
+                (folder / "options").write_text("{}")
+            (sync / "deviceMigrations").mkdir()
+            (sync / "options").write_text("{}")
+            (keys / f"{no_offsite}.offsiteTarget").write_text('{"offsiteTarget":"noOffsite"}')
+            (keys / f"{keep}.offsiteTarget").write_text('{"offsiteTarget":"cloud"}')
+            existing = {"homePool/home/agents", f"homePool/home/agents/{no_offsite}",
+                        f"homePool/home/agents/{keep}"}
+
+            def exists(name):
+                return name in existing
+
+            with mock.patch.object(module, "SPEEDSYNC_DIR", sync), \
+                 mock.patch.object(module, "ASSET_KEYS", keys), \
+                 mock.patch.object(module, "SPEEDSYNC_BACKUP", backup), \
+                 mock.patch.object(module, "dataset_exists", side_effect=exists):
+                retired = module.unregister_leftover_speedsync()
+            reasons = {item["registration"].split("+")[1]: item["reason"] for item in retired}
+            self.assertEqual(reasons, {gone: "dataset no longer exists",
+                                       no_offsite: "asset is set to no off-site replication"})
+            self.assertEqual(sorted(p.name for p in sync.iterdir()),
+                             sorted(["deviceMigrations", "options", f"1356211596+{keep}+agent"]))
+            self.assertEqual(len(list(backup.iterdir())), 2)
+            for item in retired:
+                self.assertTrue((Path(item["backup"]) / "options").is_file())
+
+    def test_unknown_pool_state_never_retires_registrations(self):
+        from unittest import mock
+        module = load_script()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            sync = root / "sync"
+            (sync / f"1356211596+{'4' * 32}+agent").mkdir(parents=True)
+            with mock.patch.object(module, "SPEEDSYNC_DIR", sync), \
+                 mock.patch.object(module, "ASSET_KEYS", root / "keys"), \
+                 mock.patch.object(module, "SPEEDSYNC_BACKUP", root / "backup"), \
+                 mock.patch.object(module, "dataset_exists", return_value=None):
+                self.assertEqual(module.unregister_leftover_speedsync(), [])
+            self.assertTrue((sync / f"1356211596+{'4' * 32}+agent").is_dir())
+        source = SCRIPT.read_text(encoding="utf-8")
+        self.assertIn('report["speedsync_registrations_retired"] = speedsync_retired', source)
+
 if __name__ == "__main__":
     unittest.main()

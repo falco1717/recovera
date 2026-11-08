@@ -927,6 +927,10 @@ class RecoveraPeerTests(unittest.TestCase):
         self.assertIsNone(classify(["zfs", "send", "-nvP", "-t", "token"]))
         self.assertIsNone(classify(["zfs", "list", "-H"]))
         self.assertEqual(classify(["zfs", "send", "pool/a@1"]), ("outbound", "pool/a", "full"))
+        self.assertEqual(classify(["zfs", "send", "-c", "pool/a@1"]), ("outbound", "pool/a", "full"))
+        self.assertEqual(classify(["zfs", "send", "-c", "-I", "pool/a@1", "pool/a@2"]),
+                         ("outbound", "pool/a", "incremental"))
+        self.assertIsNone(classify(["zfs", "send", "-nP", "-c", "pool/a@1"]))
         self.assertEqual(classify(["zfs", "send", "-I", "pool/a@1", "pool/a@2"]),
                          ("outbound", "pool/a", "incremental"))
         self.assertEqual(classify(["zfs", "send", "-t", "token"]), ("outbound", "", "resumed"))
@@ -1324,6 +1328,41 @@ class RecoveraPeerTests(unittest.TestCase):
         self.assertIn('_remember_name("sources", source_id, metadata["source_name"])', source_text)
         self.assertIn('_remember_name("peers", peer_id, remote.get("appliance_name"))', source_text)
         self.assertIn('"appliance_name": appliance_name(cfg)}', source_text)
+
+    def test_resumed_send_measures_progress_from_the_token_not_the_estimate(self):
+        token = self.resume_token([("bytes", 21_520_000_000)])
+        peer_id, asset, patches = self.replicate_fixture(
+            {"snapshots": [], "storage": {}, "resume_token": token})
+        seen = {}
+
+        def transfer(send, peer, remote, speed, on_start=None):
+            on_start(777)
+            path = self.peer._transfer_record_path("outbound", f"{peer_id}:{asset}")
+            seen.update(json.loads(path.read_text(encoding="utf-8")))
+
+        with contextlib.ExitStack() as stack:
+            for patch in patches:
+                stack.enter_context(patch)
+            encode = self.peer.encode_metadata
+            stack.enter_context(mock.patch.object(self.peer, "transfer_stream", side_effect=transfer))
+            stack.enter_context(mock.patch.object(self.peer, "zfs_send_resume_estimate",
+                                                  return_value=316_000_000_000))
+            self.peer.replicate(asset, peer_id)
+            sent = encode.call_args.args[0]
+        self.assertEqual(seen["bytes_before"], 21_520_000_000)
+        self.assertEqual(seen["bytes_total"], 337_520_000_000)
+        self.assertEqual(sent["transfer"], {"bytes_total": 337_520_000_000})
+
+    def test_package_enables_bbr_for_replication_without_failing_installs(self):
+        build = (SCRIPT.parents[2] / "tools" / "build-recovera-appliance-deb.sh").read_text(encoding="utf-8")
+        self.assertIn('"$stage/etc/sysctl.d/90-recovera-replication.conf"', build)
+        self.assertIn('"$stage/etc/modules-load.d/recovera-bbr.conf"', build)
+        self.assertIn("modprobe tcp_bbr 2>/dev/null || true", build)
+        self.assertIn("sysctl -q -p /etc/sysctl.d/90-recovera-replication.conf 2>/dev/null || true", build)
+        sysctl = (SCRIPT.parent / "sysctl-recovera-replication.conf").read_text(encoding="utf-8")
+        self.assertIn("net.ipv4.tcp_congestion_control = bbr", sysctl)
+        self.assertIn("net.core.default_qdisc = fq", sysctl)
+        self.assertIn("tcp_bbr", (SCRIPT.parent / "modules-load-recovera-bbr.conf").read_text(encoding="utf-8"))
 
 if __name__ == "__main__":
     unittest.main()

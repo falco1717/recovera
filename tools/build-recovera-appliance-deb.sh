@@ -29,6 +29,7 @@ mkdir -p "$stage/DEBIAN" "$stage/usr/local/sbin" "$stage/usr/local/lib/recovera"
   "$stage/etc/systemd/system" \
   "$stage/etc/apache2/conf-available" "$stage/etc/ssh/sshd_config.d" \
   "$stage/etc/sudoers.d" "$stage/etc/update-motd.d" \
+  "$stage/etc/sysctl.d" "$stage/etc/modules-load.d" \
   "$stage/etc/systemd/system/datto-sshd-configure.service.d" \
   "$stage/etc/systemd/system/datto-firewall-share-sync.service.d"
 
@@ -54,6 +55,8 @@ install -m 0644 "$ROOT/setup/peer/recovera-peer-sync.service" "$stage/etc/system
 install -m 0644 "$ROOT/setup/peer/recovera-peer-sync.timer" "$stage/etc/systemd/system/"
 install -m 0644 "$ROOT/setup/peer/recovera-peer-gateway.conf" "$stage/etc/apache2/conf-available/"
 install -m 0644 "$ROOT/setup/peer/sshd-recovera-peer.conf" "$stage/etc/ssh/sshd_config.d/91-recovera-peer.conf"
+install -m 0644 "$ROOT/setup/peer/sysctl-recovera-replication.conf" "$stage/etc/sysctl.d/90-recovera-replication.conf"
+install -m 0644 "$ROOT/setup/peer/modules-load-recovera-bbr.conf" "$stage/etc/modules-load.d/recovera-bbr.conf"
 install -m 0440 "$ROOT/setup/peer/sudoers-recovera-peer" "$stage/etc/sudoers.d/recovera-peer"
 install -m 0644 "$ROOT/setup/peer/recovera-sshd-service.conf" \
   "$stage/etc/systemd/system/datto-sshd-configure.service.d/recovera.conf"
@@ -139,6 +142,10 @@ if [ -d /usr/lib/datto/statusshell/logo ]; then
   install -m 0644 /usr/local/share/recovera/recovera-ascii.logo /usr/lib/datto/statusshell/logo/0.logo
 fi
 [ ! -e /etc/update-motd.d/25-datto ] || chmod a-x /etc/update-motd.d/25-datto
+# BBR for replication over lossy WAN links. New connections pick it up; an
+# unavailable module must never fail the package install.
+modprobe tcp_bbr 2>/dev/null || true
+sysctl -q -p /etc/sysctl.d/90-recovera-replication.conf 2>/dev/null || true
 systemctl daemon-reload
 systemctl enable recovera-upgrade-check.timer recovera-upgrade-validate.service recovera-cloud-isolation.service >/dev/null
 /usr/local/sbin/recovera-cloud-isolation apply

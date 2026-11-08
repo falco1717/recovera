@@ -10,6 +10,7 @@ from pathlib import Path
 import re
 import subprocess
 import sys
+import time
 from typing import Iterable
 
 SHARE = Path(os.environ.get("RECOVERA_ISOLATION_SHARE", "/usr/local/share/recovera/isolation"))
@@ -22,6 +23,12 @@ DATTO_TIMESYNCD = Path("systemd/timesyncd.conf.d/01-datto-timesyncd.conf")
 RECOVERA_TIMESYNCD = Path("systemd/timesyncd.conf.d/20-recovera-timesyncd.conf")
 RECOVERA_TIME_SERVERS = "time.cloudflare.com ntp.ubuntu.com"
 RECOVERA_FALLBACK_TIME_SERVERS = "0.pool.ntp.org 1.pool.ntp.org"
+SPEEDSYNC_DIR = Path(os.environ.get("RECOVERA_SPEEDSYNC_DIR", "/datto/config/sync"))
+ASSET_KEYS = Path(os.environ.get("RECOVERA_ASSET_KEYS", "/datto/config/keys"))
+SPEEDSYNC_BACKUP = Path(os.environ.get(
+    "RECOVERA_SPEEDSYNC_BACKUP", "/datto/config/recovera-speedsync-unregistered"))
+AGENT_DATASET_ROOT = os.environ.get("RECOVERA_AGENT_DATASET_ROOT", "homePool/home/agents")
+SPEEDSYNC_REGISTRATION = re.compile(r"^[0-9]{1,12}\+([0-9a-fA-F]{32})\+agent$")
 
 
 def records(path: Path) -> list[str]:
@@ -104,6 +111,70 @@ def which(command: str) -> str | None:
     return None
 
 
+def dataset_exists(name: str) -> bool | None:
+    """True/False when ZFS answers definitively, None when it cannot tell."""
+    if not which("zfs"):
+        return None
+    result = run("zfs", "list", "-H", "-o", "name", name, check=False)
+    if result.returncode == 0:
+        return True
+    if "dataset does not exist" in (result.stderr or ""):
+        return False
+    return None
+
+
+def asset_offsite_target(asset: str) -> str | None:
+    path = ASSET_KEYS / f"{asset}.offsiteTarget"
+    try:
+        raw = path.read_text().strip()
+    except OSError:
+        return None
+    try:
+        value = json.loads(raw)
+    except ValueError:
+        return raw or None
+    if isinstance(value, dict):
+        return str(value.get("offsiteTarget") or "") or None
+    return str(value) if value else None
+
+
+def unregister_leftover_speedsync() -> list[dict[str, str]]:
+    """Retire SpeedSync registrations Recovera can never use.
+
+    SpeedSync is the vendor's cloud off-site engine. Its one-minute cron keeps
+    querying the blocked master server for every registered dataset, logging
+    errors continuously. "speedsync remove" cannot finish offline (it needs the
+    master to acknowledge before deleting the registration), so for datasets
+    that no longer exist or whose asset is set to no off-site replication, move
+    the registration folder aside, which is the step "remove" ends with. The
+    folder is kept under SPEEDSYNC_BACKUP so it can be restored.
+    """
+    if not SPEEDSYNC_DIR.is_dir():
+        return []
+    # Only judge datasets as missing when the agent dataset root is visible;
+    # an unimported pool must never look like deleted datasets.
+    root_visible = dataset_exists(AGENT_DATASET_ROOT) is True
+    retired: list[dict[str, str]] = []
+    for entry in sorted(SPEEDSYNC_DIR.iterdir()):
+        match = SPEEDSYNC_REGISTRATION.match(entry.name)
+        if not match or not entry.is_dir() or entry.is_symlink():
+            continue
+        asset = match.group(1).lower()
+        reason = None
+        if asset_offsite_target(asset) == "noOffsite":
+            reason = "asset is set to no off-site replication"
+        elif root_visible and dataset_exists(f"{AGENT_DATASET_ROOT}/{asset}") is False:
+            reason = "dataset no longer exists"
+        if not reason:
+            continue
+        SPEEDSYNC_BACKUP.mkdir(mode=0o700, parents=True, exist_ok=True)
+        destination = SPEEDSYNC_BACKUP / f"{entry.name}.{int(time.time())}"
+        entry.rename(destination)
+        retired.append({"registration": entry.name, "reason": reason,
+                        "backup": str(destination)})
+    return retired
+
+
 def apply(enforce_only: bool = False) -> dict[str, object]:
     if os.geteuid() != 0:
         raise PermissionError("recovera-cloud-isolation must run as root")
@@ -128,8 +199,13 @@ def apply(enforce_only: bool = False) -> dict[str, object]:
     if not enforce_only and which("nmcli"):
         run("nmcli", "general", "reload", check=False)
     run("systemctl", "try-restart", "systemd-timesyncd.service", check=False)
+    try:
+        speedsync_retired = unregister_leftover_speedsync()
+    except OSError as exc:
+        speedsync_retired = [{"error": str(exc)}]
     report = verify()
     report["legacy_sources_changed"] = changed_sources
+    report["speedsync_registrations_retired"] = speedsync_retired
     report["time_sync"] = time_sync
     STATE.parent.mkdir(parents=True, exist_ok=True)
     STATE.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")

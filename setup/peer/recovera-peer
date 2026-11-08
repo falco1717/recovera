@@ -1273,38 +1273,46 @@ def replicate(asset: str, peer_id: str, snapshot: str | None = None,
             f"target capacity preflight failed: need {estimate} bytes plus "
             f"{reserve} bytes reserve, only {free} bytes free"
         )
-    payload = collect_metadata(asset, cfg)
-    # Receivers ignore unknown keys; newer ones use this to show total progress.
-    payload["transfer"] = {"bytes_total": int(estimate)}
-    metadata = encode_metadata(payload)
     resume_token = remote.get("resume_token")
     base: str | None = None
     bytes_before = 0
+    stream_total = estimate
+    if resume_token:
+        # A resumed stream keeps the format it started with (compressed or
+        # not), so measure it from the token itself rather than the estimate.
+        remaining = zfs_send_resume_estimate(str(resume_token))
+        bytes_before = resume_token_bytes(str(resume_token))
+        if not bytes_before and estimate and 0 < remaining < estimate:
+            bytes_before = estimate - remaining
+        if remaining:
+            stream_total = bytes_before + remaining
+    payload = collect_metadata(asset, cfg)
+    # Receivers ignore unknown keys; newer ones use this to show total progress.
+    payload["transfer"] = {"bytes_total": int(stream_total)}
+    metadata = encode_metadata(payload)
     if resume_token:
         send_command = ["zfs", "send", "-t", str(resume_token)]
         remote_command = ["receive-resume", asset, snapshot, metadata]
         mode = "resumed"
-        remaining = zfs_send_resume_estimate(str(resume_token))
-        if estimate and 0 < remaining < estimate:
-            bytes_before = estimate - remaining
     else:
         common = [value for value in local if value in remote_snaps]
         if remote_snaps and not common:
             raise PeerError("target has no common base snapshot; a controlled reseed is required")
         if common:
             base = common[-1]
-            send_command = ["zfs", "send", "-I", f"{dataset}@{base}", f"{dataset}@{snapshot}"]
+            send_command = ["zfs", "send", "-c", "-I", f"{dataset}@{base}", f"{dataset}@{snapshot}"]
             remote_command = ["receive", asset, snapshot, base, metadata]
             mode = f"incremental-from-{base}"
         else:
-            send_command = ["zfs", "send", f"{dataset}@{snapshot}"]
+            # -c sends blocks as already compressed on disk: fewer bytes on the WAN.
+            send_command = ["zfs", "send", "-c", f"{dataset}@{snapshot}"]
             remote_command = ["receive", asset, snapshot, "-", metadata]
             mode = "full"
     key = f"{peer_id}:{asset}"
     record = {
         "direction": "outbound", "asset": asset, "name": asset_display_name(asset),
         "peer_id": peer_id, "peer_name": str(peer.get("name") or peer.get("host") or peer_id),
-        "snapshot": snapshot, "base": base, "mode": mode, "bytes_total": estimate,
+        "snapshot": snapshot, "base": base, "mode": mode, "bytes_total": stream_total,
         "bytes_before": bytes_before, "started": int(time.time()), "pid": None,
     }
 
@@ -1333,7 +1341,7 @@ def zfs_send_estimate(dataset: str, snapshot: str, local: list[str],
                       remote_snapshots: list[Any]) -> int:
     """Ask ZFS for a conservative stream-size estimate before transfer."""
     common = [value for value in local if value in {str(item) for item in remote_snapshots}]
-    command = ["zfs", "send", "-nP"]
+    command = ["zfs", "send", "-nP", "-c"]
     if common:
         command += ["-I", f"{dataset}@{common[-1]}"]
     command.append(f"{dataset}@{snapshot}")
