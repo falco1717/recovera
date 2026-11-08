@@ -21,6 +21,7 @@ import grp
 import re
 import secrets
 import shlex
+import shutil
 import socket
 import socketserver
 import ssl
@@ -115,6 +116,11 @@ PROC_ROOT = Path(os.environ.get("RECOVERA_PROC_ROOT", "/proc"))
 TRANSFER_RECORD_MAX_AGE = 24 * 3600
 NETWORK_CHECK_PATH = STATE_DIR / "network-check.json"
 DEFAULT_UPDATE_HOST = "api.github.com"
+# Transport compression for replication streams, negotiated per transfer.
+# --adapt raises the level on slow WAN links and lowers it on fast LANs.
+STREAM_CODECS: dict[str, tuple[list[str], list[str]]] = {
+    "zstd": (["zstd", "-q", "-c", "-T0", "--adapt=min=1,max=15"], ["zstd", "-q", "-d", "-c"]),
+}
 _RATE_SAMPLES: dict[tuple[int, str], tuple[float, int]] = {}
 _RATE_LOCK = threading.Lock()
 
@@ -1188,37 +1194,50 @@ def encode_metadata(metadata: dict[str, Any]) -> str:
     return base64.urlsafe_b64encode(raw).decode()
 
 
+def local_stream_codecs() -> list[str]:
+    """Transport codecs this appliance can both compress and decompress."""
+    return [name for name, (compress, decompress) in STREAM_CODECS.items()
+            if shutil.which(compress[0]) and shutil.which(decompress[0])]
+
+
 def transfer_stream(send_command: list[str], peer: dict[str, Any], remote_command: list[str],
                     speed_kbps: int = 0,
-                    on_start: Callable[[int], None] | None = None) -> None:
+                    on_start: Callable[[int], None] | None = None,
+                    codec: str | None = None) -> None:
     sender = subprocess.Popen(send_command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     assert sender.stdout is not None
     if on_start:
         # Progress reporting must never interrupt the replication stream.
         with contextlib.suppress(Exception):
             on_start(sender.pid)
+    stages = [sender]
     stream = sender.stdout
-    limiter = None
+
+    def chain(argv: list[str]) -> None:
+        nonlocal stream
+        stage = subprocess.Popen(argv, stdin=stream, stdout=subprocess.PIPE,
+                                 stderr=subprocess.PIPE)
+        stream.close()
+        assert stage.stdout is not None
+        stages.append(stage)
+        stream = stage.stdout
+
+    if codec:
+        # Compress before the limiter so an upload limit caps bytes on the wire.
+        chain(STREAM_CODECS[codec][0])
     if speed_kbps > 0:
-        limiter = subprocess.Popen(["pv", "-q", "-L", str(speed_kbps * 1024)],
-                                   stdin=sender.stdout, stdout=subprocess.PIPE,
-                                   stderr=subprocess.PIPE)
-        sender.stdout.close()
-        assert limiter.stdout is not None
-        stream = limiter.stdout
+        chain(["pv", "-q", "-L", str(speed_kbps * 1024)])
     receiver = subprocess.Popen(ssh_base(peer) + [shlex.join(remote_command)], stdin=stream,
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     stream.close()
     recv_out, recv_err = receiver.communicate()
-    limit_err = b""
-    limit_rc = 0
-    if limiter:
-        limit_err = limiter.stderr.read() if limiter.stderr else b""
-        limit_rc = limiter.wait()
-    send_err = sender.stderr.read() if sender.stderr else b""
-    send_rc = sender.wait()
-    if send_rc != 0 or limit_rc != 0 or receiver.returncode != 0:
-        details = (send_err + b"\n" + limit_err + b"\n" + recv_err + b"\n" + recv_out).decode(errors="replace").strip()
+    failed = receiver.returncode != 0
+    stage_errors = []
+    for stage in stages:
+        stage_errors.append(stage.stderr.read() if stage.stderr else b"")
+        failed = stage.wait() != 0 or failed
+    if failed:
+        details = (b"\n".join(stage_errors) + b"\n" + recv_err + b"\n" + recv_out).decode(errors="replace").strip()
         raise PeerError(f"snapshot transfer failed: {details}")
     try:
         answer = json.loads(recv_out.decode())
@@ -1249,6 +1268,8 @@ def replicate(asset: str, peer_id: str, snapshot: str | None = None,
         raise PeerError(f"snapshot {snapshot} does not exist for {asset}")
     remote = remote_json(peer, ["asset-info", asset])
     _remember_name("peers", peer_id, remote.get("appliance_name"))
+    offered = remote.get("stream_codecs") if isinstance(remote.get("stream_codecs"), list) else []
+    codec = next((name for name in local_stream_codecs() if name in offered), None)
     if isinstance(remote.get("appliance_name"), str) and remote["appliance_name"].strip():
         peer = peer | {"name": remote["appliance_name"]}
     remote_snaps = [str(value) for value in remote.get("snapshots", [])]
@@ -1320,8 +1341,12 @@ def replicate(asset: str, peer_id: str, snapshot: str | None = None,
         record["pid"] = pid
         write_transfer_record("outbound", key, record)
 
+    if codec:
+        remote_command = remote_command + [codec]
+        record["codec"] = codec
     try:
-        transfer_stream(send_command, peer, remote_command, speed_kbps, on_start=started)
+        transfer_stream(send_command, peer, remote_command, speed_kbps, on_start=started,
+                        codec=codec)
     finally:
         clear_transfer_record("outbound", key)
     with locked_state() as value:
@@ -1360,7 +1385,8 @@ def zfs_send_resume_estimate(token: str) -> int:
 
 
 def receive_dataset(source_id: str, asset: str, snapshot: str, base: str,
-                    encoded_metadata: str, resume: bool, stream: BinaryIO) -> dict[str, Any]:
+                    encoded_metadata: str, resume: bool, stream: BinaryIO,
+                    codec: str | None = None) -> dict[str, Any]:
     require_root()
     cfg = config()
     if source_id not in cfg.get("sources", {}):
@@ -1417,8 +1443,17 @@ def receive_dataset(source_id: str, asset: str, snapshot: str, base: str,
         "bytes_total": bytes_total,
         "started": int(time.time()), "pid": None,
     }
+    decompressor = None
+    if codec:
+        # zfs receive (and its progress counter) sees the original stream bytes.
+        decompressor = subprocess.Popen(STREAM_CODECS[codec][1], stdin=stream,
+                                        stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        stream = decompressor.stdout
+        record["codec"] = codec
     proc = subprocess.Popen(["zfs", "receive", "-u", "-s", dataset], stdin=stream,
                             stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if decompressor and decompressor.stdout:
+        decompressor.stdout.close()
     record["pid"] = proc.pid
     with contextlib.suppress(Exception):
         write_transfer_record("inbound", asset, record)
@@ -1426,6 +1461,12 @@ def receive_dataset(source_id: str, asset: str, snapshot: str, base: str,
         _, receive_err = proc.communicate()
     finally:
         clear_transfer_record("inbound", asset)
+    decompress_err = b""
+    if decompressor:
+        decompress_err = decompressor.stderr.read() if decompressor.stderr else b""
+        if decompressor.wait() != 0 and proc.returncode == 0:
+            raise PeerError("stream decompression failed: " +
+                            decompress_err.decode(errors="replace").strip())
     if proc.returncode != 0:
         raise PeerError(f"zfs receive failed: {receive_err.decode(errors='replace').strip()}")
     run(["zfs", "set", "canmount=on", dataset])
@@ -1468,7 +1509,7 @@ def asset_info_received(source_id: str, asset: str) -> dict[str, Any]:
             token = result.stdout.decode().strip()
     return {"ok": True, "exists": zfs_exists(dataset), "snapshots": zfs_snapshots(dataset),
             "resume_token": token or None, "storage": storage_status(cfg),
-            "appliance_name": appliance_name(cfg)}
+            "appliance_name": appliance_name(cfg), "stream_codecs": local_stream_codecs()}
 
 
 def storage_status(cfg: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -1481,6 +1522,12 @@ def storage_status(cfg: dict[str, Any] | None = None) -> dict[str, Any]:
             "free": int(free), "health": health}
 
 
+def stream_codec_argument(value: str) -> str:
+    if value not in STREAM_CODECS or value not in local_stream_codecs():
+        raise PeerError(f"unsupported stream codec: {value}")
+    return value
+
+
 def ssh_entry(source_id: str) -> None:
     require_root()
     if not ID_RE.fullmatch(source_id):
@@ -1491,10 +1538,14 @@ def ssh_entry(source_id: str) -> None:
     command = argv.pop(0)
     if command == "asset-info" and len(argv) == 1:
         answer = asset_info_received(source_id, argv[0])
-    elif command == "receive" and len(argv) == 4:
-        answer = receive_dataset(source_id, argv[0], argv[1], argv[2], argv[3], False, sys.stdin.buffer)
-    elif command == "receive-resume" and len(argv) == 3:
-        answer = receive_dataset(source_id, argv[0], argv[1], "-", argv[2], True, sys.stdin.buffer)
+    elif command == "receive" and len(argv) in (4, 5):
+        codec = stream_codec_argument(argv[4]) if len(argv) == 5 else None
+        answer = receive_dataset(source_id, argv[0], argv[1], argv[2], argv[3], False,
+                                 sys.stdin.buffer, codec)
+    elif command == "receive-resume" and len(argv) in (3, 4):
+        codec = stream_codec_argument(argv[3]) if len(argv) == 4 else None
+        answer = receive_dataset(source_id, argv[0], argv[1], "-", argv[2], True,
+                                 sys.stdin.buffer, codec)
     else:
         raise PeerError("unsupported replication command")
     print(json.dumps(answer, separators=(",", ":")))
@@ -2171,6 +2222,7 @@ def replication_activity() -> dict[str, Any]:
             "percent": round(min(100.0, done * 100 / total), 1) if total else None,
             "rate_bps": int(rate),
             "eta_seconds": int((total - done) / rate) if total > done and rate > 0 else None,
+            "codec": record.get("codec"),
         }
         if direction == "outbound":
             peer_id = str(record.get("peer_id") or "")

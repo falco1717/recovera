@@ -161,6 +161,9 @@
         if (item.mode) {
             line(block, 'Type', modeLabel(item.mode));
         }
+        if (item.codec) {
+            line(block, 'In transit', 'compressed (' + item.codec + '); speed counts backup data');
+        }
         if (item.snapshot) {
             line(block, 'Recovery point', when(item.snapshot));
         }
