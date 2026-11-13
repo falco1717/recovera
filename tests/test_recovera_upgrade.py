@@ -821,7 +821,10 @@ class RecoveraUpgradeTests(unittest.TestCase):
     def test_configuration_migration_carries_appliance_state_and_fixes_fstab(self):
         migration = (ROOT / "upgrade" / "recovera-migrate-config").read_text()
         for value in ("/etc/zfs/zpool.cache", "/var/lib/datto", "/var/lib/recovera",
-                      "/etc/firewalld/zones", "/var/lib/samba/private"):
+                      "/etc/firewalld/zones", "/var/lib/samba/private",
+                      # NM derives br0's stable cloned MAC from secret_key + machine-id.
+                      "/var/lib/NetworkManager/secret_key", "/etc/localtime", "/etc/timezone",
+                      "/etc/systemd/timesyncd.conf.d"):
             self.assertIn(value, migration)
         self.assertIn('[ -e /etc/hostid ] || rm -f "$target/etc/hostid"', migration)
         start = migration.index("<<'PY'\n", migration.index('"$target/etc/fstab"')) + len("<<'PY'\n")

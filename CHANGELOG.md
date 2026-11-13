@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.6.43 - 2026-11-13
+
+- The operating-system image migration also carries NetworkManager's
+  `secret_key` (with the already-carried machine ID it determines `br0`'s
+  stable cloned MAC address, so the appliance keeps its MAC and DHCP lease),
+  the time zone (`/etc/localtime`, `/etc/timezone`) set at registration, and
+  time-synchronization settings.
+
 ## v0.6.42 - 2026-11-13
 
 Fixes found installing the current 5.12.x bundle over an existing Ubuntu 24.04
