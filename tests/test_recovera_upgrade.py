@@ -1304,6 +1304,44 @@ class RecoveraUpgradeTests(unittest.TestCase):
         self.assertIn('rm -f "$target/etc/sudoers.d/$name"', rules)
         self.assertIn("-m 0440 -o root -g root", rules)
 
+    def test_failed_image_validation_clears_the_staged_transition(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = root / "state.json"
+            state.write_text(json.dumps({
+                "installed": {"type": "package", "version": "0.6.45", "sequence": 46},
+                "previous": {"type": "package", "version": "0.6.45", "sequence": 46},
+                "pending": {"version": "0.6.45-noble.1", "sequence": 47, "transition": True,
+                            "image": "/host/recovera/images/0.6.45-noble.1.img"},
+                "transition_approval": {"version": "0.6.45-noble.1", "start": "now"},
+            }))
+            release = root / "release.json"
+            release.write_text(json.dumps({"schema": 1, "sequence": 47, "version": "0.6.45-noble.1"}))
+            marker = root / "pending"
+            marker.write_text("")
+            environment = {"RECOVERA_UPGRADE_STATE": str(state), "RECOVERA_RELEASE_FILE": str(release)}
+            with mock.patch.dict("os.environ", environment), \
+                 mock.patch.object(self.module, "UpgradeLock", lambda: contextlib.nullcontext()), \
+                 mock.patch.object(self.module, "require_root", lambda: None), \
+                 mock.patch.object(self.module, "PENDING_MARKER", marker), \
+                 mock.patch.object(self.module, "previous_image_available", return_value=False), \
+                 mock.patch.object(self.module, "run") as run:
+                self.module.command_validation_failed(
+                    {"HOST_ROOT": str(root)}, argparse.Namespace(reason="exit-code", reboot=False))
+            self.assertEqual(run.call_args_list[0].args[0], [self.module.BOOT_HELPER, "fallback"])
+            value = json.loads(state.read_text())
+            self.assertIsNone(value["pending"])
+            self.assertIsNone(value["transition_approval"])
+            self.assertIn("failed (exit-code)", value["transition_last_attempt"]["result"])
+            self.assertEqual(value["last_failure"], {"version": "0.6.45-noble.1", "reason": "exit-code"})
+            self.assertFalse(marker.exists())
+            # With nothing staged any more, a new approval can be cancelled.
+            with mock.patch.dict("os.environ", environment), \
+                 mock.patch.object(self.module, "UpgradeLock", lambda: contextlib.nullcontext()), \
+                 mock.patch.object(self.module, "require_root", lambda: None), \
+                 mock.patch("sys.stdout", new_callable=io.StringIO):
+                self.assertEqual(self.module.command_cancel_transition({}, argparse.Namespace()), 0)
+
 
 if __name__ == "__main__":
     unittest.main()
