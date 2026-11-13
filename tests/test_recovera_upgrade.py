@@ -1,3 +1,7 @@
+import argparse
+import contextlib
+import subprocess
+import sys
 import importlib.machinery
 import importlib.util
 import io
@@ -574,6 +578,276 @@ class RecoveraUpgradeTests(unittest.TestCase):
             text = (ROOT / script).read_text()
             self.assertIn("compatibility.d/openzfs-2.2-linux ] && compat=(-o compatibility=openzfs-2.2-linux)", text)
             self.assertIn('zpool create -o ashift=12 "${compat[@]}"', text)
+
+    # --- 0.6.37: image-layout conversion and OS transition images ---
+
+    UUID = "a37c1887-f6dd-425b-890c-d2fd05249a97"
+
+    def layout_fixture(self, directory):
+        root = Path(directory)
+        host = root / "host"
+        (host / "recovera").mkdir(parents=True)
+        (host / "recovera" / "state.json").write_text('{"installed_sequence": 36}')
+        share = root / "share"
+        share.mkdir()
+        (share / "07_recovera_images").write_text("#!/bin/sh\n")
+        (share / "99_recovera_images.cfg").write_text("GRUB_DEFAULT=saved\n")
+        fstab = root / "fstab"
+        fstab.write_text("LABEL=cloudimg-rootfs\t/\t ext4\tdiscard,errors=remount-ro\t0 1\n"
+                         "LABEL=UEFI\t/boot/efi\tvfat\tumask=0077\t0 1\n")
+        grub = root / "grub.cfg"
+        grub.write_text(f"menuentry 'Ubuntu' $menuentry_id_option 'gnulinux-simple-{self.UUID}' {{\n}}\n")
+        calls = []
+
+        def fake_run(args, **_kwargs):
+            args = [str(value) for value in args]
+            calls.append(args)
+            stdout = f"{self.UUID} /dev/sda1 ext4\n".encode() if args[0] == "findmnt" else b""
+            return mock.Mock(returncode=0, stdout=stdout, stderr=b"")
+
+        patches = [
+            mock.patch.object(self.module, "SHARE_DIR", share),
+            mock.patch.object(self.module, "FSTAB", fstab),
+            mock.patch.object(self.module, "GRUB_CFG", grub),
+            mock.patch.object(self.module, "GRUB_SCRIPT", root / "grub.d" / "07_recovera_images"),
+            mock.patch.object(self.module, "GRUB_DEFAULTS", root / "default" / "99_recovera_images.cfg"),
+            mock.patch.object(self.module, "SHARED_STATE", root / "recovera"),
+            mock.patch.object(self.module, "HOST_MOUNTPOINT", str(host)),
+            mock.patch.object(self.module, "PENDING_MARKER", host / "recovera" / "pending"),
+            mock.patch.object(self.module, "UpgradeLock", lambda: contextlib.nullcontext()),
+            mock.patch.object(self.module, "require_root", lambda: None),
+            mock.patch.object(self.module, "run", side_effect=fake_run),
+            mock.patch.dict("os.environ", {"RECOVERA_IMAGE_LAYOUT": str(root / "image-layout.json")}),
+            mock.patch("sys.stdout", new_callable=io.StringIO),
+        ]
+        return root, host, fstab, calls, patches, {"HOST_ROOT": str(host)}
+
+    def test_prepare_image_layout_keeps_the_conventional_boot_default(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root, host, fstab, calls, patches, config = self.layout_fixture(directory)
+            with contextlib.ExitStack() as stack:
+                for patch in patches:
+                    stack.enter_context(patch)
+                dry = argparse.Namespace(dry_run=True)
+                self.assertEqual(self.module.command_prepare_image_layout(config, dry), 0)
+                self.assertFalse((root / "image-layout.json").exists())
+                self.assertNotIn("bind", fstab.read_text())
+
+                self.assertEqual(self.module.command_prepare_image_layout(
+                    config, argparse.Namespace(dry_run=False)), 0)
+                layout = json.loads((root / "image-layout.json").read_text())
+                entry = f"gnulinux-simple-{self.UUID}"
+                self.assertEqual(layout["mode"], "loop-image-v1")
+                self.assertEqual(layout["boot_root_uuid"], self.UUID)
+                self.assertEqual(layout["fallback_entry"], entry)
+                # Updater state follows the bind mount to /recovera.
+                self.assertEqual(json.loads((root / "recovera" / "state.json").read_text()),
+                                 {"installed_sequence": 36})
+                self.assertIn(f"/ {host} none bind,", fstab.read_text())
+                self.assertTrue((root / "grub.d" / "07_recovera_images").is_file())
+                self.assertTrue((root / "default" / "99_recovera_images.cfg").is_file())
+                order = [call[0] if call[0] != "mount" else "mount" for call in calls]
+                self.assertIn(["mount", "--bind", "/", str(host)], calls)
+                self.assertIn(["grub-set-default", entry], calls)
+                self.assertLess(order.index("mount"), order.index("update-grub"))
+                self.assertLess(order.index("update-grub"), order.index("grub-set-default"))
+
+                calls.clear()
+                self.module.command_prepare_image_layout(config, argparse.Namespace(dry_run=False))
+                self.assertEqual(calls, [], "a second run must change nothing")
+
+                (host / "recovera" / "images").mkdir(parents=True, exist_ok=True)
+                (host / "recovera" / "images" / "0.7.0.img").write_text("x")
+                with self.assertRaisesRegex(self.module.UpgradeError, "--force"):
+                    self.module.command_revert_image_layout(config, argparse.Namespace(force=False))
+                self.module.command_revert_image_layout(config, argparse.Namespace(force=True))
+                self.assertFalse((root / "image-layout.json").exists())
+                self.assertFalse((root / "grub.d" / "07_recovera_images").exists())
+                self.assertNotIn("bind", fstab.read_text())
+                self.assertIn("LABEL=UEFI", fstab.read_text())
+                self.assertIn(["update-grub"], calls)
+
+    def test_prepare_image_layout_refuses_unsafe_starting_points(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root, host, fstab, calls, patches, config = self.layout_fixture(directory)
+            with contextlib.ExitStack() as stack:
+                for patch in patches:
+                    stack.enter_context(patch)
+                arguments = argparse.Namespace(dry_run=False)
+                (host / "recovera" / "pending").write_text("")
+                with self.assertRaisesRegex(self.module.UpgradeError, "reboot validation"):
+                    self.module.command_prepare_image_layout(config, arguments)
+                (host / "recovera" / "pending").unlink()
+                (root / "grub.cfg").write_text("menuentry 'Other' {\n}\n")
+                with self.assertRaisesRegex(self.module.UpgradeError, "no gnulinux-simple"):
+                    self.module.command_prepare_image_layout(config, arguments)
+                with mock.patch.object(self.module, "run", return_value=mock.Mock(
+                        returncode=0, stdout=f"{self.UUID} /dev/loop0 ext4".encode())):
+                    with self.assertRaisesRegex(self.module.UpgradeError, "already running"):
+                        self.module.command_prepare_image_layout(config, arguments)
+                self.assertFalse((root / "image-layout.json").exists())
+
+    def test_failed_first_image_falls_back_to_the_conventional_root(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = root / "state.json"
+            images = root / "host" / "recovera" / "images"
+            images.mkdir(parents=True)
+            environment = {"RECOVERA_UPGRADE_STATE": str(state),
+                           "RECOVERA_RELEASE_FILE": str(root / "none")}
+            config = {"HOST_ROOT": str(root / "host")}
+            arguments = argparse.Namespace(reason="validation failed", reboot=False)
+            cases = [
+                ({"type": "package", "version": "0.6.37", "sequence": 36}, "fallback"),
+                ({"version": "0.7.0", "sequence": 40}, "fallback"),  # image file is gone
+            ]
+            (images / "0.7.1.img").write_text("x")
+            cases.append(({"version": "0.7.1", "sequence": 41}, "rollback"))
+            for previous, expected in cases:
+                state.write_text(json.dumps({"pending": {"version": "0.8.0"}, "previous": previous}))
+                with self.subTest(previous=previous), \
+                     mock.patch.dict("os.environ", environment), \
+                     mock.patch.object(self.module, "UpgradeLock", lambda: contextlib.nullcontext()), \
+                     mock.patch.object(self.module, "require_root", lambda: None), \
+                     mock.patch.object(self.module, "PENDING_MARKER", root / "pending"), \
+                     mock.patch.object(self.module, "run") as run:
+                    self.module.command_validation_failed(config, arguments)
+                    self.assertEqual(run.call_args_list[0].args[0][1], expected)
+
+    def image_manifest(self, **extra):
+        manifest = self.manifest()
+        manifest.update(extra)
+        return manifest
+
+    def test_image_manifest_transition_fields_are_validated(self):
+        pointer = {"version": "0.7.0", "sequence": 7}
+        good = {"os": {"id": "ubuntu", "version_id": "24.04"},
+                "from": {"os_version_ids": ["22.04"], "minimum_version": "0.6.37"}}
+        with mock.patch.object(self.module.platform, "machine", return_value="x86_64"):
+            self.module.validate_manifest(self.image_manifest(**good), pointer, {"CHANNEL": "stable"})
+            for bad in ({"from": {"os_version_ids": []}},
+                        {"from": {"os_version_ids": ["22.04"], "extra": 1}},
+                        {"from": {"os_version_ids": ["22.04;rm"]}},
+                        {"os": {"id": "ubuntu"}}):
+                with self.subTest(bad=bad), self.assertRaises(self.module.UpgradeError):
+                    self.module.validate_manifest(self.image_manifest(**bad), pointer, {"CHANNEL": "stable"})
+
+    def test_transition_preflight_requires_a_drained_healthy_appliance(self):
+        manifest = self.image_manifest(
+            os={"id": "ubuntu", "version_id": "24.04"},
+            **{"from": {"os_version_ids": ["22.04"], "minimum_version": "0.6.37"}})
+        manifest["image"]["size"] = 10
+        manifest["image"]["uncompressed_size"] = 20
+        ready = argparse.Namespace(allow_busy=False)
+
+        def preflight(**overrides):
+            values = {"installed": "0.6.37-1", "at_least": True, "health": "ONLINE",
+                      "drained": (True, "idle"), "restores": [], "free": 10 * 2**30,
+                      "os": dict(self.JAMMY), "args": ready}
+            values.update(overrides)
+            with mock.patch.object(self.module, "local_os", return_value=values["os"]), \
+                 mock.patch.object(self.module, "installed_version", return_value=values["installed"]), \
+                 mock.patch.object(self.module, "version_at_least", return_value=values["at_least"]), \
+                 mock.patch.object(self.module, "pool_health", return_value=values["health"]), \
+                 mock.patch.object(self.module, "replication_drained", return_value=values["drained"]), \
+                 mock.patch.object(self.module, "active_restores", return_value=values["restores"]), \
+                 mock.patch.object(self.module.shutil, "disk_usage",
+                                   return_value=mock.Mock(free=values["free"])):
+                self.module.transition_preflight(manifest, Path("."), values["args"])
+
+        preflight()
+        with self.assertRaisesRegex(self.module.UpgradeError, "starts from Ubuntu 22.04"):
+            preflight(os=dict(self.NOBLE))
+        with self.assertRaisesRegex(self.module.UpgradeError, "0.6.37 or newer"):
+            preflight(at_least=False)
+        with self.assertRaisesRegex(self.module.UpgradeError, "DEGRADED"):
+            preflight(health="DEGRADED")
+        with self.assertRaisesRegex(self.module.UpgradeError, "not paused"):
+            preflight(drained=(False, "replication is not paused"))
+        with self.assertRaisesRegex(self.module.UpgradeError, "restores are active"):
+            preflight(restores=["virtual machine test"])
+        with self.assertRaisesRegex(self.module.UpgradeError, "MiB free"):
+            preflight(free=100)
+        preflight(drained=(False, "busy"), restores=["vm"], args=argparse.Namespace(allow_busy=True))
+        # An image for another OS release without "from" is not a transition.
+        plain = self.image_manifest(os={"id": "ubuntu", "version_id": "24.04"})
+        with mock.patch.object(self.module, "local_os", return_value=dict(self.JAMMY)):
+            with self.assertRaisesRegex(self.module.UpgradeError, "needs a transition release"):
+                self.module.transition_preflight(plain, Path("."), ready)
+
+    def test_replication_drained_reads_the_peer_maintenance_status(self):
+        def status(value):
+            return mock.Mock(returncode=0, stdout=json.dumps(value).encode())
+
+        with tempfile.TemporaryDirectory() as directory:
+            peer = Path(directory) / "recovera-peer"
+            with mock.patch.object(self.module, "PEER_COMMAND", peer):
+                self.assertTrue(self.module.replication_drained()[0])
+                peer.write_text("")
+                cases = [({"maintenance": None, "busy": []}, False),
+                         ({"maintenance": {"reason": "x"}, "busy": ["receiving a"]}, False),
+                         ({"maintenance": {"reason": "x"}, "busy": []}, True)]
+                for value, expected in cases:
+                    with mock.patch.object(self.module, "run", return_value=status(value)):
+                        self.assertEqual(self.module.replication_drained()[0], expected)
+
+    def test_channel_override_is_explicit_and_never_cached(self):
+        seen = {}
+        base = {"REPOSITORY": "falco1717/recovera", "CHANNEL": "stable",
+                "CHANNEL_BRANCH": "main", "HOST_ROOT": "/host"}
+
+        def capture(config, _args):
+            seen.update(config)
+            return 0
+
+        def invoke(*argv):
+            with mock.patch.object(self.module, "read_config", side_effect=lambda _path: dict(base)), \
+                 mock.patch.object(self.module, "command_check", side_effect=capture), \
+                 mock.patch.object(self.module.sys, "argv", ["recovera-upgrade", *argv]), \
+                 mock.patch("sys.stderr", new_callable=io.StringIO):
+                return self.module.main()
+
+        self.assertEqual(invoke("check", "--channel", "jammy-noble-transition"), 0)
+        self.assertEqual(seen["CHANNEL"], "jammy-noble-transition")
+        self.assertEqual(invoke("check", "--channel", "../stable"), 1)
+        self.assertEqual(invoke("check", "--channel", "jammy-noble-transition", "--cache"), 1)
+        schedule = (ROOT / "upgrade" / "recovera-upgrade-schedule").read_text()
+        self.assertNotIn("--channel", schedule)
+
+    def test_configuration_migration_carries_appliance_state_and_fixes_fstab(self):
+        migration = (ROOT / "upgrade" / "recovera-migrate-config").read_text()
+        for value in ("/etc/zfs/zpool.cache", "/var/lib/datto", "/var/lib/recovera",
+                      "/etc/firewalld/zones", "/var/lib/samba/private"):
+            self.assertIn(value, migration)
+        self.assertIn('[ -e /etc/hostid ] || rm -f "$target/etc/hostid"', migration)
+        start = migration.index("<<'PY'\n", migration.index('"$target/etc/fstab"')) + len("<<'PY'\n")
+        snippet = migration[start:migration.index("\nPY", start)]
+        with tempfile.TemporaryDirectory() as directory:
+            fstab = Path(directory) / "fstab"
+            fstab.write_text(
+                "# comment\n"
+                "LABEL=cloudimg-rootfs\t/\t ext4\tdiscard,errors=remount-ro\t0 1\n"
+                "LABEL=UEFI\t/boot/efi\tvfat\tumask=0077\t0 1\n"
+                "# Recovera image host (recovera-upgrade prepare-image-layout)\n"
+                "/ /host none bind,x-systemd.requires-mounts-for=/ 0 0\n")
+            script = Path(directory) / "fix.py"
+            script.write_text(snippet)
+            subprocess.run([sys.executable, str(script), str(fstab)], check=True)
+            lines = fstab.read_text().splitlines()
+        self.assertIn("LABEL=recovera-root\t/\text4\tdefaults,errors=remount-ro\t0 0", lines)
+        self.assertIn("LABEL=UEFI\t/boot/efi\tvfat\tumask=0077\t0 1", lines)
+        self.assertFalse(any("cloudimg-rootfs" in line or "/host" in line for line in lines))
+        self.assertIn("# comment", lines)
+
+    def test_image_builder_marks_transitions_and_drops_host_identity(self):
+        builder = (ROOT / "tools" / "build-upgrade-image.sh").read_text()
+        for value in ("--from-os", "--minimum-version", "--os-version", "*-transition",
+                      "manifest['from']", '"$mountpoint/etc/hostid"',
+                      '"$mountpoint/etc/zfs/zpool.cache"', "the highest sequence on any channel"):
+            self.assertIn(value, builder)
+        control = (ROOT / "tools" / "build-recovera-appliance-deb.sh").read_text()
+        self.assertIn('"$stage/usr/local/share/recovera-upgrade/07_recovera_images"', control)
+        self.assertIn('"$stage/usr/local/share/recovera-upgrade/99_recovera_images.cfg"', control)
 
 
 if __name__ == "__main__":
