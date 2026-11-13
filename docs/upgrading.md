@@ -156,6 +156,7 @@ Its `/etc/fstab` root line is rewritten to the image label. Administrator-made
 `/etc/sudoers.d` rules (root-owned files not installed by a package, such as a
 rule for `backup-admin`) are carried with the local accounts; each must pass
 `visudo -c`, otherwise it is left behind and the migration says so.
+cloud-init's `90-cloud-init-users` is not carried.
 
 Recovery points, logs and configuration changed while running the image stay
 in `homePool`, but a fallback to 22.04 uses the 22.04 copy of `/datto/config`

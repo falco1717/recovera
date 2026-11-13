@@ -24,7 +24,9 @@ both ways, and an administrator rollback to 22.04).
   success and error, and free cache space.
 - The OS transition carries administrator-made `/etc/sudoers.d` rules (for
   example a `backup-admin` rule) along with the local accounts, when they are
-  root-owned, not from a package and pass `visudo`.
+  root-owned, not from a package and pass `visudo`. cloud-init's
+  `90-cloud-init-users` rule for the cloud image's default account is not
+  carried: the image disables cloud-init and locks that account.
 - After a reboot ends a maintenance hold, the replication event log records
   that replication resumed instead of ending on "paused for maintenance".
 - A failed validation of an operating-system image now clears the staged

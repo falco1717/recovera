@@ -54,6 +54,9 @@ for path in /etc/sudoers.d/*; do
   [ -f "$path" ] && [ ! -L "$path" ] || continue
   name=${path##*/}
   case "$name" in *~|*.*) continue;; esac  # sudo ignores these names
+  # cloud-init's rule for the cloud image's default account: the image
+  # disables cloud-init and locks that account, so it is not carried.
+  [ "$name" = 90-cloud-init-users ] && continue
   [ "$(stat -c %u "$path")" = 0 ] || continue
   dpkg -S "$path" >/dev/null 2>&1 && continue
   install -D -m 0440 -o root -g root "$path" "$target/etc/sudoers.d/$name"
