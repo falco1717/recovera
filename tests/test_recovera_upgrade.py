@@ -10,6 +10,7 @@ import importlib.util
 import io
 import json
 from pathlib import Path
+import shutil
 import tempfile
 import unittest
 from unittest import mock
@@ -25,6 +26,61 @@ def load_updater():
     module = importlib.util.module_from_spec(spec)
     loader.exec_module(module)
     return module
+
+
+class AssetServer:
+    """A local HTTP origin for one asset. `mode` picks how it treats Range."""
+
+    def __init__(self, data, mode="ranges", cut_first_after=None):
+        import http.server
+        import threading
+        self.data, self.mode, self.cut_first_after = data, mode, cut_first_after
+        self.requests = []
+        owner = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def do_GET(self):
+                header = self.headers.get("Range")
+                owner.requests.append(header)
+                data, start = owner.data, 0
+                if header and owner.mode == "reject":
+                    self.send_response(416)
+                    self.send_header("Content-Range", f"bytes */{len(data)}")
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
+                if header and owner.mode == "ranges":
+                    start = int(header.split("=", 1)[1].split("-", 1)[0])
+                    self.send_response(206)
+                    self.send_header("Content-Range", f"bytes {start}-{len(data) - 1}/{len(data)}")
+                else:
+                    self.send_response(200)
+                body = data[start:]
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                if owner.cut_first_after is not None and len(owner.requests) == 1:
+                    self.wfile.write(body[:owner.cut_first_after])
+                    self.wfile.flush()
+                    self.close_connection = True
+                    return
+                self.wfile.write(body)
+
+        self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+
+    def __enter__(self):
+        self.thread.start()
+        return self
+
+    def __exit__(self, *args):
+        self.server.shutdown()
+        self.server.server_close()
+
+    def url(self, name="part-000"):
+        return f"http://127.0.0.1:{self.server.server_address[1]}/{name}"
 
 
 class RecoveraUpgradeTests(unittest.TestCase):
@@ -407,8 +463,12 @@ class RecoveraUpgradeTests(unittest.TestCase):
         self.assertIn("ProtectSystem=false", service)
         self.assertIn("TimeoutStartSec=infinity", service)
 
-    def test_assembler_reclaims_verified_parts_before_decompression(self):
-        self.assertIn("local.unlink()", UPDATER.read_text())
+    def test_install_keeps_parts_until_the_image_is_staged(self):
+        source = UPDATER.read_text()
+        install = source[source.index("def command_install_image"):source.index("def dpkg_field")]
+        self.assertNotIn("TemporaryDirectory", install)
+        self.assertLess(install.index('run([BOOT_HELPER, "stage"'), install.index("shutil.rmtree(work"))
+        self.assertNotIn("recovera-image.img.xz", source)
 
     def test_configuration_migration_is_allowlisted(self):
         migration = (ROOT / "upgrade" / "recovera-migrate-config").read_text()
@@ -1127,6 +1187,122 @@ class RecoveraUpgradeTests(unittest.TestCase):
         self.assertIn("--exclude='/home/*'", builder)
         self.assertIn("--exclude='/var/log/journal/*'", builder)
         self.assertIn("! -name 'recovera-appliance_*.deb' -delete", builder)
+
+    # --- 0.6.45: resumable image downloads ---
+
+    def _obtain_part(self, server, directory, data):
+        import hashlib
+        assets = {"__release_base_urls__": [server.url("").rstrip("/")]}
+        target = Path(directory) / "part-000"
+        with mock.patch.object(self.module.time, "sleep"):
+            self.module.obtain_asset("part-000", assets, target, {},
+                                     expected_size=len(data),
+                                     expected_sha256=hashlib.sha256(data).hexdigest())
+        return target
+
+    def test_image_part_resumes_from_its_partial_file(self):
+        data = bytes(range(256)) * 4096
+        with tempfile.TemporaryDirectory() as directory, AssetServer(data) as server:
+            (Path(directory) / "part-000.partial").write_bytes(data[:300000])
+            target = self._obtain_part(server, directory, data)
+            self.assertEqual(target.read_bytes(), data)
+            self.assertEqual(server.requests, ["bytes=300000-"])
+            self.assertFalse((Path(directory) / "part-000.partial").exists())
+
+    def test_origin_that_ignores_ranges_restarts_the_part(self):
+        data = b"recovera" * 50000
+        with tempfile.TemporaryDirectory() as directory, AssetServer(data, mode="ignore") as server:
+            (Path(directory) / "part-000.partial").write_bytes(data[:1000])
+            target = self._obtain_part(server, directory, data)
+            self.assertEqual(target.read_bytes(), data)
+            self.assertEqual(server.requests, ["bytes=1000-"])
+
+    def test_rejected_range_restarts_the_part(self):
+        data = b"x" * 200000
+        with tempfile.TemporaryDirectory() as directory, AssetServer(data, mode="reject") as server:
+            (Path(directory) / "part-000.partial").write_bytes(data[:5000])
+            target = self._obtain_part(server, directory, data)
+            self.assertEqual(target.read_bytes(), data)
+            self.assertEqual(server.requests, ["bytes=5000-", None])
+
+    def test_interrupted_transfer_keeps_its_partial_file_and_resumes(self):
+        data = bytes(range(251)) * 8000
+        with tempfile.TemporaryDirectory() as directory, \
+                AssetServer(data, cut_first_after=700000) as server:
+            target = self._obtain_part(server, directory, data)
+            self.assertEqual(target.read_bytes(), data)
+            self.assertEqual(server.requests[0], None)
+            self.assertEqual(server.requests[1], "bytes=700000-")
+
+    def test_part_with_the_wrong_digest_is_discarded(self):
+        import hashlib
+        data = b"a" * 100000
+        with tempfile.TemporaryDirectory() as directory, AssetServer(b"b" * 100000) as server:
+            assets = {"__release_base_urls__": [server.url("").rstrip("/")]}
+            target = Path(directory) / "part-000"
+            with mock.patch.object(self.module.time, "sleep"), \
+                    self.assertRaisesRegex(self.module.UpgradeError, "verification failed"):
+                self.module.obtain_asset("part-000", assets, target, {}, expected_size=len(data),
+                                         expected_sha256=hashlib.sha256(data).hexdigest())
+            self.assertFalse(target.exists())
+            self.assertEqual(len(server.requests), 3)
+
+    def test_verified_part_from_an_earlier_attempt_is_not_downloaded_again(self):
+        import hashlib
+        data = b"done" * 1000
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "part-000"
+            target.write_bytes(data)
+            with mock.patch.object(self.module, "download") as downloader:
+                self.module.obtain_asset("part-000", {"__release_base_urls__": ["https://x"]}, target, {},
+                                         expected_size=len(data),
+                                         expected_sha256=hashlib.sha256(data).hexdigest())
+            downloader.assert_not_called()
+
+    def test_download_directory_is_per_release_and_clears_older_ones(self):
+        manifest = {"sequence": 46, "image": {"sha256": "ab" * 32}}
+        with tempfile.TemporaryDirectory() as directory:
+            downloads = Path(directory)
+            (downloads / "image-45-0123456789abcdef").mkdir()
+            (downloads / "release-abc").mkdir()
+            work = self.module.image_download_dir(downloads, manifest)
+            self.assertEqual(work.name, "image-46-abababababababab")
+            self.assertEqual(sorted(item.name for item in downloads.iterdir()), [work.name])
+            (work / "part-000.partial").write_bytes(b"keep")
+            self.module.image_download_dir(downloads, manifest)
+            self.assertEqual((work / "part-000.partial").read_bytes(), b"keep")
+
+    @unittest.skipUnless(shutil.which("xz"), "xz is required")
+    def test_parts_stream_through_xz_and_the_combined_digest_is_checked(self):
+        import hashlib
+        import lzma
+        raw = os.urandom(300000) * 3
+        packed = lzma.compress(raw, format=lzma.FORMAT_XZ)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            parts = []
+            for index, start in enumerate(range(0, len(packed), 100000)):
+                part = root / f"part-{index:03d}"
+                part.write_bytes(packed[start:start + 100000])
+                parts.append(part)
+            manifest = {"image": {"size": len(packed), "sha256": hashlib.sha256(packed).hexdigest()}}
+            output = root / "image.pending"
+            self.module.decompress_image(parts, manifest, output)
+            self.assertEqual(output.read_bytes(), raw)
+            self.assertTrue(all(part.exists() for part in parts))
+            manifest["image"]["sha256"] = "0" * 64
+            with self.assertRaisesRegex(self.module.UpgradeError, "combined compressed image"):
+                self.module.decompress_image(parts, manifest, output)
+
+    def test_migration_carries_only_local_validated_sudo_rules(self):
+        migration = (ROOT / "upgrade" / "recovera-migrate-config").read_text()
+        rules = migration[migration.index("for path in /etc/sudoers.d/*; do"):]
+        rules = rules[:rules.index("\ndone\n")]
+        self.assertIn('[ ! -L "$path" ]', rules)
+        self.assertIn('dpkg -S "$path" >/dev/null 2>&1 && continue', rules)
+        self.assertIn('visudo -cqf "$target/etc/sudoers.d/$name"', rules)
+        self.assertIn('rm -f "$target/etc/sudoers.d/$name"', rules)
+        self.assertIn("-m 0440 -o root -g root", rules)
 
 
 if __name__ == "__main__":

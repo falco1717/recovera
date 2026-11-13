@@ -3,6 +3,7 @@
 
 import argparse
 import base64
+import contextlib
 import errno
 import http.server
 import json
@@ -95,6 +96,34 @@ class SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
         return redirected
 
 
+BYTE_RANGE_RE = re.compile(r"bytes=([0-9]{0,19})-([0-9]{0,19})")
+
+
+def parse_byte_range(header, size):
+    """Interpret a Range header for a file of `size` bytes.
+
+    Returns None to send the whole file (no header), (start, end) inclusive for
+    one satisfiable range, or "unsatisfiable" for a malformed, multi-part or
+    out-of-bounds request. Multiple ranges are never served.
+    """
+    if header is None:
+        return None
+    match = BYTE_RANGE_RE.fullmatch(header.strip())
+    if not match or match.group(1) == match.group(2) == "":
+        return "unsatisfiable"
+    first, last = match.groups()
+    if first == "":
+        suffix = int(last)
+        if suffix == 0 or size == 0:
+            return "unsatisfiable"
+        return max(0, size - suffix), size - 1
+    start = int(first)
+    end = size - 1 if last == "" else min(int(last), size - 1)
+    if start >= size or (last != "" and int(last) < start):
+        return "unsatisfiable"
+    return start, end
+
+
 def safe_file(root, name):
     if not ASSET_RE.fullmatch(name) or Path(name).name != name:
         raise GatewayError("unsafe asset name")
@@ -146,6 +175,11 @@ class Configuration:
         self.bind = os.environ.get("RECOVERA_GATEWAY_BIND", "127.0.0.1")
         self.port = int(os.environ.get("RECOVERA_GATEWAY_PORT", "8080"))
         self.sync_interval = max(60, int(os.environ.get("RECOVERA_GATEWAY_SYNC_INTERVAL", "900")))
+        # Releases kept per channel besides the current one, so an appliance
+        # that read the previous pointer can still finish its download.
+        self.keep_previous = max(0, int(os.environ.get("RECOVERA_GATEWAY_KEEP_PREVIOUS", "1")))
+        self.space_reserve = max(0, int(os.environ.get(
+            "RECOVERA_GATEWAY_SPACE_RESERVE", str(1024 * 1024 * 1024))))
         self.tls_certificate = os.environ.get("RECOVERA_GATEWAY_TLS_CERT")
         self.tls_key = os.environ.get("RECOVERA_GATEWAY_TLS_KEY")
 
@@ -204,6 +238,117 @@ class Cache:
 
     def release_path(self, tag):
         return self.configuration.cache / "releases" / tag
+
+    def stamp_path(self, tag):
+        return self.configuration.cache / "verified" / f"{tag}.json"
+
+    def release_fingerprint(self, directory):
+        """Size and modification time of every cached file in a release."""
+        files = {}
+        for item in sorted(Path(directory).iterdir()):
+            if item.is_file() and not item.is_symlink():
+                info = item.stat()
+                files[item.name] = [info.st_size, info.st_mtime_ns, info.st_ctime_ns, info.st_ino]
+        return files
+
+    def verify_cached_release(self, tag, manifest_name):
+        """Full verification, skipped while the files are unchanged since the last one."""
+        directory = self.release_path(tag)
+        stamp = self.stamp_path(tag)
+        fingerprint = {"manifest": manifest_name, "files": self.release_fingerprint(directory)}
+        try:
+            if json.loads(stamp.read_text(encoding="utf-8")) == fingerprint:
+                return
+        except (OSError, json.JSONDecodeError):
+            pass
+        stamp.unlink(missing_ok=True)
+        self.verify_release(directory, manifest_name)
+        stamp.parent.mkdir(parents=True, exist_ok=True)
+        atomic_bytes(stamp, json.dumps(fingerprint, sort_keys=True).encode("utf-8"), mode=0o644)
+
+    def require_space(self, needed):
+        root = self.configuration.cache
+        root.mkdir(parents=True, exist_ok=True)
+        free = shutil.disk_usage(root).free
+        if needed + self.configuration.space_reserve > free:
+            raise GatewayError(
+                f"not enough cache space for this release: need {needed} bytes plus a "
+                f"{self.configuration.space_reserve}-byte reserve, {free} bytes free"
+            )
+
+    def history_path(self):
+        return self.configuration.cache / "history.json"
+
+    def remember_release(self, channel, tag):
+        try:
+            history = json.loads(self.history_path().read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            history = {}
+        tags = [item for item in history.get(channel, []) if item != tag] + [tag]
+        history[channel] = tags[-(self.configuration.keep_previous + 1):]
+        atomic_bytes(self.history_path(), json.dumps(history, indent=2, sort_keys=True).encode("utf-8"),
+                     mode=0o644)
+
+    def cleanup(self):
+        """Remove cached releases no channel uses or keeps as its previous release."""
+        try:
+            history = json.loads(self.history_path().read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return []
+        keep = set()
+        for channel in self.configuration.channels:
+            keep.update(history.get(channel, [])[-(self.configuration.keep_previous + 1):])
+            with contextlib.suppress(GatewayError):
+                tag = self.read_channel(channel).get("release_tag")
+                if tag:
+                    keep.add(tag)
+        removed = []
+        releases = self.configuration.cache / "releases"
+        if not releases.is_dir():
+            return removed
+        now = time.time()
+        for item in releases.iterdir():
+            if item.is_symlink() or not item.is_dir():
+                continue
+            if item.name.startswith("."):
+                # A download directory left by an interrupted process. Another
+                # process may own a recent one, so only old ones are removed.
+                if now - item.stat().st_mtime > 6 * 3600:
+                    shutil.rmtree(item, ignore_errors=True)
+                continue
+            if item.name in keep:
+                continue
+            shutil.rmtree(item, ignore_errors=True)
+            self.stamp_path(item.name).unlink(missing_ok=True)
+            removed.append(item.name)
+        return removed
+
+    def status_path(self):
+        return self.configuration.cache / "status.json"
+
+    def record_status(self, results):
+        try:
+            previous = json.loads(self.status_path().read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            previous = {}
+        now = int(time.time())
+        channels = {}
+        for result in results:
+            name = result.get("channel")
+            entry = dict((previous.get("channels") or {}).get(name) or {})
+            if result.get("error"):
+                entry.update({"last_error": result["error"], "last_error_time": now})
+            else:
+                entry.update({"release_tag": result.get("release_tag"), "version": result.get("version"),
+                              "sequence": result.get("sequence"), "last_success": now,
+                              "last_error": None})
+            channels[name] = entry
+        usage = shutil.disk_usage(self.configuration.cache)
+        value = {"time": now, "channels": channels,
+                 "cache": {"free_bytes": usage.free, "total_bytes": usage.total}}
+        atomic_bytes(self.status_path(), json.dumps(value, indent=2, sort_keys=True).encode("utf-8"),
+                     mode=0o644)
+        return value
 
     def read_channel(self, channel):
         try:
@@ -298,6 +443,8 @@ class Cache:
             item["name"]: item["url"] for item in release.get("assets", [])
             if ASSET_RE.fullmatch(str(item.get("name", "")))
         }
+        sizes = {item["name"]: item.get("size") for item in release.get("assets", [])
+                 if ASSET_RE.fullmatch(str(item.get("name", "")))}
         manifest_name = pointer.get("manifest_asset")
         signature_name = pointer.get("signature_asset")
         if not ASSET_RE.fullmatch(str(manifest_name or "")) or not ASSET_RE.fullmatch(str(signature_name or "")):
@@ -319,11 +466,13 @@ class Cache:
                 names = self.manifest_assets(manifest)
                 if any(not isinstance(name, str) or not ASSET_RE.fullmatch(name) for name in names):
                     raise GatewayError("release contains an unsafe asset name")
+                self.require_space(sum(int(sizes.get(name) or 0) for name in names))
                 for name in names:
                     if name not in available:
                         raise GatewayError(f"release asset is missing: {name}")
                     self.github.download(available[name], temporary / name)
                 self.verify_release(temporary, manifest_name)
+                self.stamp_path(tag).unlink(missing_ok=True)
                 try:
                     os.replace(temporary, target)
                 except OSError as exc:
@@ -332,16 +481,16 @@ class Cache:
                     if exc.errno not in (errno.EEXIST, errno.ENOTEMPTY) or not target.is_dir():
                         raise
                     shutil.rmtree(temporary, ignore_errors=True)
-                    self.verify_release(target, manifest_name)
             except Exception:
                 shutil.rmtree(temporary, ignore_errors=True)
                 raise
-        else:
-            self.verify_release(target, manifest_name)
+        self.verify_cached_release(tag, manifest_name)
         atomic_bytes(self.channel_path(channel), json.dumps(
             pointer, indent=2, sort_keys=True
         ).encode("utf-8") + b"\n", mode=0o644)
-        return {"channel": channel, "release_tag": tag, "version": pointer.get("version")}
+        self.remember_release(channel, tag)
+        return {"channel": channel, "release_tag": tag, "version": pointer.get("version"),
+                "sequence": pointer.get("sequence")}
 
     def sync(self):
         # Each channel stands alone: one unavailable channel must not stop the
@@ -353,6 +502,14 @@ class Cache:
                     results.append(self.sync_channel(channel))
                 except Exception as exc:
                     results.append({"channel": channel, "error": str(exc)})
+            # Never clean up after a failed sync: an error could mean the
+            # pointers on disk are older than what appliances are using.
+            if not any(item.get("error") for item in results):
+                removed = self.cleanup()
+                if removed:
+                    results.append({"removed_releases": removed})
+            with contextlib.suppress(Exception):
+                self.record_status([item for item in results if "channel" in item])
         return results
 
 
@@ -402,14 +559,38 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
         if path.is_symlink() or not path.is_file():
             raise GatewayError("requested content is unavailable")
         size = path.stat().st_size
-        self.send_response(200)
+        # Release assets are immutable, so an interrupted image download can
+        # resume with one byte range. Channel pointers are always sent whole.
+        selected = parse_byte_range(self.headers.get("Range"), size) if immutable else None
+        if selected == "unsatisfiable":
+            self.send_response(416)
+            self.send_header("Content-Range", f"bytes */{size}")
+            self.send_header("Content-Length", "0")
+            self.send_header("Accept-Ranges", "bytes")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.end_headers()
+            return
+        start, end = selected if selected else (0, size - 1)
+        length = end - start + 1 if size else 0
+        self.send_response(206 if selected else 200)
         self.send_header("Content-Type", "application/octet-stream")
-        self.send_header("Content-Length", str(size))
+        self.send_header("Content-Length", str(length))
+        if selected:
+            self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
+        if immutable:
+            self.send_header("Accept-Ranges", "bytes")
         self.send_header("Cache-Control", "public, max-age=31536000, immutable" if immutable else "no-store")
         self.send_header("X-Content-Type-Options", "nosniff")
         self.end_headers()
         with path.open("rb") as stream:
-            shutil.copyfileobj(stream, self.wfile, 1024 * 1024)
+            stream.seek(start)
+            remaining = length
+            while remaining > 0:
+                block = stream.read(min(1024 * 1024, remaining))
+                if not block:
+                    break
+                self.wfile.write(block)
+                remaining -= len(block)
 
     def do_GET(self):
         try:
@@ -478,12 +659,17 @@ def serve(configuration, cache):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=("serve", "sync"))
+    parser.add_argument("command", choices=("serve", "sync", "status"))
     arguments = parser.parse_args(argv)
     configuration = Configuration()
     cache = Cache(configuration)
     if arguments.command == "sync":
         print(json.dumps(cache.sync(), indent=2, sort_keys=True))
+    elif arguments.command == "status":
+        try:
+            print(cache.status_path().read_text(encoding="utf-8").rstrip())
+        except FileNotFoundError:
+            raise GatewayError("no synchronization has been recorded yet")
     else:
         serve(configuration, cache)
     return 0

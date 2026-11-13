@@ -89,6 +89,10 @@ the update gateway, and an administrator only approves it:
    layout if needed, pauses replication and waits up to three hours for running
    transfers (otherwise it releases the hold and retries in the next window),
    downloads and verifies the image from the gateway, and reboots into it.
+   Image parts are kept in `/host/recovera/downloads/image-<sequence>-<digest>`
+   until the image is staged. An interrupted download (a dropped connection, a
+   gateway restart, a power cut) resumes each part from where it stopped, from
+   either gateway, and each part's SHA-256 is checked before it is used.
 4. The new system boots once and becomes the default only after validation. A
    failure or crash returns the appliance to its previous system and clears the
    approval, so it does not retry until approved again. The page shows the last
@@ -148,8 +152,10 @@ is never modified:
 The image carries this appliance's identity and configuration from the 22.04
 root (see the migration list above), including `/var/lib/datto`,
 `/etc/zfs/zpool.cache` and `/etc/hostid` so `homePool` imports without `-f`.
-Its `/etc/fstab` root line is rewritten to the image label. Local `sudoers.d`
-additions are not carried over.
+Its `/etc/fstab` root line is rewritten to the image label. Administrator-made
+`/etc/sudoers.d` rules (root-owned files not installed by a package, such as a
+rule for `backup-admin`) are carried with the local accounts; each must pass
+`visudo -c`, otherwise it is left behind and the migration says so.
 
 Recovery points, logs and configuration changed while running the image stay
 in `homePool`, but a fallback to 22.04 uses the 22.04 copy of `/datto/config`

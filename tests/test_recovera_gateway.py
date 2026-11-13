@@ -193,7 +193,11 @@ class RecoveraGatewayGitHubTests(unittest.TestCase):
     def test_gateway_handles_another_process_winning_release_publish(self):
         source = (GATEWAY / "recovera-gateway").read_text()
         self.assertIn("errno.ENOTEMPTY", source)
-        self.assertIn("self.verify_release(target, manifest_name)", source)
+        # The winner's release is verified like any cached release.
+        sync = source[source.index("    def sync_channel"):source.index("    def sync(self)")]
+        self.assertIn("self.verify_cached_release(tag, manifest_name)", sync)
+        self.assertLess(sync.index("self.verify_cached_release(tag, manifest_name)"),
+                        sync.rindex("atomic_bytes(self.channel_path(channel)"))
 
     def test_gateway_root_has_branded_operational_page(self):
         page = self.module.LANDING_PAGE.decode("utf-8")
@@ -207,6 +211,168 @@ class RecoveraGatewayGitHubTests(unittest.TestCase):
         self.assertIn("Content-Security-Policy", source)
         self.assertIn("frame-ancestors 'none'", source)
         self.assertIn('if parsed.path == "/":', source)
+
+
+class RecoveraGatewayRangeTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.module = load_gateway()
+
+    def test_byte_range_parsing(self):
+        parse = self.module.parse_byte_range
+        self.assertIsNone(parse(None, 100))
+        self.assertEqual(parse("bytes=0-9", 100), (0, 9))
+        self.assertEqual(parse("bytes=40-", 100), (40, 99))
+        self.assertEqual(parse("bytes=90-500", 100), (90, 99))
+        self.assertEqual(parse("bytes=-10", 100), (90, 99))
+        self.assertEqual(parse("bytes=-500", 100), (0, 99))
+        for bad in ("bytes=100-", "bytes=5-2", "bytes=0-1,5-6", "items=0-1", "bytes=-", "bytes=-0", "bytes=a-b"):
+            self.assertEqual(parse(bad, 100), "unsatisfiable", bad)
+
+    def _serve(self, path):
+        import http.server
+        import threading
+        module = self.module
+
+        class Handler(module.GatewayHandler):
+            def credential(self, channel):
+                if self.headers.get("Authorization") != "Bearer test":
+                    raise module.AccessError("gateway credential is required")
+
+        class Cache:
+            def release_channel(self, tag):
+                return "stable"
+
+            def release_path(self, tag):
+                return path.parent
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        server.cache = Cache()
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        return server.server_address[1]
+
+    def _get(self, port, headers):
+        import http.client
+        connection = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+        connection.request("GET", "/v1/releases/image-v1/recovera-1.img.xz.part-000", headers=headers)
+        response = connection.getresponse()
+        body = response.read()
+        connection.close()
+        return response, body
+
+    def test_release_asset_ranges(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "recovera-1.img.xz.part-000"
+            data = bytes(range(256)) * 40
+            path.write_bytes(data)
+            port = self._serve(path)
+            auth = {"Authorization": "Bearer test"}
+            response, body = self._get(port, auth)
+            self.assertEqual((response.status, body), (200, data))
+            self.assertEqual(response.getheader("Accept-Ranges"), "bytes")
+            response, body = self._get(port, auth | {"Range": "bytes=1000-"})
+            self.assertEqual((response.status, body), (206, data[1000:]))
+            self.assertEqual(response.getheader("Content-Range"), f"bytes 1000-{len(data) - 1}/{len(data)}")
+            self.assertEqual(response.getheader("Content-Length"), str(len(data) - 1000))
+            self.assertIn("immutable", response.getheader("Cache-Control"))
+            response, body = self._get(port, auth | {"Range": "bytes=10-19"})
+            self.assertEqual((response.status, body), (206, data[10:20]))
+            for bad in (f"bytes={len(data)}-", "bytes=0-1,4-5"):
+                response, body = self._get(port, auth | {"Range": bad})
+                self.assertEqual(response.status, 416, bad)
+                self.assertEqual(response.getheader("Content-Range"), f"bytes */{len(data)}")
+            response, body = self._get(port, {"Range": "bytes=0-"})
+            self.assertEqual(response.status, 401)
+
+
+class RecoveraGatewayCacheTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.module = load_gateway()
+
+    def make_cache(self, root, channels=("stable", "noble-stable"), keep_previous=1):
+        from types import SimpleNamespace
+        configuration = SimpleNamespace(cache=Path(root), channels=list(channels), keep_previous=keep_previous,
+                                        space_reserve=0)
+        cache = self.module.Cache.__new__(self.module.Cache)
+        cache.configuration = configuration
+        import threading
+        cache.lock = threading.Lock()
+        return cache
+
+    def publish(self, cache, channel, tag):
+        release = cache.release_path(tag)
+        release.mkdir(parents=True, exist_ok=True)
+        (release / "recovera-image-manifest.json").write_text("{}")
+        cache.channel_path(channel).parent.mkdir(parents=True, exist_ok=True)
+        cache.channel_path(channel).write_text(json.dumps({"schema": 1, "channel": channel, "release_tag": tag}))
+        cache.remember_release(channel, tag)
+
+    def test_cached_release_is_rehashed_only_when_its_files_change(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cache = self.make_cache(directory)
+            self.publish(cache, "stable", "image-v1")
+            with mock.patch.object(cache, "verify_release") as verify:
+                cache.verify_cached_release("image-v1", "recovera-image-manifest.json")
+                cache.verify_cached_release("image-v1", "recovera-image-manifest.json")
+                self.assertEqual(verify.call_count, 1)
+                (cache.release_path("image-v1") / "recovera-image-manifest.json").write_text('{"x": 1}')
+                cache.verify_cached_release("image-v1", "recovera-image-manifest.json")
+                self.assertEqual(verify.call_count, 2)
+            with mock.patch.object(cache, "verify_release", side_effect=self.module.GatewayError("bad")):
+                (cache.release_path("image-v1") / "recovera-image-manifest.json").write_text('{"x": 22}')
+                with self.assertRaises(self.module.GatewayError):
+                    cache.verify_cached_release("image-v1", "recovera-image-manifest.json")
+            self.assertFalse(cache.stamp_path("image-v1").exists())
+
+    def test_cleanup_keeps_current_and_previous_release_per_channel(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cache = self.make_cache(directory)
+            for tag in ("package-v1", "package-v2", "package-v3"):
+                self.publish(cache, "stable", tag)
+            self.publish(cache, "noble-stable", "package-v1")
+            orphan = cache.release_path("image-v0")
+            orphan.mkdir(parents=True)
+            fresh_partial = cache.release_path(".image-v9.abc")
+            fresh_partial.mkdir()
+            removed = cache.cleanup()
+            self.assertEqual(sorted(removed), ["image-v0"])
+            remaining = sorted(item.name for item in (Path(directory) / "releases").iterdir())
+            self.assertEqual(remaining, [".image-v9.abc", "package-v1", "package-v2", "package-v3"])
+            self.publish(cache, "noble-stable", "package-v3")
+            self.publish(cache, "noble-stable", "package-v4")
+            self.assertEqual(sorted(cache.cleanup()), ["package-v1"])
+
+    def test_failed_sync_never_removes_releases(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cache = self.make_cache(directory, channels=("stable",))
+            self.publish(cache, "stable", "package-v1")
+            cache.release_path("image-v0").mkdir(parents=True)
+            with mock.patch.object(cache, "sync_channel", side_effect=self.module.GatewayError("GitHub is unreachable")):
+                results = cache.sync()
+            self.assertTrue(cache.release_path("image-v0").exists())
+            self.assertEqual(results[0]["error"], "GitHub is unreachable")
+            status = json.loads(cache.status_path().read_text())
+            self.assertEqual(status["channels"]["stable"]["last_error"], "GitHub is unreachable")
+            with mock.patch.object(cache, "sync_channel", return_value={
+                    "channel": "stable", "release_tag": "package-v1", "version": "1", "sequence": 1}):
+                results = cache.sync()
+            self.assertFalse(cache.release_path("image-v0").exists())
+            status = json.loads(cache.status_path().read_text())
+            self.assertIsNone(status["channels"]["stable"]["last_error"])
+            self.assertEqual(status["channels"]["stable"]["sequence"], 1)
+            self.assertIn("free_bytes", status["cache"])
+            self.assertNotIn("token", json.dumps(status).lower())
+
+    def test_release_larger_than_free_space_is_refused(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cache = self.make_cache(directory)
+            free = shutil.disk_usage(directory).free
+            cache.require_space(1024)
+            with self.assertRaisesRegex(self.module.GatewayError, "not enough cache space"):
+                cache.require_space(free + 1)
 
 
 if __name__ == "__main__":

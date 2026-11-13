@@ -1,5 +1,33 @@
 # Changelog
 
+## v0.6.45 - 2026-11-13
+
+Large-image delivery for the Ubuntu 22.04 → 24.04 transition, and two findings
+from the second end-to-end test (the `0.6.44-noble.1` candidate on a paired
+test appliance: transition with a transfer in flight, post-upgrade replication
+both ways, and an administrator rollback to 22.04).
+
+- **Resumable image downloads.** Parts are kept in a per-release directory
+  under `/host/recovera/downloads` until the image is staged. An interrupted
+  part resumes with one HTTP byte range (from either gateway); an origin that
+  ignores ranges restarts only that part; a complete part with the wrong digest
+  is discarded. A dropped connection is now a retryable error, so the updater
+  moves on to the other gateway instead of stopping. The verified parts stream
+  straight into `xz` (no combined copy), so a power cut during decompression
+  does not need a new download.
+- **Gateway:** release assets honour one byte range per request (206/416,
+  never multi-part); the cache is checked for space before a release is
+  downloaded; a verified release is re-hashed only when its files change;
+  releases no channel uses are removed after a fully successful sync (each
+  channel keeps one previous release, `RECOVERA_GATEWAY_KEEP_PREVIOUS`); and
+  `recovera-gateway status` reports each channel's cached release, last
+  success and error, and free cache space.
+- The OS transition carries administrator-made `/etc/sudoers.d` rules (for
+  example a `backup-admin` rule) along with the local accounts, when they are
+  root-owned, not from a package and pass `visudo`.
+- After a reboot ends a maintenance hold, the replication event log records
+  that replication resumed instead of ending on "paused for maintenance".
+
 ## v0.6.44 - 2026-11-13
 
 Fixes from the first end-to-end Ubuntu 22.04 → 24.04 transition on a test

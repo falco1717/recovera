@@ -1468,6 +1468,23 @@ class RecoveraPeerTests(unittest.TestCase):
         self.assertEqual(kinds.count("maintenance-started"), 1)
         self.assertEqual(kinds.count("maintenance-ended"), 1)
 
+    def test_restart_closes_a_maintenance_hold_that_a_reboot_ended(self):
+        path = self.root / "run" / "maintenance"
+        with mock.patch.object(self.peer, "MAINTENANCE_PATH", path):
+            self.peer.event("maintenance-started", "Replication paused for maintenance: OS upgrade")
+            self.peer.close_stale_maintenance_event()
+            self.peer.close_stale_maintenance_event()
+            kinds = [item["kind"] for item in self.peer.state()["events"]]
+            self.assertEqual(kinds[-2:], ["maintenance-started", "maintenance-ended"])
+            self.assertEqual(kinds.count("maintenance-ended"), 1)
+            # A hold that is still in place is not closed.
+            self.peer.event("maintenance-started", "Replication paused for maintenance: again")
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text('{"reason": "again"}')
+            self.peer.close_stale_maintenance_event()
+            self.assertEqual(self.peer.state()["events"][-1]["kind"], "maintenance-started")
+        self.assertIn("close_stale_maintenance_event()", SCRIPT.read_text())
+
     def test_maintenance_waits_for_running_receives_and_reports_them(self):
         proc = self.root / "proc"
         (proc / "4242").mkdir(parents=True)

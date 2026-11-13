@@ -4,6 +4,7 @@
 import argparse
 import base64
 import hashlib
+import http.client
 import json
 import os
 from pathlib import Path
@@ -315,12 +316,13 @@ class SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
         return redirected
 
 
-def request(url, config, *, accept="application/vnd.github+json"):
+def request(url, config, *, accept="application/vnd.github+json", extra_headers=None):
     headers = {
         "Accept": accept,
         "User-Agent": f"recovera-upgrade/{UPDATER_VERSION}",
         "X-GitHub-Api-Version": "2022-11-28",
     }
+    headers.update(extra_headers or {})
     credential = credential_for_url(url, config)
     if credential:
         headers["Authorization"] = f"Bearer {credential}"
@@ -329,6 +331,8 @@ def request(url, config, *, accept="application/vnd.github+json"):
         return opener.open(urllib.request.Request(url, headers=headers), timeout=60)
     except urllib.error.HTTPError as exc:
         detail = exc.read(512).decode("utf-8", "replace")
+        if exc.code == 416 and "Range" in headers:
+            raise RangeNotSatisfiable(f"origin rejected the byte range {headers['Range']}") from exc
         if exc.code in (401, 404) and not credential:
             token_file = config.get("TOKEN_FILE", "/etc/recovera/github-token")
             raise UpgradeError(
@@ -338,6 +342,12 @@ def request(url, config, *, accept="application/vnd.github+json"):
         raise UpgradeError(f"GitHub request failed ({exc.code}): {detail}") from exc
     except urllib.error.URLError as exc:
         raise UpgradeError(f"GitHub is unreachable: {exc.reason}") from exc
+    except (OSError, http.client.HTTPException) as exc:
+        raise UpgradeError(f"update request failed: {exc}") from exc
+
+
+class RangeNotSatisfiable(UpgradeError):
+    pass
 
 
 def github_json(path, config):
@@ -356,12 +366,59 @@ def validated_repository(config):
     return repository
 
 
-def download(url, target, config, *, api_asset=False):
+def download(url, target, config, *, api_asset=False, expected_size=None):
+    """Download one asset to `target` through `target.partial`.
+
+    With `expected_size` (image parts), an existing partial file is resumed
+    with a single byte range; an origin that ignores the range restarts the
+    file from the beginning. An interrupted transfer keeps its partial file
+    for the next attempt. The caller verifies the digest before using it.
+    """
     accept = "application/octet-stream" if api_asset else "application/vnd.github+json"
     target = Path(target)
     temporary = target.with_name(target.name + ".partial")
-    with request(url, config, accept=accept) as response, temporary.open("wb") as output:
-        shutil.copyfileobj(response, output, 1024 * 1024)
+    offset = 0
+    if expected_size is not None and temporary.is_file():
+        offset = temporary.stat().st_size
+        if offset > expected_size:
+            temporary.unlink()
+            offset = 0
+        elif offset and offset == expected_size:
+            os.replace(temporary, target)
+            return
+    if expected_size is None:
+        temporary.unlink(missing_ok=True)
+    try:
+        response = request(url, config, accept=accept,
+                           extra_headers={"Range": f"bytes={offset}-"} if offset else None)
+    except RangeNotSatisfiable:
+        temporary.unlink(missing_ok=True)
+        offset = 0
+        response = request(url, config, accept=accept)
+    with response:
+        status = getattr(response, "status", 200)
+        mode = "wb"
+        if offset:
+            content_range = response.headers.get("Content-Range", "") or ""
+            if status == 206 and content_range.startswith(f"bytes {offset}-"):
+                mode = "ab"
+            elif status == 206:
+                raise UpgradeError(f"origin returned an unexpected byte range: {content_range}")
+        elif status == 206:
+            raise UpgradeError("origin returned a partial response to a full request")
+        try:
+            with temporary.open(mode) as output:
+                shutil.copyfileobj(response, output, 1024 * 1024)
+        except (OSError, http.client.HTTPException) as exc:
+            received = temporary.stat().st_size if temporary.exists() else 0
+            raise UpgradeError(f"download interrupted after {received} bytes: {exc}") from exc
+    if expected_size is not None:
+        received = temporary.stat().st_size
+        if received < expected_size:
+            raise UpgradeError(f"download ended early ({received} of {expected_size} bytes)")
+        if received > expected_size:
+            temporary.unlink()
+            raise UpgradeError(f"download is larger than expected ({received} > {expected_size} bytes)")
     os.replace(temporary, target)
 
 
@@ -437,7 +494,33 @@ def release_assets(pointer, config, source_dir=None):
     return {"__release_base_url__": f"https://github.com/{repo}/releases/download/{tag_path}"}
 
 
-def obtain_asset(name, assets, target, config):
+def obtain_asset(name, assets, target, config, *, expected_size=None, expected_sha256=None):
+    """Fetch one release asset. Image parts (with size and digest) resume and retry."""
+    target = Path(target)
+    if expected_sha256 and target.is_file():
+        if target.stat().st_size == expected_size and sha256(target) == expected_sha256:
+            return
+        target.unlink()
+    attempts = 3 if expected_size is not None else 1
+    failure = None
+    for attempt in range(attempts):
+        if attempt:
+            time.sleep(min(60, 10 * attempt))
+        try:
+            _obtain_asset_once(name, assets, target, config, expected_size)
+        except UpgradeError as exc:
+            failure = exc
+            continue
+        if expected_sha256 and sha256(target) != expected_sha256:
+            # A complete file with the wrong digest cannot be resumed.
+            target.unlink()
+            failure = UpgradeError(f"image part verification failed: {name}")
+            continue
+        return
+    raise failure
+
+
+def _obtain_asset_once(name, assets, target, config, expected_size):
     if name in assets:
         source = assets[name]
     elif "__release_base_urls__" in assets and safe_asset_name(name):
@@ -453,14 +536,14 @@ def obtain_asset(name, assets, target, config):
         failures = []
         for candidate in source:
             try:
-                download(candidate, target, config, api_asset=True)
+                download(candidate, target, config, api_asset=True, expected_size=expected_size)
                 return
             except UpgradeError as exc:
                 failures.append(f"{urllib.parse.urlsplit(candidate).netloc}: {exc}")
         raise UpgradeError("all Recovera update gateways failed while downloading "
                            f"{name}: " + "; ".join(failures))
     else:
-        download(source, target, config, api_asset=True)
+        download(source, target, config, api_asset=True, expected_size=expected_size)
 
 
 def verify_signature(manifest_path, signature_path, signers):
@@ -829,24 +912,65 @@ def require_layout(config):
     return layout
 
 
+def image_download_dir(downloads, manifest):
+    """A per-release directory that survives interruptions and reboots.
+
+    Parts already downloaded (or partly downloaded) are reused by the next
+    attempt. Directories left by other releases are removed.
+    """
+    name = f"image-{int(manifest['sequence'])}-{manifest['image']['sha256'][:16]}"
+    # release-* directories are left by an interrupted run of an older updater.
+    for stale in [*downloads.glob("image-*"), *downloads.glob("release-*")]:
+        if stale.name != name and stale.is_dir() and not stale.is_symlink():
+            shutil.rmtree(stale, ignore_errors=True)
+    work = downloads / name
+    work.mkdir(mode=0o700, exist_ok=True)
+    return work
+
+
 def assemble_image(config, manifest, assets, work):
+    """Download and verify every image part; return their paths in order."""
+    parts = []
+    for part in manifest["image"]["parts"]:
+        local = work / part["name"]
+        obtain_asset(part["name"], assets, local, config,
+                     expected_size=int(part["size"]), expected_sha256=part["sha256"])
+        if local.stat().st_size != int(part["size"]) or sha256(local) != part["sha256"]:
+            raise UpgradeError(f"image part verification failed: {part['name']}")
+        parts.append(local)
+    return parts
+
+
+def decompress_image(parts, manifest, output_path):
+    """Stream the verified parts through xz into `output_path`.
+
+    No combined compressed file is written, and the parts stay in place until
+    the image is staged, so an interruption here does not need a new download.
+    """
     image = manifest["image"]
-    compressed = work / "recovera-image.img.xz"
-    with compressed.open("wb") as combined:
-        for part in image["parts"]:
-            local = work / part["name"]
-            obtain_asset(part["name"], assets, local, config)
-            if local.stat().st_size != int(part["size"]) or sha256(local) != part["sha256"]:
-                raise UpgradeError(f"image part verification failed: {part['name']}")
-            with local.open("rb") as source:
-                shutil.copyfileobj(source, combined, 1024 * 1024)
-            # The combined stream is independently verified below. Reclaim each
-            # split part immediately so a 40 GB image host can hold the current
-            # image, compressed candidate, and uncompressed candidate together.
-            local.unlink()
-    if compressed.stat().st_size != int(image["size"]) or sha256(compressed) != image["sha256"]:
+    digest = hashlib.sha256()
+    total = 0
+    with Path(output_path).open("wb") as output:
+        process = subprocess.Popen(["xz", "-d", "-c"], stdin=subprocess.PIPE, stdout=output)
+        try:
+            for part in parts:
+                with Path(part).open("rb") as source:
+                    for block in iter(lambda: source.read(1024 * 1024), b""):
+                        digest.update(block)
+                        total += len(block)
+                        process.stdin.write(block)
+            process.stdin.close()
+        except BrokenPipeError:
+            pass
+        except BaseException:
+            process.kill()
+            process.wait()
+            raise
+        status = process.wait()
+    if status != 0:
+        raise UpgradeError("xz image decompression failed")
+    if total != int(image["size"]) or digest.hexdigest() != image["sha256"]:
         raise UpgradeError("combined compressed image verification failed")
-    return compressed
 
 
 def inspect_image(image_path, manifest):
@@ -893,41 +1017,43 @@ def command_install_image(config, args, release):
     downloads = host / "recovera/downloads"
     images.mkdir(parents=True, exist_ok=True)
     downloads.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(prefix="release-", dir=downloads) as temporary:
-        work = Path(temporary)
-        compressed = assemble_image(config, manifest, assets, work)
-        filename = f"{manifest['version']}.img"
-        target = images / filename
-        pending = images / (filename + ".pending")
-        with pending.open("wb") as output:
-            process = subprocess.Popen(["xz", "-d", "-c", str(compressed)], stdout=output)
-            if process.wait() != 0:
-                raise UpgradeError("xz image decompression failed")
-        inspect_image(pending, manifest)
-        migrate_appliance_config(pending)
-        os.replace(pending, target)
-        shutil.copyfile(manifest_path, images / f"{manifest['version']}.manifest.json")
-        shutil.copyfile(signature_path, images / f"{manifest['version']}.manifest.sig")
-        current = current_release()
-        state = read_json(state_path(), {})
-        state.update({
-            "pending": {"version": manifest["version"], "sequence": manifest["sequence"], "image": str(target),
-                        "transition": bool(manifest.get("from"))},
-            "previous": current,
-            "release_tag": pointer["release_tag"],
-            # A package transaction belongs to the root being replaced; its
-            # rollback files are not in the new image.
-            "last_transaction": None,
-        })
+    work = image_download_dir(downloads, manifest)
+    parts = assemble_image(config, manifest, assets, work)
+    filename = f"{manifest['version']}.img"
+    target = images / filename
+    pending = images / (filename + ".pending")
+    try:
+        decompress_image(parts, manifest, pending)
+    except BaseException:
+        pending.unlink(missing_ok=True)
+        raise
+    inspect_image(pending, manifest)
+    migrate_appliance_config(pending)
+    os.replace(pending, target)
+    shutil.copyfile(manifest_path, images / f"{manifest['version']}.manifest.json")
+    shutil.copyfile(signature_path, images / f"{manifest['version']}.manifest.sig")
+    current = current_release()
+    state = read_json(state_path(), {})
+    state.update({
+        "pending": {"version": manifest["version"], "sequence": manifest["sequence"], "image": str(target),
+                    "transition": bool(manifest.get("from"))},
+        "previous": current,
+        "release_tag": pointer["release_tag"],
+        # A package transaction belongs to the root being replaced; its
+        # rollback files are not in the new image.
+        "last_transaction": None,
+    })
+    atomic_json(state_path(), state)
+    PENDING_MARKER.touch(mode=0o600, exist_ok=True)
+    try:
+        run([BOOT_HELPER, "stage", manifest["version"], target])
+    except subprocess.SubprocessError:
+        PENDING_MARKER.unlink(missing_ok=True)
+        state["pending"] = None
         atomic_json(state_path(), state)
-        PENDING_MARKER.touch(mode=0o600, exist_ok=True)
-        try:
-            run([BOOT_HELPER, "stage", manifest["version"], target])
-        except subprocess.SubprocessError:
-            PENDING_MARKER.unlink(missing_ok=True)
-            state["pending"] = None
-            atomic_json(state_path(), state)
-            raise
+        raise
+    # The staged image no longer needs its downloaded parts.
+    shutil.rmtree(work, ignore_errors=True)
     print(f"Recovera {manifest['version']} is verified and staged for one-time boot.")
     if args.reboot:
         run(["systemctl", "reboot"])

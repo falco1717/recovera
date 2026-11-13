@@ -2782,8 +2782,26 @@ class ThreadingUnixHTTPServer(socketserver.ThreadingMixIn, UnixHTTPServer):
     daemon_threads = True
 
 
+def close_stale_maintenance_event() -> None:
+    """A hold lives in /run, so a reboot ends it without a "resumed" event.
+
+    Record the end so the event log does not show replication still paused.
+    """
+    if maintenance_status():
+        return
+    with locked_state() as value:
+        events = value.setdefault("events", [])
+        kinds = [item.get("kind") for item in events
+                 if item.get("kind") in ("maintenance-started", "maintenance-ended")]
+        if kinds and kinds[-1] == "maintenance-started":
+            events.append({"time": int(time.time()), "kind": "maintenance-ended",
+                           "message": "Replication resumed after the appliance restarted"})
+
+
 def serve() -> None:
     require_root(); repair_replication_account_permissions(); config()
+    with contextlib.suppress(Exception):
+        close_stale_maintenance_event()
     SOCKET_PATH.parent.mkdir(mode=0o750, parents=True, exist_ok=True)
     with contextlib.suppress(FileNotFoundError):
         SOCKET_PATH.unlink()
