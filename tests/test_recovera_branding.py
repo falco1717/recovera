@@ -296,6 +296,11 @@ class RecoveraBrandingLayoutTests(unittest.TestCase):
         (device / "config").mkdir(parents=True)
         (device / "config/routes.yaml").write_text("home:\n    path: /\n", encoding="utf-8")
         (web / prefix / "js/App").mkdir(parents=True)
+        if legacy:
+            # Real 5.6.x trees have the stock base layout; detection relies on it.
+            stock = device / "templates/commonlookandfeel/Default/layout.base.html.twig"
+            stock.parent.mkdir(parents=True, exist_ok=True)
+            stock.write_text("<html><head></head><body></body></html>\n", encoding="utf-8")
         return device, web
 
     def run_branding(self, legacy: bool):
@@ -361,6 +366,35 @@ class RecoveraBrandingLayoutTests(unittest.TestCase):
         status = (templates / "Agents/List/index.html.twig").read_text()
         self.assertIn("asset('js/App/Agents/RecoveraProtectStatus.js')", status)
         self.assertFalse((templates / "commonlookandfeel").exists())
+
+    def test_stray_recovera_files_do_not_switch_a_flat_tree_to_legacy(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        root = Path(temp.name)
+        device, web = self.build_tree(root, legacy=False)
+        stray_template = device / "templates/commonlookandfeel/Configure/RecoveraTarget/index.html.twig"
+        stray_template.parent.mkdir(parents=True)
+        stray_template.write_text("old", encoding="utf-8")
+        stray_js = web / "commonlookandfeel/js/App/Configure/RecoveraTarget.js"
+        stray_js.parent.mkdir(parents=True)
+        stray_js.write_text("old", encoding="utf-8")
+        logo = root / "logo.png"
+        logo.write_bytes(b"png")
+        branding = load_module()
+        with mock.patch.object(branding, "ROOT", device), mock.patch.object(branding, "WEB", web), \
+             mock.patch.object(sys, "argv", ["apply-branding.py", str(logo)]), \
+             mock.patch("builtins.print"):
+            branding.main()
+        self.assertEqual(branding.LAYOUT, "")
+        self.assertFalse((device / "templates/commonlookandfeel").exists())
+        self.assertFalse((web / "commonlookandfeel").exists())
+        self.assertIn("asset('js/App/Synchronize/RecoveraSynchronize.js')",
+                      (device / "templates/Synchronize/index.html.twig").read_text())
+        # A legacy tree's own files are never removed.
+        legacy_root = root / "legacy"
+        legacy_device, legacy_web = self.build_tree(legacy_root, legacy=True)
+        with mock.patch.object(branding, "ROOT", legacy_device), mock.patch.object(branding, "WEB", legacy_web):
+            self.assertEqual(branding.detect_layout(), "commonlookandfeel/")
 
 
 if __name__ == "__main__":

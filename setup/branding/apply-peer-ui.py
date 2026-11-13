@@ -21,7 +21,9 @@ RECOVERA_PANEL = '''{% if not inWizard %}
 def detect_layout(root: "Path | None" = None) -> str:
     """commonlookandfeel/ on images up to 5.6.x; the flat layout on 5.12.x."""
     root = ROOT if root is None else root
-    return "commonlookandfeel/" if (root / "templates/commonlookandfeel").is_dir() else ""
+    # A stock 5.6.x template, not just the directory: Recovera files left in a
+    # commonlookandfeel/ tree on a flat image must not switch the layout.
+    return "commonlookandfeel/" if (root / "templates/commonlookandfeel/Default/layout.base.html.twig").is_file() else ""
 
 
 def append_once(path: Path, marker: str, content: str) -> None:

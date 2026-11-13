@@ -1,5 +1,21 @@
 # Changelog
 
+## v0.6.42 - 2026-11-13
+
+Fixes found installing the current 5.12.x bundle over an existing Ubuntu 24.04
+appliance.
+
+- The web layout is detected from a stock 5.6.x template
+  (`templates/commonlookandfeel/Default/layout.base.html.twig`) instead of the
+  `commonlookandfeel/` directory. A 24.04 test appliance running a pre-0.6.36
+  updater had pulled a 22.04 release, whose branding created Recovera-only
+  `commonlookandfeel/` trees before the install rolled back; later 24.04
+  package installs then took the 5.6.x paths and failed. On the flat layout,
+  such Recovera-only leftovers are now removed.
+- `setup.sh` re-stages the bundle's packages when their `SHA256SUMS` differ
+  from the staged set; a newer bundle run over an existing install kept the
+  older packages.
+
 ## v0.6.41 - 2026-11-13
 
 - OS images no longer carry the build machine's network or login identity:

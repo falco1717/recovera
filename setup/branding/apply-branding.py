@@ -22,7 +22,9 @@ LAYOUT = ""
 
 def detect_layout(root: "Path | None" = None) -> str:
     root = ROOT if root is None else root
-    return "commonlookandfeel/" if (root / "templates/commonlookandfeel").is_dir() else ""
+    # A stock 5.6.x template, not just the directory: Recovera files left in a
+    # commonlookandfeel/ tree on a flat image must not switch the layout.
+    return "commonlookandfeel/" if (root / "templates/commonlookandfeel/Default/layout.base.html.twig").is_file() else ""
 
 
 def asset(relative: str) -> str:
@@ -39,6 +41,20 @@ def template_paths(relative: str, *, vintage: bool = False) -> list[Path]:
     if vintage and LAYOUT:
         paths.append(ROOT / "templates/vintage" / relative)
     return paths
+
+
+def remove_stray_legacy_files() -> list[str]:
+    """On a flat (5.12.x) tree, remove commonlookandfeel/ trees that contain only
+    Recovera files (left behind by a 5.6.x branding run on this image)."""
+    removed = []
+    for base in (ROOT / "templates/commonlookandfeel", WEB / "commonlookandfeel"):
+        if not base.is_dir():
+            continue
+        files = [path for path in base.rglob("*") if path.is_file() or path.is_symlink()]
+        if files and all("recovera" in str(path.relative_to(base)).lower() for path in files):
+            shutil.rmtree(base)
+            removed.append(str(base))
+    return removed
 
 
 def localize(text: str) -> str:
@@ -415,6 +431,9 @@ def main() -> int:
     if not logo_source.is_file():
         raise SystemExit(f"logo not found: {logo_source}")
     LAYOUT = detect_layout()
+    if not LAYOUT:
+        for path in remove_stray_legacy_files():
+            print(f"removed stray 5.6.x-layout Recovera files: {path}")
 
     logo_target = WEB / "UI/img/recovera-logo.png"
     css_target = WEB / asset("UI/css/recovera-brand.css")
