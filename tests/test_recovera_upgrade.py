@@ -548,7 +548,7 @@ class RecoveraUpgradeTests(unittest.TestCase):
         self.assertIn("'os': {'id': 'ubuntu', 'version_id': os_version}", builder)
         self.assertIn("--os-version", builder)
         self.assertIn('OS_PREFIX=noble-', builder)
-        self.assertIn('"$ROOT"/upgrade/channels/*.json', builder)
+        self.assertIn("CHANNELS_DIR=$ROOT/upgrade/channels", builder)
         self.assertIn("the highest sequence on any channel", builder)
 
     def test_schedule_skips_while_in_maintenance(self):

@@ -8,12 +8,13 @@ VERSION=
 SEQUENCE=
 CHANNEL=
 OS_VERSION=22.04
+CHANNELS_DIR=$ROOT/upgrade/channels
 OUTPUT=
 SIGNING_KEY=
 REBOOT_REQUIRED=false
 
 usage() {
-  echo "usage: $0 --packages DIR --version VERSION --sequence N --output DIR [--os-version 22.04|24.04] [--channel NAME] [--signing-key FILE] [--reboot-required]" >&2
+  echo "usage: $0 --packages DIR --version VERSION --sequence N --output DIR [--os-version 22.04|24.04] [--channel NAME] [--channels-dir DIR] [--signing-key FILE] [--reboot-required]" >&2
 }
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -21,6 +22,7 @@ while [ "$#" -gt 0 ]; do
     --version) VERSION=$2; shift 2;;
     --sequence) SEQUENCE=$2; shift 2;;
     --os-version) OS_VERSION=$2; shift 2;;
+    --channels-dir) CHANNELS_DIR=$2; shift 2;;
     --channel) CHANNEL=$2; shift 2;;
     --output) OUTPUT=$2; shift 2;;
     --signing-key) SIGNING_KEY=$2; shift 2;;
@@ -50,7 +52,8 @@ fi
 # One sequence counter across every channel, so an appliance that moves to its
 # new OS release's channel never sees that channel's releases as older.
 highest=0
-for pointer in "$ROOT"/upgrade/channels/*.json; do
+# (--channels-dir points test fixtures at their own, empty, set of pointers.)
+for pointer in "$CHANNELS_DIR"/*.json; do
   [ -e "$pointer" ] || continue
   value=$(python3 -c 'import json,sys; print(int(json.load(open(sys.argv[1])).get("sequence") or 0))' "$pointer")
   [ "$value" -le "$highest" ] || highest=$value

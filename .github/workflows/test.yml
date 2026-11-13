@@ -44,8 +44,18 @@ jobs:
             sha256sum recovera-appliance_*_all.deb Packages Packages.gz > SHA256SUMS)
           bash tools/build-package-release.sh \
             --packages /tmp/recovera-debs --version 0.6.1 --sequence 1 \
-            --output /tmp/recovera-package-release
-          python3 -c 'import json; p=json.load(open("/tmp/recovera-package-release/recovera-package-manifest.json")); assert p["schema"] == 2 and p["type"] == "package" and len(p["packages"]) == 1'
+            --channels-dir "$(mktemp -d)" --output /tmp/recovera-package-release
+          python3 -c 'import json; p=json.load(open("/tmp/recovera-package-release/recovera-package-manifest.json")); assert p["schema"] == 2 and p["type"] == "package" and len(p["packages"]) == 1 and p["os"] == {"id": "ubuntu", "version_id": "22.04"}'
+          # The real channel pointers forbid reusing a sequence.
+          if bash tools/build-package-release.sh --packages /tmp/recovera-debs --version 0.6.1 \
+              --sequence 1 --output "$(mktemp -d)" 2>/dev/null; then
+            echo "builder accepted a sequence below the channel pointers" >&2; exit 1
+          fi
+          if bash tools/build-package-release.sh --packages /tmp/recovera-debs --version 0.6.1 \
+              --sequence 1 --channels-dir "$(mktemp -d)" --channel noble-stable \
+              --output "$(mktemp -d)" 2>/dev/null; then
+            echo "builder accepted a 22.04 release on a noble channel" >&2; exit 1
+          fi
       - name: Preserve tested appliance package
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         uses: actions/upload-artifact@v4
