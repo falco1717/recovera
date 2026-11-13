@@ -1387,6 +1387,9 @@ def command_validation_failed(config, args):
                 # release, or nothing), not a loop image: boot that again.
                 run([BOOT_HELPER, "fallback"])
             failed_version = current_release().get("version")
+            # The image is no longer staged: the next boot is the previous
+            # system, and a stale entry would block cancel-transition.
+            state["pending"] = None
         state["last_failure"] = {"version": failed_version, "reason": args.reason}
         atomic_json(state_path(), state)
         PENDING_MARKER.unlink(missing_ok=True)

@@ -27,6 +27,11 @@ both ways, and an administrator rollback to 22.04).
   root-owned, not from a package and pass `visudo`.
 - After a reboot ends a maintenance hold, the replication event log records
   that replication resumed instead of ending on "paused for maintenance".
+- A failed validation of an operating-system image now clears the staged
+  image from the updater state. The appliance already returned to its previous
+  system, but the stale entry made `cancel-transition` (and the UI) treat the
+  upgrade as still staged. Found by forcing a validation failure (Apache
+  unable to start) on the test appliance, which otherwise fell back correctly.
 
 ## v0.6.44 - 2026-11-13
 
