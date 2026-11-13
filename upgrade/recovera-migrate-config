@@ -36,6 +36,8 @@ for path in \
   copy_path "$path"
 done
 for path in /etc/ssh/ssh_host_*; do copy_path "$path"; done
+# Ubuntu 24.04 NetworkManager keeps connections as netplan files.
+for path in /etc/netplan/90-NM-*.yaml; do copy_path "$path"; done
 
 # ZFS refuses to import a pool last used under another host ID without -f.
 # Match the source exactly: a candidate must not carry a host ID of its own.

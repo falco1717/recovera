@@ -108,7 +108,22 @@ rm -f "$mountpoint/etc/recovera/github-token" \
   "$mountpoint/etc/recovera/image-layout.json" \
   "$mountpoint/etc/apache2/ssl/www.key" "$mountpoint/etc/apache2/ssl/www.crt" \
   "$mountpoint/etc/ssh"/ssh_host_* "$mountpoint/datto/config/deviceID" \
-  "$mountpoint/etc/hostid" "$mountpoint/etc/zfs/zpool.cache"
+  "$mountpoint/etc/hostid" "$mountpoint/etc/zfs/zpool.cache" \
+  "$mountpoint/etc/recovera/gateway-token" "$mountpoint/etc/recovera/upgrade.conf.pre-gateway" \
+  "$mountpoint/root/.ssh/authorized_keys" \
+  "$mountpoint/etc/netplan"/90-NM-*.yaml \
+  "$mountpoint/var/lib/NetworkManager/secret_key" \
+  "$mountpoint/var/lib/NetworkManager"/*.lease \
+  "$mountpoint/var/lib/dhcp"/*.leases
+# Ubuntu 24.04's NetworkManager keeps its connections as netplan files
+# (90-NM-<uuid>.yaml). The builder's br0 (static address, fixed MAC) must not
+# reach any appliance; the receiving appliance's own connections are migrated.
+# cloud-init is not part of the appliance; make sure it cannot re-run first-boot
+# configuration (host keys, network, users) if a package pulls it back in.
+if [ -d "$mountpoint/etc/cloud" ]; then
+  touch "$mountpoint/etc/cloud/cloud-init.disabled"
+fi
+rm -rf "$mountpoint/var/lib/cloud/instances" "$mountpoint/var/lib/cloud/instance"
 : > "$mountpoint/etc/machine-id"
 printf 'recovera\n' > "$mountpoint/etc/hostname"
 cat > "$mountpoint/etc/hosts" <<'EOF'
@@ -120,6 +135,8 @@ ff02::1 ip6-allnodes
 ff02::2 ip6-allrouters
 EOF
 chroot "$mountpoint" passwd -l backup-admin >/dev/null 2>&1 || true
+# A cloud image's default account carries no purpose on an appliance.
+chroot "$mountpoint" passwd -l ubuntu >/dev/null 2>&1 || true
 mkdir -p "$mountpoint"/{dev,proc,sys,run,tmp,host,mnt,media,var/tmp} \
   "$mountpoint/usr/local/lib/recovera-upgrade" \
   "$mountpoint/usr/local/share/recovera-upgrade" \

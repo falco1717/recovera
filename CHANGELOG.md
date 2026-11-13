@@ -1,5 +1,20 @@
 # Changelog
 
+## v0.6.41 - 2026-11-13
+
+- OS images no longer carry the build machine's network or login identity:
+  Ubuntu 24.04 keeps NetworkManager connections as netplan files
+  (`/etc/netplan/90-NM-*.yaml`), and the builder's static `br0` with a fixed
+  MAC would have come up beside every appliance's own connection. The builder
+  also removes root's `authorized_keys`, NetworkManager's secret key and
+  leases, any gateway token, and locks the cloud image's `ubuntu` account;
+  cloud-init is disabled if present.
+- The configuration migration carries a 24.04 appliance's netplan-stored
+  NetworkManager connections into a newer image.
+- `check-transition`, `approve-transition` and `install-transition` accept
+  `--channel-file` and `--source-dir` to test a transition from local files
+  before it is published.
+
 ## v0.6.40 - 2026-11-13
 
 - Both update gateways are configured: `recoveragw` (gateway A, jprod-sb) and
