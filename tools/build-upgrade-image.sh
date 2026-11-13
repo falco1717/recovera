@@ -12,9 +12,14 @@ SIGNING_KEY=
 PART_SIZE=1900M
 COMPRESSION_LEVEL=6
 WORK_ROOT=${RECOVERA_IMAGE_WORK_ROOT:-/var/tmp}
+OS_VERSION=
+FROM_OS=
+MINIMUM_VERSION=
+CHANNELS_DIR=$REPO_ROOT/upgrade/channels
 
 usage() {
   echo "usage: sudo $0 --root DIR --version VERSION --sequence N --output DIR [--signing-key FILE] [--channel NAME] [--compression-level 0-9]" >&2
+  echo "       [--os-version 24.04] [--from-os 22.04[,..] --minimum-version 0.6.37] [--channels-dir DIR]" >&2
 }
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -22,6 +27,10 @@ while [ "$#" -gt 0 ]; do
     --version) VERSION=$2; shift 2;;
     --sequence) SEQUENCE=$2; shift 2;;
     --channel) CHANNEL=$2; shift 2;;
+    --os-version) OS_VERSION=$2; shift 2;;
+    --from-os) FROM_OS=$2; shift 2;;
+    --minimum-version) MINIMUM_VERSION=$2; shift 2;;
+    --channels-dir) CHANNELS_DIR=$2; shift 2;;
     --output) OUTPUT=$2; shift 2;;
     --signing-key) SIGNING_KEY=$2; shift 2;;
     --compression-level) COMPRESSION_LEVEL=$2; shift 2;;
@@ -34,6 +43,26 @@ done
 [ -z "$SIGNING_KEY" ] || [ -f "$SIGNING_KEY" ] || { echo "signing key not found: $SIGNING_KEY" >&2; exit 2; }
 [[ "$VERSION" =~ ^[0-9A-Za-z][0-9A-Za-z._-]{0,63}$ ]] || { echo "invalid version" >&2; exit 2; }
 [[ "$COMPRESSION_LEVEL" =~ ^[0-9]$ ]] || { echo "compression level must be 0 through 9" >&2; exit 2; }
+[[ "$CHANNEL" =~ ^[0-9A-Za-z][0-9A-Za-z._-]{0,31}$ ]] || { echo "invalid channel" >&2; exit 2; }
+[ -z "$OS_VERSION" ] || [[ "$OS_VERSION" =~ ^[0-9]{2}\.[0-9]{2}$ ]] || { echo "invalid --os-version" >&2; exit 2; }
+[ -z "$FROM_OS" ] || [[ "$FROM_OS" =~ ^[0-9]{2}\.[0-9]{2}(,[0-9]{2}\.[0-9]{2})*$ ]] || { echo "invalid --from-os" >&2; exit 2; }
+[ -z "$MINIMUM_VERSION" ] || [ -n "$FROM_OS" ] || { echo "--minimum-version needs --from-os" >&2; exit 2; }
+if [ -n "$FROM_OS" ]; then
+  [ -n "$OS_VERSION" ] || { echo "--from-os needs --os-version" >&2; exit 2; }
+  # An operating-system transition is opt-in: it must never sit on a channel
+  # that the automatic update window installs from.
+  if [[ ",$FROM_OS," != *",$OS_VERSION,"* ]] && [[ "$CHANNEL" != *-transition ]]; then
+    echo "an OS transition image must use a *-transition channel, not $CHANNEL" >&2; exit 2
+  fi
+fi
+# One sequence counter across every channel (see build-package-release.sh).
+highest=0
+for pointer in "$CHANNELS_DIR"/*.json; do
+  [ -e "$pointer" ] || continue
+  value=$(python3 -c 'import json,sys; print(int(json.load(open(sys.argv[1])).get("sequence") or 0))' "$pointer")
+  [ "$value" -le "$highest" ] || highest=$value
+done
+[ "$SEQUENCE" -gt "$highest" ] || { echo "sequence $SEQUENCE must be greater than $highest, the highest sequence on any channel" >&2; exit 2; }
 for command in rsync mkfs.ext4 e2fsck resize2fs xz split ssh-keygen jq; do
   command -v "$command" >/dev/null || { echo "missing command: $command" >&2; exit 1; }
 done
@@ -78,7 +107,8 @@ rm -f "$mountpoint/etc/recovera/github-token" \
   "$mountpoint/etc/recovera/backup-admin.json" \
   "$mountpoint/etc/recovera/image-layout.json" \
   "$mountpoint/etc/apache2/ssl/www.key" "$mountpoint/etc/apache2/ssl/www.crt" \
-  "$mountpoint/etc/ssh"/ssh_host_* "$mountpoint/datto/config/deviceID"
+  "$mountpoint/etc/ssh"/ssh_host_* "$mountpoint/datto/config/deviceID" \
+  "$mountpoint/etc/hostid" "$mountpoint/etc/zfs/zpool.cache"
 : > "$mountpoint/etc/machine-id"
 printf 'recovera\n' > "$mountpoint/etc/hostname"
 cat > "$mountpoint/etc/hosts" <<'EOF'
@@ -144,9 +174,11 @@ rm -f "$OUTPUT"/recovera-$VERSION.img.xz.part-*
 split -b "$PART_SIZE" -d -a 3 "$compressed" "$OUTPUT/recovera-$VERSION.img.xz.part-"
 
 manifest=$OUTPUT/recovera-image-manifest.json
-python3 - "$VERSION" "$SEQUENCE" "$CHANNEL" "$image" "$compressed" "$OUTPUT" > "$manifest" <<'PY'
+python3 - "$VERSION" "$SEQUENCE" "$CHANNEL" "$image" "$compressed" "$OUTPUT" \
+  "$OS_VERSION" "$FROM_OS" "$MINIMUM_VERSION" > "$manifest" <<'PY'
 import hashlib, json, pathlib, sys
-version, sequence, channel, raw_name, compressed_name, output_name = sys.argv[1:]
+(version, sequence, channel, raw_name, compressed_name, output_name,
+ os_version, from_os, minimum_version) = sys.argv[1:]
 def digest(path):
     value = hashlib.sha256()
     with open(path, 'rb') as stream:
@@ -158,13 +190,20 @@ compressed = pathlib.Path(compressed_name)
 parts = []
 for part in sorted(pathlib.Path(output_name).glob(f'recovera-{version}.img.xz.part-*')):
     parts.append({'name': part.name, 'size': part.stat().st_size, 'sha256': digest(part)})
-print(json.dumps({
+manifest = {
     'schema': 1, 'version': version, 'sequence': int(sequence), 'channel': channel,
     'architecture': 'amd64', 'minimum_updater': 1,
     'image': {'compression': 'xz', 'size': compressed.stat().st_size,
               'sha256': digest(compressed), 'uncompressed_size': raw.stat().st_size,
               'uncompressed_sha256': digest(raw), 'parts': parts},
-}, indent=2, sort_keys=True))
+}
+if os_version:
+    manifest['os'] = {'id': 'ubuntu', 'version_id': os_version}
+if from_os:
+    manifest['from'] = {'os_version_ids': from_os.split(',')}
+    if minimum_version:
+        manifest['from']['minimum_version'] = minimum_version
+print(json.dumps(manifest, indent=2, sort_keys=True))
 PY
 rm -f "$manifest.sig"
 if [ -n "$SIGNING_KEY" ]; then

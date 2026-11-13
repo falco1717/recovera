@@ -1,5 +1,34 @@
 # Changelog
 
+## v0.6.37 - 2026-11-12
+
+Moving an existing appliance to a new Ubuntu release without a hypervisor
+snapshot. The new release boots from a verified loop image; the 22.04 root is
+never modified and stays the fallback.
+
+- `recovera-upgrade prepare-image-layout [--dry-run]` lets an OVA-installed
+  appliance boot loop images: it bind-mounts the root filesystem at `/host`,
+  moves the updater state to match, installs the GRUB image menu, records the
+  conventional entry as the fallback and keeps it the default.
+  `revert-image-layout` undoes it.
+- `check`/`install --channel NAME` read another channel once, for transition
+  releases; the update window never does. `--channel` cannot be cached.
+- Image manifests may declare their OS (`os`) and, for a transition, the
+  starting releases and minimum Recovera version (`from`). Installing one
+  requires that start, a healthy pool, replication paused and idle, no active
+  restores and enough disk space (`--allow-busy` skips the idle checks). An
+  image for another OS release without `from` is refused.
+- `build-upgrade-image.sh` takes `--os-version`, `--from-os`,
+  `--minimum-version` and `--channels-dir`, keeps transitions on `*-transition`
+  channels and shares the package releases' sequence counter. Images no longer
+  carry the builder's host ID or pool cache.
+- The configuration migration now also carries `/var/lib/datto`,
+  `/var/lib/recovera`, firewall zones, Samba share accounts and the ZFS pool
+  cache, removes a host ID the source does not have, and rewrites the image's
+  fstab root line to the image label (it pointed at the 22.04 disk).
+- A failed first image now falls back to the conventional root. It used to try
+  a GRUB entry named after the previous package release, which does not exist.
+
 ## v0.6.36 - 2026-11-12
 
 Groundwork that must reach every 22.04 appliance before any Ubuntu 24.04

@@ -26,11 +26,48 @@ for path in \
   /etc/hostname \
   /etc/hosts \
   /etc/hostid \
+  /etc/zfs/zpool.cache \
   /etc/fstab \
+  /etc/firewalld/zones \
+  /var/lib/datto \
+  /var/lib/recovera \
+  /var/lib/samba/private \
   /opt/recovera/setup.conf; do
   copy_path "$path"
 done
 for path in /etc/ssh/ssh_host_*; do copy_path "$path"; done
+
+# ZFS refuses to import a pool last used under another host ID without -f.
+# Match the source exactly: a candidate must not carry a host ID of its own.
+[ -e /etc/hostid ] || rm -f "$target/etc/hostid"
+
+# The candidate's root is the loop image (label recovera-root), not this
+# appliance's conventional root, and /host is attached by the initramfs.
+python3 - "$target/etc/fstab" <<'PY'
+import sys
+path = sys.argv[1]
+try:
+    lines = open(path).read().splitlines()
+except FileNotFoundError:
+    lines = []
+output = []
+for line in lines:
+    fields = line.split()
+    if line.strip() == "# Recovera image host (recovera-upgrade prepare-image-layout)":
+        continue
+    if line.lstrip().startswith("#") or len(fields) < 2:
+        output.append(line)
+    elif fields[1] == "/host":
+        continue
+    elif fields[1] == "/":
+        output.append("LABEL=recovera-root\t/\text4\tdefaults,errors=remount-ro\t0 0")
+    else:
+        output.append(line)
+if not any(len(line.split()) > 1 and line.split()[1] == "/" for line in output
+           if not line.lstrip().startswith("#")):
+    output.append("LABEL=recovera-root\t/\text4\tdefaults,errors=remount-ro\t0 0")
+open(path, "w").write("\n".join(output) + "\n")
+PY
 
 # Preserve human/login accounts without replacing service accounts introduced
 # by the new image. Group memberships for those users are carried forward.

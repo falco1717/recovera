@@ -72,6 +72,64 @@ root containing the GRUB configuration and environment. When an appliance is
 running from a loop image, staging, commit, and rollback mount that boot root
 explicitly so all three operations update the files firmware actually reads.
 
+## Moving an existing appliance to a new Ubuntu release
+
+An appliance installed from the OVA runs from a conventional ext4 root. It can
+still move to a new Ubuntu release (22.04 to 24.04) without a hypervisor
+snapshot, because the new release arrives as a loop image and the 22.04 root
+is never modified:
+
+1. **Prepare the layout once** (Recovera 0.6.37 or newer). This changes nothing
+   about the next boot: the conventional GRUB entry stays the default and is
+   recorded as the fallback.
+
+   ```bash
+   sudo recovera-upgrade prepare-image-layout --dry-run
+   sudo recovera-upgrade prepare-image-layout
+   ```
+
+   It bind-mounts the root filesystem at `/host` (an `/etc/fstab` line), moves
+   the updater state from `/host/recovera` to `/recovera` on the same
+   filesystem (the same path through the bind), installs the GRUB image menu
+   script, writes `/etc/recovera/image-layout.json` with the root UUID and the
+   `gnulinux-simple-<uuid>` fallback entry, and sets that entry as the saved
+   default. `revert-image-layout` undoes it while no image is staged.
+2. **Drain replication** so no transfer is cut by the reboot:
+   `sudo recovera-peer maintenance on --reason "OS transition" --wait 21600`.
+3. **Install the transition image** from its own channel. Transition images
+   are never published on `stable`, and the automatic update window never
+   passes `--channel`:
+
+   ```bash
+   sudo recovera-upgrade check --channel jammy-noble-transition
+   sudo recovera-upgrade install --channel jammy-noble-transition --reboot
+   ```
+
+   Before downloading anything, the updater requires the starting Ubuntu
+   release and minimum Recovera version named in the signed manifest
+   (`from`), a healthy `homePool`, paused and idle replication, no restore
+   virtual machines or iSCSI targets, and room on the root disk for the
+   compressed and uncompressed image. `--allow-busy` skips only the
+   replication and restore checks.
+4. The appliance boots the 24.04 image **once**. If Apache, PHP-FPM and
+   Recovera replication come up, the validation service makes it the default.
+   Otherwise, and after any crash or reset before validation, the next boot is
+   the untouched 22.04 installation. `sudo recovera-upgrade rollback --reboot`
+   returns to 22.04 later on request.
+5. On 24.04 the `stable` channel is read as `noble-stable`. End the hold with
+   `sudo recovera-peer maintenance off` (a reboot also clears it).
+
+The image carries this appliance's identity and configuration from the 22.04
+root (see the migration list above), including `/var/lib/datto`,
+`/etc/zfs/zpool.cache` and `/etc/hostid` so `homePool` imports without `-f`.
+Its `/etc/fstab` root line is rewritten to the image label. Local `sudoers.d`
+additions are not carried over.
+
+Recovery points, logs and configuration changed while running the image stay
+in `homePool`, but a fallback to 22.04 uses the 22.04 copy of `/datto/config`
+from before the transition. Both releases use the same OpenZFS 2.2 kernel
+module, so the pool imports on either.
+
 ## Appliance commands
 
 ```bash
@@ -106,8 +164,9 @@ An image is accepted only when all of these checks pass:
 
 After base-image verification, a constrained migration step copies this
 appliance's registration, TLS and SSH identity, network configuration,
-administrator accounts, and Recovera replication configuration into the
-inactive candidate. It does not copy recovery points, logs, caches, package
+administrator accounts, Recovera replication configuration, device state
+(`/var/lib/datto`), firewall zones, share accounts, the ZFS pool cache and
+host ID into the inactive candidate. It does not copy recovery points, logs, caches, package
 state, or arbitrary root files. The candidate filesystem is checked again after
 this migration.
 

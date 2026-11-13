@@ -85,6 +85,9 @@ install -m 0755 "$ROOT/upgrade/recovera-upgrade-schedule" "$stage/usr/local/sbin
 install -m 0755 "$ROOT/upgrade/recovera-image-boot" "$stage/usr/local/lib/recovera-upgrade/"
 install -m 0755 "$ROOT/upgrade/recovera-migrate-config" "$stage/usr/local/lib/recovera-upgrade/"
 install -m 0644 "$ROOT/upgrade/keys/recovera-release-signers" "$stage/usr/local/share/recovera-upgrade/release-signers"
+# Installed into /etc only by `recovera-upgrade prepare-image-layout`.
+install -m 0644 "$ROOT/upgrade/07_recovera_images" "$stage/usr/local/share/recovera-upgrade/07_recovera_images"
+install -m 0644 "$ROOT/upgrade/99_recovera_images.cfg" "$stage/usr/local/share/recovera-upgrade/99_recovera_images.cfg"
 install -m 0644 "$ROOT/upgrade/recovera-upgrade.conf" "$stage/usr/share/recovera/defaults/upgrade.conf"
 install -m 0644 "$ROOT/upgrade/recovera-upgrade-check.service" "$stage/etc/systemd/system/"
 install -m 0644 "$ROOT/upgrade/recovera-upgrade-check.timer" "$stage/etc/systemd/system/"

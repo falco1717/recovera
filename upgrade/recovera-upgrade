@@ -13,6 +13,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import urllib.error
 import urllib.request
 import urllib.parse
@@ -39,6 +40,19 @@ DEFAULT_OS_RELEASE = Path("/etc/os-release")
 # (stable.json). Every other OS release reads "<codename>-<channel>".
 LEGACY_OS = ("ubuntu", "22.04")
 PHP_FPM_SERVICE_RE = re.compile(r"^php(?:[0-9]+\.[0-9]+)?-fpm(?:\.service)?$")
+CHANNEL_RE = re.compile(r"^[0-9A-Za-z][0-9A-Za-z._-]{0,31}$")
+SHARE_DIR = Path("/usr/local/share/recovera-upgrade")
+GRUB_SCRIPT = Path("/etc/grub.d/07_recovera_images")
+GRUB_DEFAULTS = Path("/etc/default/grub.d/99_recovera_images.cfg")
+FSTAB = Path("/etc/fstab")
+GRUB_CFG = Path("/boot/grub/grub.cfg")
+# Conventional appliances expose their own root filesystem at /host with a
+# non-recursive bind mount, so the image host is the same path whether the
+# appliance runs from its conventional root or from a loop image.
+# Updater state under /host/recovera is /recovera on the root filesystem.
+SHARED_STATE = Path("/recovera")
+HOST_BIND_COMMENT = "# Recovera image host (recovera-upgrade prepare-image-layout)"
+PEER_COMMAND = Path(os.environ.get("RECOVERA_PEER_COMMAND", "/usr/local/sbin/recovera-peer"))
 FORBIDDEN_PACKAGE_RE = re.compile(
     r"^(?:linux-(?:image|headers|modules|tools)|grub|shim|initramfs-tools|"
     r"systemd|libc6|zfs(?:utils|initramfs|dkms|modules)?)(?:[-:].*)?$"
@@ -449,6 +463,104 @@ def validate_image_manifest(manifest):
             raise UpgradeError(f"invalid image {field}")
     if int(image.get("size", 0)) < 1 or int(image.get("uncompressed_size", 0)) < 1:
         raise UpgradeError("invalid image size")
+    target = manifest.get("os")
+    if target is not None and (not isinstance(target, dict) or set(target) != {"id", "version_id"}):
+        raise UpgradeError("image release contains an invalid operating system")
+    origin = manifest.get("from")
+    if origin is not None:
+        if not isinstance(origin, dict) or set(origin) - {"os_version_ids", "minimum_version"}:
+            raise UpgradeError("image release contains invalid starting requirements")
+        versions = origin.get("os_version_ids")
+        if not isinstance(versions, list) or not versions or not all(
+                isinstance(item, str) and re.fullmatch(r"[0-9.]{2,16}", item) for item in versions):
+            raise UpgradeError("image release contains invalid starting OS releases")
+        minimum = origin.get("minimum_version")
+        if minimum is not None and not re.fullmatch(r"[0-9A-Za-z][0-9A-Za-z.+:~_-]{0,63}", str(minimum)):
+            raise UpgradeError("image release contains an invalid minimum version")
+
+
+def version_at_least(installed, minimum):
+    """Debian version comparison (installed >= minimum)."""
+    if installed is None:
+        return False
+    result = run(["dpkg", "--compare-versions", str(installed), "ge", str(minimum)], check=False)
+    return result.returncode == 0
+
+
+def replication_drained():
+    """(ok, detail): replication is held for maintenance and nothing is running."""
+    if not PEER_COMMAND.exists():
+        return True, "replication is not installed"
+    result = run([PEER_COMMAND, "maintenance", "status"], check=False, capture=True)
+    try:
+        status = json.loads(result.stdout.decode("utf-8", "replace"))
+    except json.JSONDecodeError:
+        return False, "could not read the replication maintenance status"
+    if not status.get("maintenance"):
+        return False, ("replication is not paused; run `sudo recovera-peer maintenance on "
+                       "--reason \"OS transition\" --wait 21600` first")
+    if status.get("busy"):
+        return False, "replication is still running: " + "; ".join(map(str, status["busy"]))
+    return True, "replication is paused and idle"
+
+
+def pool_health(pool="homePool"):
+    result = run(["zpool", "list", "-H", "-o", "health", pool], check=False, capture=True)
+    if result.returncode:
+        return None
+    return result.stdout.decode("utf-8", "replace").strip()
+
+
+def active_restores():
+    """Virtual machines or iSCSI targets that a restore may be using."""
+    found = []
+    if shutil.which("virsh"):
+        result = run(["virsh", "list", "--all", "--name"], check=False, capture=True)
+        found += [f"virtual machine {name}" for name in
+                  result.stdout.decode("utf-8", "replace").split() if name]
+    targets = Path("/sys/kernel/config/target/iscsi")
+    if targets.is_dir():
+        found += [f"iSCSI target {item.name}" for item in targets.iterdir() if item.name.startswith("iqn.")]
+    return found
+
+
+def transition_preflight(manifest, host, args):
+    """Refuse an operating-system transition unless the appliance is ready for it."""
+    origin = manifest.get("from")
+    os_info = local_os()
+    if origin is None:
+        target = manifest.get("os")
+        if target and (target["id"], target["version_id"]) != (os_info.get("id"), os_info.get("version_id")):
+            raise UpgradeError(
+                f"this image runs {target['id']} {target['version_id']}; moving this appliance "
+                "to another OS release needs a transition release"
+            )
+        return
+    if os_info.get("version_id") not in origin["os_version_ids"]:
+        raise UpgradeError(
+            f"this transition starts from Ubuntu {', '.join(origin['os_version_ids'])}; "
+            f"this appliance runs {os_info.get('version_id') or 'an unknown release'}"
+        )
+    minimum = origin.get("minimum_version")
+    if minimum and not version_at_least(installed_version("recovera-appliance"), minimum):
+        raise UpgradeError(f"install Recovera {minimum} or newer before this transition")
+    problems = []
+    health = pool_health()
+    if health != "ONLINE":
+        problems.append(f"homePool is {health or 'not imported'}, not ONLINE")
+    drained, detail = replication_drained()
+    if not drained and not getattr(args, "allow_busy", False):
+        problems.append(detail)
+    restores = active_restores()
+    if restores and not getattr(args, "allow_busy", False):
+        problems.append("restores are active: " + ", ".join(restores))
+    image = manifest["image"]
+    needed = int(image["size"]) + int(image["uncompressed_size"]) + 1024 * 1024 * 1024
+    free = shutil.disk_usage(host).free
+    if free < needed:
+        problems.append(f"the image host needs {needed // 2**20} MiB free and has {free // 2**20} MiB")
+    if problems:
+        raise UpgradeError("the appliance is not ready for this transition:\n- " + "\n- ".join(problems))
 
 
 def safe_asset_name(name):
@@ -698,6 +810,7 @@ def command_install_image(config, args, release):
     require_layout(config)
     pointer, assets, manifest, manifest_path, signature_path = release
     host = Path(config["HOST_ROOT"])
+    transition_preflight(manifest, host, args)
     images = host / "recovera/images"
     downloads = host / "recovera/downloads"
     images.mkdir(parents=True, exist_ok=True)
@@ -1029,6 +1142,14 @@ def command_mark_success(config, args):
         print(f"Recovera {current['version']} passed validation and is now the default image.")
 
 
+def previous_image_available(previous, config):
+    """True when the previous release is a loop image that is still on disk."""
+    version = str(previous.get("version") or "")
+    if not version or previous.get("type", "image") != "image":
+        return False
+    return (Path(config.get("HOST_ROOT", "/host")) / "recovera/images" / f"{version}.img").is_file()
+
+
 def command_validation_failed(config, args):
     require_root()
     with UpgradeLock():
@@ -1040,9 +1161,11 @@ def command_validation_failed(config, args):
             state["pending"] = None
         else:
             previous = state.get("previous", {})
-            if previous.get("version"):
+            if previous_image_available(previous, config):
                 run([BOOT_HELPER, "rollback", previous["version"]])
             else:
+                # The previous system was the conventional root (a package
+                # release, or nothing), not a loop image: boot that again.
                 run([BOOT_HELPER, "fallback"])
             failed_version = current_release().get("version")
         state["last_failure"] = {"version": failed_version, "reason": args.reason}
@@ -1071,9 +1194,12 @@ def command_rollback(config, args):
             atomic_json(state_path(), state)
             PENDING_MARKER.unlink(missing_ok=True)
             print(f"Rolled back Recovera package release {transaction.get('version')}.")
-        elif previous.get("version") and BOOT_HELPER.exists():
+        elif previous_image_available(previous, config) and BOOT_HELPER.exists():
             run([BOOT_HELPER, "rollback", previous["version"]])
             print(f"Selected Recovera image {previous['version']} for rollback.")
+        elif read_json(layout_path(), {}).get("fallback_entry") and BOOT_HELPER.exists():
+            run([BOOT_HELPER, "fallback"])
+            print("Selected the conventional installation for rollback.")
         else:
             raise UpgradeError("there is no rollback transaction available")
         if args.reboot:
@@ -1093,6 +1219,143 @@ def command_status(config, args):
     print(json.dumps(value, indent=2, sort_keys=True))
 
 
+def root_filesystem_uuid():
+    result = run(["findmnt", "-n", "-o", "UUID,SOURCE,FSTYPE", "/"], capture=True)
+    fields = result.stdout.decode("utf-8", "replace").split()
+    if len(fields) < 3:
+        raise UpgradeError("cannot identify the root filesystem")
+    uuid, source, fstype = fields[:3]
+    if source.startswith("/dev/loop"):
+        raise UpgradeError("this appliance is already running from a Recovera image")
+    if fstype != "ext4" or not re.fullmatch(r"[0-9A-Fa-f-]{8,64}", uuid):
+        raise UpgradeError(f"unsupported root filesystem for image boot: {fstype} {uuid}")
+    return uuid
+
+
+def conventional_grub_entry(uuid):
+    entry = f"gnulinux-simple-{uuid}"
+    try:
+        config_text = GRUB_CFG.read_text(errors="replace")
+    except OSError as exc:
+        raise UpgradeError(f"cannot read {GRUB_CFG}: {exc}") from exc
+    if f"'{entry}'" not in config_text:
+        raise UpgradeError(f"the GRUB menu has no {entry} entry to fall back to")
+    return entry
+
+
+HOST_MOUNTPOINT = "/host"
+
+
+def host_bind_line(host):
+    return f"/ {host} none bind,x-systemd.requires-mounts-for=/ 0 0"
+
+
+def fstab_lines():
+    return FSTAB.read_text().splitlines()
+
+
+def host_bind_present(lines=None):
+    return any(line.split()[:2] == ["/", HOST_MOUNTPOINT] for line in (lines or fstab_lines())
+               if line.strip() and not line.lstrip().startswith("#"))
+
+
+def command_prepare_image_layout(config, args):
+    """Let a conventional appliance boot verified loop images, keeping its own root.
+
+    Nothing about the next boot changes: the conventional GRUB entry stays the
+    default and is recorded as the fallback for a failed image.
+    """
+    require_root()
+    layout = read_json(layout_path(), {})
+    if layout.get("mode") == "loop-image-v1":
+        print(json.dumps({"prepared": True, "already": True, "layout": layout}, indent=2))
+        return 0
+    host = Path(config["HOST_ROOT"])
+    if str(host) != HOST_MOUNTPOINT:
+        raise UpgradeError(f"image layout conversion expects HOST_ROOT={HOST_MOUNTPOINT}")
+    if PENDING_MARKER.exists():
+        raise UpgradeError("an update is waiting for reboot validation; finish it first")
+    uuid = root_filesystem_uuid()
+    entry = conventional_grub_entry(uuid)
+    for source in ("07_recovera_images", "99_recovera_images.cfg"):
+        if not (SHARE_DIR / source).is_file():
+            raise UpgradeError(f"missing {SHARE_DIR / source}; reinstall recovera-appliance")
+    plan = {"boot_root_uuid": uuid, "fallback_entry": entry, "host": str(host),
+            "state_moved_from": str(host / "recovera") if not host.is_mount() else None}
+    if args.dry_run:
+        print(json.dumps({"prepared": False, "plan": plan}, indent=2))
+        return 0
+    with UpgradeLock():
+        if not host.is_mount():
+            # Updater state lives under /host/recovera. Through the bind mount
+            # that is /recovera on the root filesystem, so carry it across.
+            legacy = host / "recovera"
+            shared = SHARED_STATE
+            shared.mkdir(mode=0o755, exist_ok=True)
+            if legacy.is_dir():
+                for item in legacy.iterdir():
+                    destination = shared / item.name
+                    if destination.exists():
+                        continue
+                    if item.is_dir():
+                        shutil.copytree(item, destination, symlinks=True)
+                    else:
+                        shutil.copy2(item, destination)
+            host.mkdir(exist_ok=True)
+            run(["mount", "--bind", "/", str(host)])
+            lines = fstab_lines()
+            if not host_bind_present(lines):
+                FSTAB.write_text("\n".join(lines + [HOST_BIND_COMMENT, host_bind_line(host)]) + "\n")
+        (host / "recovera/images").mkdir(parents=True, exist_ok=True)
+        GRUB_DEFAULTS.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(SHARE_DIR / "99_recovera_images.cfg", GRUB_DEFAULTS)
+        GRUB_SCRIPT.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(SHARE_DIR / "07_recovera_images", GRUB_SCRIPT)
+        GRUB_SCRIPT.chmod(0o755)
+        atomic_json(layout_path(), {"schema": 1, "mode": "loop-image-v1",
+                                    "boot_root_uuid": uuid, "fallback_entry": entry,
+                                    "prepared": int(time.time())}, mode=0o644)
+        run(["update-grub"])
+        run(["grub-set-default", entry])
+    print(json.dumps({"prepared": True, "plan": plan}, indent=2))
+    return 0
+
+
+def command_revert_image_layout(config, args):
+    """Undo prepare-image-layout while no image is staged or running."""
+    require_root()
+    layout = read_json(layout_path(), {})
+    host = Path(config["HOST_ROOT"])
+    if layout.get("mode") != "loop-image-v1":
+        print(json.dumps({"reverted": True, "already": True}, indent=2))
+        return 0
+    root_filesystem_uuid()  # refuses while running from an image
+    if PENDING_MARKER.exists():
+        raise UpgradeError("an image is staged; roll it back before reverting the layout")
+    images = sorted((host / "recovera/images").glob("*.img")) if host.is_dir() else []
+    if images and not args.force:
+        raise UpgradeError("images are present in /host/recovera/images; pass --force to keep "
+                           "them on disk and revert anyway")
+    with UpgradeLock():
+        for path in (GRUB_SCRIPT, GRUB_DEFAULTS):
+            path.unlink(missing_ok=True)
+        layout_path().unlink(missing_ok=True)
+        run(["grub-editenv", "/boot/grub/grubenv", "unset", "saved_entry", "next_entry"], check=False)
+        run(["update-grub"])
+        lines = [line for line in fstab_lines()
+                 if line.strip() != HOST_BIND_COMMENT and line.split()[:2] != ["/", HOST_MOUNTPOINT]]
+        FSTAB.write_text("\n".join(lines) + "\n")
+        if host.is_mount():
+            shared = SHARED_STATE
+            run(["umount", str(host)])
+            (host / "recovera").mkdir(parents=True, exist_ok=True)
+            for name in ("state.json",):
+                if (shared / name).is_file():
+                    shutil.copy2(shared / name, host / "recovera" / name)
+    print(json.dumps({"reverted": True}, indent=2))
+    return 0
+
+
 def parser():
     value = argparse.ArgumentParser(prog="recovera-upgrade")
     value.add_argument("--config", type=Path, default=Path(os.environ.get("RECOVERA_UPGRADE_CONFIG", DEFAULT_CONFIG)))
@@ -1102,10 +1365,19 @@ def parser():
         command = sub.add_parser(name)
         command.add_argument("--channel-file", type=Path)
         command.add_argument("--source-dir", type=Path)
+        # Read a different channel once, e.g. an operating-system transition.
+        # The automatic update window never passes this.
+        command.add_argument("--channel")
         if name == "check":
             command.add_argument("--cache", action="store_true")
         else:
             command.add_argument("--reboot", action="store_true")
+            command.add_argument("--allow-busy", action="store_true",
+                                 help="skip the replication and restore idle checks of a transition")
+    prepare = sub.add_parser("prepare-image-layout")
+    prepare.add_argument("--dry-run", action="store_true")
+    revert = sub.add_parser("revert-image-layout")
+    revert.add_argument("--force", action="store_true")
     sub.add_parser("status")
     sub.add_parser("mark-success")
     rollback = sub.add_parser("rollback")
@@ -1126,6 +1398,12 @@ def main():
     try:
         config = read_config(args.config)
         if args.command in ("check", "install"):
+            if args.channel:
+                if not CHANNEL_RE.fullmatch(args.channel):
+                    raise UpgradeError("invalid channel name")
+                if getattr(args, "cache", False):
+                    raise UpgradeError("--channel cannot be combined with --cache")
+                config["CHANNEL"] = args.channel
             config["CHANNEL_REQUESTED"] = config["CHANNEL"]
             config["CHANNEL"] = effective_channel(config["CHANNEL"], local_os())
         return {
@@ -1135,6 +1413,8 @@ def main():
             "mark-success": command_mark_success,
             "validation-failed": command_validation_failed,
             "rollback": command_rollback,
+            "prepare-image-layout": command_prepare_image_layout,
+            "revert-image-layout": command_revert_image_layout,
         }[args.command](config, args) or 0
     except (UpgradeError, FileNotFoundError, ValueError, subprocess.SubprocessError) as exc:
         print(f"recovera-upgrade: {exc}", file=sys.stderr)
