@@ -1,7 +1,7 @@
-{% extends 'commonlookandfeel/Default/layout.main.html.twig' %}
+{% extends 'Default/layout.main.html.twig' %}
 {% set title = 'Appliance Access' %}
 {% block scripts %}
-    <script src="{{ asset('commonlookandfeel/js/App/Configure/RecoveraAccess.js') }}"></script>
+    <script src="{{ asset('js/App/Configure/RecoveraAccess.js') }}"></script>
 {% endblock %}
 {% block content %}
 <div id="recovera-access" data-api="{{ path('recovera_target_api', {'operation':'status'})|replace({'status':''}) }}">

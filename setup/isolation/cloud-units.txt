@@ -44,6 +44,7 @@ datto-snapnas-growth-report.service
 datto-snapnas-growth-report.timer
 datto-iscsi-health-check.service
 datto-iscsi-health-check.timer
+datto-hva-iscsi-tls-configure.service
 datto-https-check.service
 datto-https-check.timer
 datto-https-repair.service

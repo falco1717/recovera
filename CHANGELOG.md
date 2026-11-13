@@ -1,5 +1,36 @@
 # Changelog
 
+## v0.6.38 - 2026-11-12
+
+One code base for both application releases: 5.6.x on Ubuntu 22.04 (the
+current appliances) and 5.12.x on Ubuntu 24.04 (the transition target). This
+brings in the 5.12.2 / Noble compatibility work, made conditional so 22.04
+appliances keep their behaviour.
+
+- WebUI branding detects the web layout: `commonlookandfeel/` and `vintage/`
+  on 5.6.x, flat on 5.12.x. Recovera pages, the Synchronize panel, the
+  connectivity check and the Protect integration install into whichever is
+  present. Checked against the original 5.6.3 and 5.12.2 web trees.
+- Fix: the Recovery Points page loaded `RecoveraRecoveryPoints.js` through a
+  tag written with backslash-escaped quotes, so browsers never ran it. The
+  branding step now writes a correct tag and repairs the broken one.
+- `setup.sh` and `install.sh` install a 22.04 (5.6.x) or 24.04 (5.12.x)
+  bundle and refuse a bundle built for the other release. PHP-FPM is detected.
+  The 24.04-only runtime fixes (no Xen libvirt driver, dnsmasq beside
+  systemd-resolved, `target.service` loading `target_core_mod`, Symfony route
+  cache rebuild) run only on 24.04.
+- The control package installs the dnsmasq and `target.service` drop-ins only
+  on 24.04 and never restarts `target.service` or dnsmasq during an update,
+  because stopping `target.service` clears the iSCSI targets of a running
+  restore. Apache is restarted rather than reloaded after an update.
+- Bundle tooling from the Noble work: `tools/export-installed-packages.sh`,
+  `tools/build-php-xattr-deb.sh`, sanitizer fixes (offline npyscreen venv,
+  salt-minion and rly-client presets, the Xen libvirt plug-in), a stale
+  `recovera-appliance` package is dropped from exports, and the source package
+  is found by its Debian `Package` field. The PHP-FPM pool is found for either
+  PHP version.
+- Cloud isolation also masks `datto-hva-iscsi-tls-configure.service`.
+
 ## v0.6.37 - 2026-11-12
 
 Moving an existing appliance to a new Ubuntu release without a hypervisor

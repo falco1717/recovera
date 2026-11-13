@@ -7,7 +7,7 @@ replication can operate without Internet access.
 
 ## Requirements
 
-- Ubuntu 22.04 LTS on an amd64 system
+- Ubuntu 24.04 LTS (5.12.x bundles) or 22.04 LTS (5.6.x bundles) on an amd64 system
 - 8 GB RAM minimum; allocate more for larger recovery workloads
 - A user account with `sudo` access
 - Approximately 12 GB of free space on the system disk

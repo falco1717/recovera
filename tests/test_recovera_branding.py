@@ -1,9 +1,13 @@
 import importlib.util
+import sys
+import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 SCRIPT = Path(__file__).parents[1] / "setup" / "branding" / "apply-branding.py"
+PEER_UI = Path(__file__).parents[1] / "setup" / "branding" / "apply-peer-ui.py"
 ROOT = Path(__file__).parents[1]
 
 
@@ -78,7 +82,7 @@ class RecoveraBrandingTests(unittest.TestCase):
     def test_recovery_points_bridge_is_injected_once_after_native_view(self):
         branding = load_module()
         source = """{% block scripts %}
-<script src=\"{{ asset('commonlookandfeel/js/App/Assets/RecoveryPointsView.js') }}\"></script>
+<script src=\"{{ asset('js/App/Assets/RecoveryPointsView.js') }}\"></script>
 {% endblock %}
 {% block content %}<main></main>{% endblock %}
 """
@@ -88,12 +92,29 @@ class RecoveraBrandingTests(unittest.TestCase):
         self.assertLess(patched.index("RecoveryPointsView.js"),
                         patched.index("RecoveraRecoveryPoints.js"))
         self.assertEqual(branding.patch_recovery_points_template(patched), patched)
+        self.assertIn('<script type="text/javascript" src="{{ asset(\'js/App/Assets/RecoveraRecoveryPoints.js\') }}"></script>',
+                      patched)
+
+    def test_recovery_points_repairs_the_backslash_quoted_tag(self):
+        # Exactly what 0.6.37 and earlier left in the 5.6.3 template.
+        branding = load_module()
+        broken = ("<script src=\"{{ asset('commonlookandfeel/js/App/Assets/RecoveryPointsView.js') }}\"></script>\n"
+                  "<script type=\\\"text/javascript\\\" src=\\\"{{ asset('commonlookandfeel/js/App/Assets/"
+                  "RecoveraRecoveryPoints.js') }}\\\"></script>\n"
+                  "{% block content %}\n    <div id=\"recovera-recovery-points-csrf\" class=\"d-none\"></div>")
+        self.assertIn('type=\\"text/javascript\\"', broken)
+        repaired = branding.patch_recovery_points_template(broken)
+        self.assertNotIn("\\", repaired)
+        self.assertIn('<script type="text/javascript" src="{{ asset(\'commonlookandfeel/js/App/Assets/'
+                      'RecoveraRecoveryPoints.js\') }}"></script>', repaired)
+        self.assertEqual(repaired.count("RecoveraRecoveryPoints.js"), 1)
+        self.assertEqual(branding.patch_recovery_points_template(repaired), repaired)
 
     def test_protect_system_enables_recovera_replication_bridge_once(self):
         branding = load_module()
         source = """{% set cloudPaneTitle = feature.isSupported('FEATURE_PEER_REPLICATION') %}
 {% block wizard_assets %}
-    <script type=\"text/javascript\" src=\"{{ asset('commonlookandfeel/js/App/Agents/WizardSystem.js') }}\"></script>
+    <script type=\"text/javascript\" src=\"{{ asset('js/App/Agents/WizardSystem.js') }}\"></script>
 {% endblock %}
 {% block agentsFinish %}
 canOffsite: {{ canOffsite|json_encode|raw }}
@@ -147,8 +168,8 @@ canOffsite: {{ canOffsite|json_encode|raw }}
         self.assertLess(patched.index("ReplicationStatusView.js"), patched.index("RecoveraSynchronize.js"))
         self.assertLess(patched.index('id="synchronizeBody"'), patched.index('id="recovera-sync-panel"'))
         installer = SCRIPT.read_text(encoding="utf-8")
-        self.assertIn("templates/vintage/Synchronize/index.html.twig", installer)
-        self.assertIn('(resources / "RecoveraSynchronize.js", synchronize_js)', installer)
+        self.assertIn('template_paths("Synchronize/index.html.twig", vintage=True)', installer)
+        self.assertIn('(resources / "RecoveraSynchronize.js", scripts / "Synchronize/RecoveraSynchronize.js")', installer)
         panel = (ROOT / "setup" / "branding" / "RecoveraSynchronize.js").read_text(encoding="utf-8")
         self.assertIn("/api/recovera/offsite-target/replication-activity", panel)
         self.assertNotIn("innerHTML", panel)
@@ -171,8 +192,8 @@ canOffsite: {{ canOffsite|json_encode|raw }}
             self.assertLess(patched.index("ConnectivityView.js"), patched.index("RecoveraNetworkCheck.js"))
             self.assertLess(patched.index("RecoveraNetworkCheck.js"), patched.index("view.render()"))
         installer = SCRIPT.read_text(encoding="utf-8")
-        self.assertIn("templates/vintage/Configure/Network/ip.status.html.twig", installer)
-        self.assertIn('(resources / "RecoveraNetworkCheck.js", network_check_js)', installer)
+        self.assertIn('template_paths("Configure/Network/ip.status.html.twig", vintage=True)', installer)
+        self.assertIn('(resources / "RecoveraNetworkCheck.js", scripts / "Configure/Network/RecoveraNetworkCheck.js")', installer)
         override = (ROOT / "setup" / "branding" / "RecoveraNetworkCheck.js").read_text(encoding="utf-8")
         self.assertIn("View.prototype.renderView = function", override)
         self.assertIn("/api/recovera/offsite-target/", override)
@@ -245,6 +266,101 @@ canOffsite: {{ canOffsite|json_encode|raw }}
         self.assertIn("document.execCommand('copy')", access)
         self.assertIn("document.createElement('textarea')", access)
         self.assertIn("selectDisplayedPassword", access)
+
+
+class RecoveraBrandingLayoutTests(unittest.TestCase):
+    """apply-branding.py and apply-peer-ui.py on 5.6.x and 5.12.x web trees."""
+
+    TEMPLATES = {
+        "Default/layout.base.html.twig": "<html><head></head><body></body></html>\n",
+        "Synchronize/index.html.twig": (
+            "{% block scripts %}\n"
+            "    <script type=\"text/javascript\" src=\"{{ asset('PREFIXjs/App/Synchronize/ReplicationStatusView.js') }}\"></script>\n"
+            "{% endblock %}\n{% block content %}\n    <div id=\"synchronizeBody\"></div>\n{% endblock %}\n"),
+        "Configure/Network/ip.status.html.twig": (
+            "<script src=\"{{ asset('PREFIXjs/App/Configure/Network/ConnectivityView.js') }}\"></script>\n"
+            "<script>view.render()</script>\n"),
+        "Agents/List/index.html.twig": "{% block scripts %}\n{% endblock %}\n",
+        "Assets/Configure/cloud.backup.html.twig": "<div></div>\n",
+    }
+
+    def build_tree(self, root: Path, legacy: bool) -> tuple[Path, Path]:
+        device, web = root / "device", root / "web"
+        prefix = "commonlookandfeel/" if legacy else ""
+        layouts = ["commonlookandfeel/", "vintage/"] if legacy else [""]
+        for layout in layouts:
+            for name, text in self.TEMPLATES.items():
+                path = device / "templates" / layout / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(text.replace("PREFIX", layout), encoding="utf-8")
+        (device / "config").mkdir(parents=True)
+        (device / "config/routes.yaml").write_text("home:\n    path: /\n", encoding="utf-8")
+        (web / prefix / "js/App").mkdir(parents=True)
+        return device, web
+
+    def run_branding(self, legacy: bool):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        root = Path(temp.name)
+        device, web = self.build_tree(root, legacy)
+        logo = root / "logo.png"
+        logo.write_bytes(b"png")
+        branding = load_module()
+        with mock.patch.object(branding, "ROOT", device), mock.patch.object(branding, "WEB", web), \
+             mock.patch.object(sys, "argv", ["apply-branding.py", str(logo)]), \
+             mock.patch("builtins.print"):
+            self.assertEqual(branding.main(), 0)
+        spec = importlib.util.spec_from_file_location("recovera_peer_ui_test", PEER_UI)
+        peer_ui = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(peer_ui)
+        with mock.patch.object(peer_ui, "ROOT", device), mock.patch.object(peer_ui, "WEB_ROOT", web):
+            self.assertEqual(peer_ui.main(), 0)
+        return device, web
+
+    def test_legacy_commonlookandfeel_layout(self):
+        device, web = self.run_branding(legacy=True)
+        templates = device / "templates"
+        self.assertTrue((web / "commonlookandfeel/js/App/Configure/RecoveraTarget.js").is_file())
+        self.assertTrue((web / "commonlookandfeel/UI/css/recovera-brand.css").is_file())
+        self.assertTrue((web / "commonlookandfeel/js/App/Agents/RecoveraProtectStatus.js").is_file())
+        target = (templates / "commonlookandfeel/Configure/RecoveraTarget/index.html.twig").read_text()
+        self.assertIn("{% extends 'commonlookandfeel/Default/layout.main.html.twig' %}", target)
+        self.assertIn("asset('commonlookandfeel/js/App/Configure/RecoveraTarget.js')", target)
+        controller = (device / "src/App/Controller/Web/Configure/RecoveraTargetController.php").read_text()
+        self.assertIn("render('commonlookandfeel/Configure/RecoveraTarget/index.html.twig')", controller)
+        for layout in ("commonlookandfeel", "vintage"):
+            sync = (templates / layout / "Synchronize/index.html.twig").read_text()
+            self.assertIn("asset('commonlookandfeel/js/App/Synchronize/RecoveraSynchronize.js')", sync)
+            network = (templates / layout / "Configure/Network/ip.status.html.twig").read_text()
+            self.assertIn("asset('commonlookandfeel/js/App/Configure/Network/RecoveraNetworkCheck.js')", network)
+            base = (templates / layout / "Default/layout.base.html.twig").read_text()
+            self.assertIn('href="/commonlookandfeel/UI/css/recovera-brand.css?v=', base)
+        status = (templates / "commonlookandfeel/Agents/List/index.html.twig").read_text()
+        self.assertIn("asset('commonlookandfeel/js/App/Agents/RecoveraProtectStatus.js')", status)
+        pane = (templates / "commonlookandfeel/Assets/Configure/cloud.backup.html.twig").read_text()
+        self.assertIn("asset('commonlookandfeel/js/App/Agents/RecoveraProtectSystem.js')", pane)
+        self.assertFalse((templates / "Configure").exists(), "nothing may be written to the flat path")
+
+    def test_flat_512_layout(self):
+        device, web = self.run_branding(legacy=False)
+        templates = device / "templates"
+        self.assertTrue((web / "js/App/Configure/RecoveraTarget.js").is_file())
+        self.assertTrue((web / "UI/css/recovera-brand.css").is_file())
+        self.assertFalse((web / "commonlookandfeel").exists())
+        target = (templates / "Configure/RecoveraTarget/index.html.twig").read_text()
+        self.assertIn("{% extends 'Default/layout.main.html.twig' %}", target)
+        self.assertIn("asset('js/App/Configure/RecoveraTarget.js')", target)
+        controller = (device / "src/App/Controller/Web/Configure/RecoveraTargetController.php").read_text()
+        self.assertIn("render('Configure/RecoveraTarget/index.html.twig')", controller)
+        sync = (templates / "Synchronize/index.html.twig").read_text()
+        self.assertIn("asset('js/App/Synchronize/RecoveraSynchronize.js')", sync)
+        self.assertIn('id="recovera-sync-panel"', sync)
+        base = (templates / "Default/layout.base.html.twig").read_text()
+        self.assertIn('href="/UI/css/recovera-brand.css?v=', base)
+        self.assertIn('src="/js/App/Configure/RecoveraDeviceSettings.js"', base)
+        status = (templates / "Agents/List/index.html.twig").read_text()
+        self.assertIn("asset('js/App/Agents/RecoveraProtectStatus.js')", status)
+        self.assertFalse((templates / "commonlookandfeel").exists())
 
 
 if __name__ == "__main__":

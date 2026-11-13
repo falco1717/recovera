@@ -1,7 +1,7 @@
 Recovera: single-script appliance setup
 ========================================
 
-Turns a fresh Ubuntu 22.04 (jammy, amd64) VM into a Recovera backup appliance using
+Turns a fresh Ubuntu 24.04 (noble) or 22.04 (jammy) amd64 VM, matching the bundle, into a Recovera backup appliance using
 the reviewed application package set: 1,329 retained packages at tested versions,
 installed offline from debs/, plus the fixes required to run that application stack
 on a normal Ubuntu VM.
@@ -9,7 +9,7 @@ The bundle excludes 22 source-appliance-only security, telemetry, debug, and leg
 kernel packages after validating the retained package dependency closure.
 
 NEEDS
-  - Ubuntu 22.04 amd64 (cloud image or server install), SSH key login for your user
+  - Ubuntu 24.04 (5.12.x bundles) or 22.04 (5.6.x bundles) amd64, cloud image or server install,, SSH key login for your user
   - at least 8 GB RAM (more when local recovery/verification VMs require it)
   - about 12 GB free on /   (archive extraction + bundle copy + install)
   - a second, BLANK disk of at least ZFS_MIN_GB (default 20 GB) for homePool

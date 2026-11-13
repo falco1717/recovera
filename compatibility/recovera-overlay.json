@@ -55,6 +55,20 @@
       ],
       "strategy": "owned",
       "contracts": ["dpkg", "systemd", "minisign-compatible Ed25519 verification"]
+    },
+    {
+      "component": "noble-runtime",
+      "source_glob": "setup/*recovera.conf",
+      "installed_globs": [
+        "/etc/dnsmasq.d/recovera.conf",
+        "/etc/systemd/system/target.service.d/zz-recovera.conf"
+      ],
+      "strategy": "drop_in",
+      "contracts": [
+        "Ubuntu 24.04 systemd-resolved coexistence",
+        "target_core_mod before targetctl restore",
+        "QEMU/KVM libvirt driver availability"
+      ]
     }
   ],
   "acceptance_tests": [

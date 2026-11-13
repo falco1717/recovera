@@ -1,6 +1,7 @@
 # Recovera virtual appliance
 
-The Recovera OVA contains a complete, unregistered Ubuntu 22.04 appliance. It
+The Recovera OVA contains a complete, unregistered Ubuntu appliance (24.04 for
+5.12.x bundles, 22.04 for 5.6.x bundles). It
 is an alternative to running `install.sh` on an existing VM; both deployment
 paths produce the same application and offline registration workflow.
 

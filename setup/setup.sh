@@ -1,5 +1,7 @@
 #!/bin/bash
-# Recovera: one-shot setup for a fresh Ubuntu 22.04 (jammy, amd64) VM.
+# Recovera: one-shot setup for a fresh Ubuntu 22.04 (jammy) or 24.04 (noble) amd64 VM.
+# The bundle decides which: 5.6.x application packages are jammy builds, 5.12.x
+# packages are noble builds.
 #
 # Installs the reviewed application package set at its exact versions from the bundled
 # .debs (no internet needed), then applies the Recovera appliance configuration:
@@ -138,10 +140,21 @@ kvm_ready() {
 }
 
 # ------------------------------------------------------------------------ preflight
+# The installed PHP-FPM unit: php8.1-fpm on 22.04, php8.3-fpm on 24.04.
+php_fpm_unit() {
+  local unit
+  unit=$(systemctl list-unit-files --no-legend --plain 'php*-fpm.service' 2>/dev/null \
+    | awk '{print $1}' | sort -V | tail -n 1)
+  echo "${unit:-php8.1-fpm.service}"
+}
+
 preflight() {
   [ "$(id -u)" -eq 0 ] || { echo "run with sudo"; exit 1; }
   . /etc/os-release
-  [ "${VERSION_ID:-}" = "22.04" ] || { echo "needs Ubuntu 22.04 (this is ${PRETTY_NAME:-unknown}); the packages are jammy builds"; exit 1; }
+  case "${VERSION_ID:-}" in
+    22.04|24.04) ;;
+    *) echo "needs Ubuntu 22.04 or 24.04 (this is ${PRETTY_NAME:-unknown})"; exit 1 ;;
+  esac
   [ "$(dpkg --print-architecture)" = amd64 ] || { echo "needs amd64"; exit 1; }
   load_conf
   validate_conf
@@ -199,12 +212,20 @@ stage_bundle() {   # copy the bundle to /opt/recovera so nothing depends on /hom
   [ -d "$BUNDLE/peer" ] || die "missing peer/ in bundle: $BUNDLE"
   [ -d "$BUNDLE/upgrade" ] || die "missing upgrade/ in bundle: $BUNDLE"
   [ -d "$BUNDLE/isolation" ] || die "missing isolation/ in bundle: $BUNDLE"
+  [ -f "$BUNDLE/recovera-dnsmasq.conf" ] || die "missing recovera-dnsmasq.conf in bundle: $BUNDLE"
+  [ -f "$BUNDLE/target-recovera.conf" ] || die "missing target-recovera.conf in bundle: $BUNDLE"
+  # Application packages are built for one Ubuntu release (…-0ubuntu22.04 or
+  # …-0ubuntu24.04); refuse a bundle made for the other one.
+  if ! compgen -G "$BUNDLE/debs/*siris-os-2_*ubuntu${VERSION_ID}_*.deb" >/dev/null; then
+    die "this bundle's application packages are not built for Ubuntu ${VERSION_ID}"
+  fi
   need_kb=$(( $(du -sk "$BUNDLE" | cut -f1) + 6*1024*1024 ))   # bundle + ~6 GB for the install itself
   free_kb=$(df -Pk / | awk 'NR==2{print $4}')
   [ "$free_kb" -ge "$need_kb" ] || { echo "not enough space on /: need ~$((need_kb/1024/1024)) GB, have $((free_kb/1024/1024)) GB"; exit 1; }
   echo "staging bundle into $INSTALL_DIR ..."
   mkdir -p "$INSTALL_DIR"
   cp -a "$BUNDLE/setup.sh" "$BUNDLE/setup.conf" "$INSTALL_DIR/"
+  cp -a "$BUNDLE/recovera-dnsmasq.conf" "$BUNDLE/target-recovera.conf" "$INSTALL_DIR/"
   [ -f "$BUNDLE/README.txt" ] && cp -a "$BUNDLE/README.txt" "$INSTALL_DIR/"
   rm -rf "$INSTALL_DIR/wheels"; cp -a "$BUNDLE/wheels" "$INSTALL_DIR/"
   rm -rf "$INSTALL_DIR/lists"; cp -a "$BUNDLE/lists" "$INSTALL_DIR/"
@@ -329,9 +350,11 @@ disable_online_registration_gates() {
   # that pane on this deliberately offline replica and stop its perpetual
   # connectivity poll when no online-only pane remains.
   local f
+  # 5.6.x keeps commonlookandfeel/ and vintage/ copies; 5.12.x is flat.
   for f in \
     /usr/lib/datto/device/templates/commonlookandfeel/Registration/Register/index.html.twig \
-    /usr/lib/datto/device/templates/vintage/Registration/Register/index.html.twig; do
+    /usr/lib/datto/device/templates/vintage/Registration/Register/index.html.twig \
+    /usr/lib/datto/device/templates/Registration/Register/index.html.twig; do
     [ -f "$f" ] || continue
     if ! grep -q 'offline replica: skip online update pane' "$f"; then
       sed -i "/^{% set panes = \[\] %}$/i\\{% set updatePaneEnabled = false %} {# Recovera offline replica: skip online update pane #}" "$f" || return 1
@@ -339,7 +362,8 @@ disable_online_registration_gates() {
   done
   for f in \
     /datto/web/commonlookandfeel/js/App/Registration/RegisterWizard.js \
-    /datto/web/vintage/js/App/Registration/RegisterWizard.js; do
+    /datto/web/vintage/js/App/Registration/RegisterWizard.js \
+    /datto/web/js/App/Registration/RegisterWizard.js; do
     [ -f "$f" ] || continue
     if ! grep -q 'offline replica: no online panes' "$f"; then
       sed -i '/^[[:space:]]*this\.checkNetworkConnectivity();$/c\        // Recovera offline replica: no online panes, so do not poll forever\n        if (this.context.authorizationPaneEnabled || this.context.updatePaneEnabled) {\n            this.checkNetworkConnectivity();\n        } else {\n            this.networkConnected = true;\n        }' "$f" || return 1
@@ -351,7 +375,7 @@ disable_online_registration_gates() {
     { find /var/cache/datto/device/prod/twig -type f -name '*.php' -exec \
       grep -lZ 'Registration/Register/index.html.twig' {} + 2>/dev/null || true; } | xargs -0 -r rm -f || return 1
   fi
-  systemctl restart php8.1-fpm >/dev/null 2>&1 || return 1
+  systemctl restart "$(php_fpm_unit)" >/dev/null 2>&1 || return 1
 }
 
 install_offline_registration_finalizer() {
@@ -360,8 +384,7 @@ install_offline_registration_finalizer() {
   # registerNow RPC succeeds. Preserve that native routine, but replace its cloud
   # clients reachable from this one flow with an in-process client that returns
   # local success without opening a network connection.
-  install -d -m 0755 /datto/web/commonlookandfeel/js/App/Registration \
-    /datto/web/vintage/js/App/Registration
+  install -d -m 0755 /datto/web/js/App/Registration
 
   cat > /datto/web/offline-register.php <<'PHP'
 <?php
@@ -676,7 +699,7 @@ echo $body;
 PHP
   chmod 0644 /datto/web/offline-update.php || return 1
 
-  cat > /datto/web/commonlookandfeel/js/App/Registration/OfflineRegister.js <<'JS'
+  cat > /datto/web/js/App/Registration/OfflineRegister.js <<'JS'
 (function ($, RegisterWizard) {
     'use strict';
 
@@ -842,17 +865,28 @@ PHP
     };
 })(jQuery, Datto.App.RegisterWizard);
 JS
-  cp -a /datto/web/commonlookandfeel/js/App/Registration/OfflineRegister.js \
-    /datto/web/vintage/js/App/Registration/OfflineRegister.js || return 1
+  # 5.6.x serves the wizard from commonlookandfeel/ and vintage/ copies.
+  local layout
+  for layout in commonlookandfeel vintage; do
+    [ -d "/datto/web/$layout/js/App" ] || continue
+    install -d -m 0755 "/datto/web/$layout/js/App/Registration" || return 1
+    cp -a /datto/web/js/App/Registration/OfflineRegister.js \
+      "/datto/web/$layout/js/App/Registration/OfflineRegister.js" || return 1
+  done
 
   local f asset
   for f in \
     /usr/lib/datto/device/templates/commonlookandfeel/Registration/Register/index.html.twig \
-    /usr/lib/datto/device/templates/vintage/Registration/Register/index.html.twig; do
+    /usr/lib/datto/device/templates/vintage/Registration/Register/index.html.twig \
+    /usr/lib/datto/device/templates/Registration/Register/index.html.twig; do
     [ -f "$f" ] || continue
+    case "$f" in
+      */templates/commonlookandfeel/*) asset=commonlookandfeel/ ;;
+      */templates/vintage/*) asset=vintage/ ;;
+      *) asset= ;;
+    esac
     if ! grep -q 'OfflineRegister.js' "$f"; then
-      if [[ "$f" == *commonlookandfeel* ]]; then asset=commonlookandfeel; else asset=vintage; fi
-      sed -i "/RegisterWizard\.js/a\\    <script type=\"text/javascript\" src=\"{{ asset('$asset/js/App/Registration/OfflineRegister.js') }}\"></script>" "$f" || return 1
+      sed -i "/RegisterWizard\.js/a\\    <script type=\"text/javascript\" src=\"{{ asset('${asset}js/App/Registration/OfflineRegister.js') }}\"></script>" "$f" || return 1
     fi
     # Recovera checks the signed channel during registration: enable the
     # native update pane in place and let OfflineRegister.js re-point it.
@@ -866,7 +900,7 @@ JS
     { find /var/cache/datto/device/prod/twig -type f -name '*.php' -exec \
       grep -lZ 'Registration/Register/index.html.twig' {} + 2>/dev/null || true; } | xargs -0 -r rm -f || return 1
   fi
-  systemctl restart php8.1-fpm >/dev/null 2>&1 || return 1
+  systemctl restart "$(php_fpm_unit)" >/dev/null 2>&1 || return 1
 }
 
 generate_local_tls_certificate() {
@@ -942,13 +976,18 @@ p45_conffiles() {
   for f in hosts bash.bashrc; do
     [ -e "$STATE_DIR/target-base/$f" ] && cp -a "$STATE_DIR/target-base/$f" "/etc/$f"
   done
+  if ! awk -v host="$(hostname)" '{ for (i = 2; i <= NF; i++) if ($i == host) found = 1 } END { exit !found }' /etc/hosts; then
+    printf '127.0.1.1 %s\n' "$(hostname)" >> /etc/hosts || return 1
+  fi
 
   # Telegraf was only the secondary socket owner. Apache already runs as
   # www-data, so use that group and do not retain a telemetry-only dependency.
-  if [ -f /etc/php/8.1/fpm/pool.d/siris.conf ]; then
+  local fpm_pool
+  for fpm_pool in /etc/php/8.3/fpm/pool.d/siris.conf /etc/php/8.1/fpm/pool.d/siris.conf; do
+    [ -f "$fpm_pool" ] || continue
     sed -Ei 's/^([[:space:]]*listen\.group[[:space:]]*=[[:space:]]*)telegraf([[:space:]]*)$/\1www-data\2/' \
-      /etc/php/8.1/fpm/pool.d/siris.conf || return 1
-  fi
+      "$fpm_pool" || return 1
+  done
   rm -f /etc/default/grub.d/99-ubuntu-fips.cfg \
     /etc/init.d/falcon-sensor \
     /etc/logrotate.d/falcon-sensor \
@@ -1103,6 +1142,9 @@ EOF
 p75_protection_engine() {
   [ "$REQUIRE_KVM" = yes ] || { log "KVM protection-engine check disabled in setup.conf"; return 0; }
   kvm_ready || { log "KVM is not available; agentless VM protection cannot run"; return 1; }
+  if [ "${VERSION_ID:-}" = 24.04 ]; then
+    p75_noble_runtime || return 1
+  fi
   local test_log=/var/log/recovera-libguestfs-test.log
   log "testing the libguestfs/KVM disk-inspection engine (log: $test_log)"
   timeout 180 libguestfs-test-tool > "$test_log" 2>&1 || {
@@ -1116,6 +1158,40 @@ p75_protection_engine() {
   install -d -m 0755 /var/lib/recovera
   touch /var/lib/recovera/libguestfs-self-test-passed
   log "libguestfs/KVM disk-inspection engine passed"
+}
+
+# Ubuntu 24.04 only: runtime fixes validated with the 5.12.x application packages.
+p75_noble_runtime() {
+  # Remove the optional Xen 4.16 driver carried by the source appliance. It is
+  # ABI-incompatible with Noble and prevents the healthy QEMU driver starting.
+  rm -f /usr/lib64/libvirt/connection-driver/libvirt_driver_libxl.so
+  systemctl reset-failed libvirtd.service libvirtd.socket libvirtd-ro.socket \
+    libvirtd-admin.socket >/dev/null 2>&1 || true
+  systemctl restart libvirtd.socket libvirtd-ro.socket libvirtd-admin.socket || return 1
+  virsh -c qemu:///system version >/dev/null || return 1
+
+  # Keep Noble's loopback resolver while binding restore DHCP/DNS only to
+  # appliance interfaces.
+  install -d -m 0755 /etc/dnsmasq.d || return 1
+  install -m 0644 "$INSTALL_DIR/recovera-dnsmasq.conf" \
+    /etc/dnsmasq.d/recovera.conf || return 1
+  systemctl reset-failed dnsmasq.service >/dev/null 2>&1 || true
+  systemctl restart dnsmasq.service || return 1
+
+  # Avoid targetctl's obsolete Python kmod fallback by loading configfs target
+  # support before its restore operation.
+  install -d -m 0755 /etc/systemd/system/target.service.d || return 1
+  rm -f /etc/systemd/system/target.service.d/recovera.conf || return 1
+  install -m 0644 "$INSTALL_DIR/target-recovera.conf" \
+    /etc/systemd/system/target.service.d/zz-recovera.conf || return 1
+  systemctl daemon-reload || return 1
+  modprobe target_core_mod || return 1
+  systemctl reset-failed target.service >/dev/null 2>&1 || true
+  systemctl restart target.service || return 1
+  if [ -s /etc/mercuryftp/mercuryftp.conf ]; then
+    systemctl reset-failed mercuryftp.service >/dev/null 2>&1 || true
+    systemctl restart mercuryftp.service || return 1
+  fi
 }
 
 p76_backup_admin() {
@@ -1201,6 +1277,17 @@ p77_recovera_branding() {
   python3 "$INSTALL_DIR/branding/apply-branding.py" \
     "$INSTALL_DIR/branding/recovera-logo.png" || return 1
   python3 "$INSTALL_DIR/branding/apply-peer-ui.py" || return 1
+  # The flat (5.12.x) web UI compiles routes into Symfony's production cache.
+  # Rebuild it after adding Recovera controllers so the Configure pages are
+  # available immediately. 5.6.x rebuilds from the cleared cache on demand.
+  if [ ! -d /usr/lib/datto/device/templates/commonlookandfeel ] && \
+     [ -f /usr/lib/datto/device/app/console.php ]; then
+    (
+      cd /usr/lib/datto/device || exit 1
+      php app/console.php cache:clear --env=prod --no-warmup >/dev/null &&
+        php app/console.php cache:warmup --env=prod >/dev/null
+    ) || return 1
+  fi
   install -d -m 0755 /usr/local/share/recovera || return 1
   install -m 0644 "$INSTALL_DIR/branding/recovera-ascii.logo" \
     /usr/local/share/recovera/recovera-ascii.logo || return 1
@@ -1214,7 +1301,7 @@ p77_recovera_branding() {
   fi
   install -m 0755 "$INSTALL_DIR/branding/recovera-motd" \
     /etc/update-motd.d/25-recovera || return 1
-  systemctl restart php8.1-fpm >/dev/null 2>&1 || return 1
+  systemctl restart "$(php_fpm_unit)" >/dev/null 2>&1 || return 1
   log "Recovera WebUI, console, and login branding installed"
 }
 
@@ -1318,7 +1405,8 @@ PY
   systemctl restart ssh.service || return 1
   systemctl enable recovera-peer.service recovera-peer-sync.timer >/dev/null || return 1
   systemctl restart recovera-peer.service recovera-peer-sync.timer || return 1
-  systemctl reload apache2 || return 1
+  systemctl reset-failed apache2.service >/dev/null 2>&1 || true
+  systemctl restart apache2.service || return 1
   log "Recovera pairing is available through HTTPS 443; replication uses restricted SSH and the internal API uses a Unix socket"
 }
 
@@ -1548,7 +1636,7 @@ verify() {
   check "password SSH is enabled only for backup-admin"     "[ \"\$(sshd -T -C user=backup-admin,host=localhost,addr=127.0.0.1 | awk '/^passwordauthentication /{print \$2}')\" = yes ] && [ \"\$(sshd -T -C user=root,host=localhost,addr=127.0.0.1 | awk '/^passwordauthentication /{print \$2}')\" = no ]"
   check "snapctl works"                                    "snapctl --version"
   check "SpeedSync recognizes the local Recovera device"   "timeout 10 speedsync version"
-  check "php8.1-fpm active (/run/php)"                     "systemctl is-active php8.1-fpm"
+  check "PHP-FPM active (/run/php)"                        "systemctl is-active \"\$(php_fpm_unit)\""
   check "legacy cloud control plane is isolated"          "/usr/local/sbin/recovera-cloud-isolation verify"
   # libvirtd is socket-activated with --timeout 120, so "inactive" is normal; ask it instead
   check "libvirt answers (virsh version)"                  "virsh -c qemu:///system version"
