@@ -22,6 +22,10 @@ for path in \
   /var/lib/recovera-peer \
   /etc/apache2/ssl \
   /etc/NetworkManager/system-connections \
+  /var/lib/NetworkManager/secret_key \
+  /etc/timezone \
+  /etc/localtime \
+  /etc/systemd/timesyncd.conf.d \
   /etc/machine-id \
   /etc/hostname \
   /etc/hosts \
