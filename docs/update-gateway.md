@@ -155,7 +155,14 @@ space in the cache. It contains no tokens.
   out-of-range requests get 416. Appliances use this to resume an interrupted
   image part instead of restarting it.
 
-Monitor `/healthz` externally at every location. Also perform an authenticated
-channel check; `/healthz` intentionally proves only that the process is alive.
+Monitor `/healthz` externally at every location. `/healthz` intentionally
+proves only that the process is alive; `/readyz` answers 200 only when the last
+synchronization was recent and every configured channel succeeded (503
+otherwise), without saying more. Also perform an authenticated channel check.
+
+The gateways also serve `jammy-noble-candidate-transition`, a non-production
+channel for testing an operating-system image through both gateways with a
+test appliance's token before the production `jammy-noble-transition` pointer
+changes. Production tokens do not list it.
 Test failover quarterly by making the first configured hostname unreachable
 and running `sudo recovera-upgrade check` on a non-production appliance.

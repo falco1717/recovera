@@ -12,6 +12,7 @@ from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 GATEWAY = ROOT / "gateway"
+NEW_CHANNELS = "stable jammy-noble-transition noble-stable jammy-noble-candidate-transition"
 
 
 def load_auth():
@@ -183,9 +184,9 @@ class RecoveraGatewayGitHubTests(unittest.TestCase):
 
     def test_saltbox_gateways_serve_the_os_upgrade_channels(self):
         for name in ("compose.saltbox.yaml", "compose.yaml"):
-            self.assertIn("stable jammy-noble-transition noble-stable", (GATEWAY / name).read_text())
-        self.assertIn("stable jammy-noble-transition noble-stable", (GATEWAY / "install-saltbox.sh").read_text())
-        for channel in ("jammy-noble-transition", "noble-stable"):
+            self.assertIn(NEW_CHANNELS, (GATEWAY / name).read_text())
+        self.assertIn(NEW_CHANNELS, (GATEWAY / "install-saltbox.sh").read_text())
+        for channel in ("jammy-noble-transition", "noble-stable", "jammy-noble-candidate-transition"):
             pointer = json.loads((ROOT / "upgrade" / "channels" / f"{channel}.json").read_text())
             self.assertEqual(pointer["channel"], channel)
             self.assertEqual(pointer["schema"], 1)
@@ -365,6 +366,24 @@ class RecoveraGatewayCacheTests(unittest.TestCase):
             self.assertEqual(status["channels"]["stable"]["sequence"], 1)
             self.assertIn("free_bytes", status["cache"])
             self.assertNotIn("token", json.dumps(status).lower())
+
+    def test_ready_only_when_every_channel_synced_recently(self):
+        import time as clock
+        with tempfile.TemporaryDirectory() as directory:
+            cache = self.make_cache(directory, channels=("stable", "noble-stable"))
+            cache.configuration.sync_interval = 900
+            self.assertFalse(cache.ready())
+            ok = {"last_success": 1, "last_error": None}
+            status = {"time": int(clock.time()), "channels": {"stable": ok, "noble-stable": ok}}
+            cache.status_path().write_text(json.dumps(status))
+            self.assertTrue(cache.ready())
+            status["channels"]["noble-stable"] = {"last_success": 1, "last_error": "GitHub is unreachable"}
+            cache.status_path().write_text(json.dumps(status))
+            self.assertFalse(cache.ready())
+            status["channels"]["noble-stable"] = ok
+            status["time"] = int(clock.time()) - 4 * 900
+            cache.status_path().write_text(json.dumps(status))
+            self.assertFalse(cache.ready())
 
     def test_release_larger_than_free_space_is_refused(self):
         with tempfile.TemporaryDirectory() as directory:

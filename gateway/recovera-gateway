@@ -326,6 +326,25 @@ class Cache:
     def status_path(self):
         return self.configuration.cache / "status.json"
 
+    def ready(self):
+        """True when the last synchronization was recent and every channel succeeded.
+
+        /healthz proves only that the process is alive; this proves the cache
+        is current. Details stay in `recovera-gateway status`.
+        """
+        try:
+            status = json.loads(self.status_path().read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return False
+        interval = getattr(self.configuration, "sync_interval", 900)
+        if time.time() - int(status.get("time", 0)) > 3 * interval + 300:
+            return False
+        channels = status.get("channels") or {}
+        return all(
+            (channels.get(name) or {}).get("last_success") and not (channels.get(name) or {}).get("last_error")
+            for name in self.configuration.channels
+        )
+
     def record_status(self, results):
         try:
             previous = json.loads(self.status_path().read_text(encoding="utf-8"))
@@ -602,6 +621,10 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
                 return
             if parsed.path == "/healthz":
                 self.reply_json(200, {"ok": True})
+                return
+            if parsed.path == "/readyz":
+                ready = self.cache.ready()
+                self.reply_json(200 if ready else 503, {"ready": ready})
                 return
             channel_match = CHANNEL_PATH_RE.fullmatch(parsed.path)
             if channel_match:
