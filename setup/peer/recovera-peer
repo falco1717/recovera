@@ -115,6 +115,10 @@ TRANSFER_DIR = STATE_DIR / "transfers"
 PROC_ROOT = Path(os.environ.get("RECOVERA_PROC_ROOT", "/proc"))
 TRANSFER_RECORD_MAX_AGE = 24 * 3600
 NETWORK_CHECK_PATH = STATE_DIR / "network-check.json"
+# Present while the appliance is being drained for maintenance (for example an
+# operating-system transition). It lives in /run, so a reboot always clears it.
+MAINTENANCE_PATH = Path(os.environ.get("RECOVERA_MAINTENANCE", "/run/recovera/maintenance"))
+OS_RELEASE_PATH = Path(os.environ.get("RECOVERA_OS_RELEASE", "/etc/os-release"))
 DEFAULT_UPDATE_HOST = "api.github.com"
 # Transport compression for replication streams, negotiated per transfer.
 # --adapt raises the level on slow WAN links and lowers it on fast LANs.
@@ -1509,7 +1513,113 @@ def asset_info_received(source_id: str, asset: str) -> dict[str, Any]:
             token = result.stdout.decode().strip()
     return {"ok": True, "exists": zfs_exists(dataset), "snapshots": zfs_snapshots(dataset),
             "resume_token": token or None, "storage": storage_status(cfg),
-            "appliance_name": appliance_name(cfg), "stream_codecs": local_stream_codecs()}
+            "appliance_name": appliance_name(cfg), "stream_codecs": local_stream_codecs(),
+            "os_version_id": os_version_id(), "zfs_version": zfs_versions()}
+
+
+def os_version_id() -> str | None:
+    """VERSION_ID from os-release, e.g. 22.04."""
+    with contextlib.suppress(OSError):
+        for line in OS_RELEASE_PATH.read_text().splitlines():
+            if line.startswith("VERSION_ID="):
+                return line.split("=", 1)[1].strip().strip('"') or None
+    return None
+
+
+def zfs_versions() -> dict[str, str | None]:
+    """ZFS userland and kernel-module versions (they can differ, e.g. HWE kernels)."""
+    versions: dict[str, str | None] = {"userland": None, "kmod": None}
+    with contextlib.suppress(Exception):
+        result = run(["zfs", "version"], check=False, timeout=10)
+        for line in result.stdout.decode("utf-8", "replace").split():
+            if line.startswith("zfs-kmod-"):
+                versions["kmod"] = line.removeprefix("zfs-kmod-")
+            elif line.startswith("zfs-"):
+                versions["userland"] = line.removeprefix("zfs-")
+    return versions
+
+
+def maintenance_status() -> dict[str, Any] | None:
+    """The active maintenance hold, or None."""
+    if not MAINTENANCE_PATH.exists():
+        return None
+    value = load_json(MAINTENANCE_PATH, {})
+    if not isinstance(value, dict):
+        value = {}
+    return {"reason": str(value.get("reason") or "maintenance"), "since": value.get("since")}
+
+
+def require_not_in_maintenance() -> None:
+    hold = maintenance_status()
+    if hold:
+        raise PeerError(f"this appliance is in maintenance ({hold['reason']}); "
+                        "replication resumes automatically when it ends")
+
+
+def replication_busy() -> list[str]:
+    """Describe replication work still running on this appliance."""
+    busy = []
+    LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with LOCK_PATH.open("a") as handle:
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            busy.append("an outbound replication run is active")
+    try:
+        pids = sorted(int(entry.name) for entry in PROC_ROOT.iterdir() if entry.name.isdigit())
+    except OSError:
+        pids = []
+    for pid in pids:
+        found = _zfs_transfer_process(_proc_cmdline(pid))
+        if found and found[0] == "inbound":
+            busy.append(f"receiving {found[1]} (pid {pid})")
+    return busy
+
+
+def maintenance_on(reason: str, wait_seconds: int = 0, poll: float = 10.0) -> dict[str, Any]:
+    """Stop new replication, then wait for running transfers to finish.
+
+    New outbound runs and inbound receives are refused at once. Transfers that
+    are already running are left alone: they finish, or an operator stops
+    recovera-peer-sync.service and the transfer resumes from its token later.
+    """
+    require_root()
+    reason = " ".join(str(reason or "maintenance").split())[:200] or "maintenance"
+    current = maintenance_status()
+    MAINTENANCE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    atomic_json(MAINTENANCE_PATH, {"reason": reason,
+                                   "since": (current or {}).get("since") or int(time.time())},
+                mode=0o644)
+    if not current:
+        event("maintenance-started", f"Replication paused for maintenance: {reason}")
+    deadline = time.monotonic() + max(0, wait_seconds)
+    busy = replication_busy()
+    while busy and time.monotonic() < deadline:
+        time.sleep(min(poll, max(0.0, deadline - time.monotonic())))
+        busy = replication_busy()
+    return {"maintenance": maintenance_status(), "idle": not busy, "busy": busy}
+
+
+def maintenance_off() -> dict[str, Any]:
+    require_root()
+    was = maintenance_status()
+    MAINTENANCE_PATH.unlink(missing_ok=True)
+    if was:
+        event("maintenance-ended", "Replication resumed after maintenance")
+    return {"maintenance": None, "was": was}
+
+
+def php_fpm_service() -> str:
+    """The installed PHP-FPM unit (php8.1-fpm on 22.04, php8.3-fpm on 24.04)."""
+    with contextlib.suppress(Exception):
+        result = run(["systemctl", "list-unit-files", "--no-legend", "--plain", "php*-fpm.service"],
+                     check=False, timeout=15)
+        found = re.findall(r"^php([0-9]+)\.([0-9]+)-fpm\.service\s",
+                           result.stdout.decode("utf-8", "replace"), re.MULTILINE)
+        if found:
+            major, minor = max(found, key=lambda item: (int(item[0]), int(item[1])))
+            return f"php{major}.{minor}-fpm.service"
+    return "php8.1-fpm.service"
 
 
 def storage_status(cfg: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -1536,6 +1646,9 @@ def ssh_entry(source_id: str) -> None:
     if not argv:
         raise PeerError("a replication command is required")
     command = argv.pop(0)
+    if command in ("asset-info", "receive", "receive-resume"):
+        # The source keeps its resume token and retries on its next run.
+        require_not_in_maintenance()
     if command == "asset-info" and len(argv) == 1:
         answer = asset_info_received(source_id, argv[0])
     elif command == "receive" and len(argv) in (4, 5):
@@ -1649,6 +1762,8 @@ def queued_sync(speed: int) -> list[dict[str, Any]]:
 
 def configured_sync() -> list[dict[str, Any]]:
     require_root()
+    if maintenance_status():
+        return [{"ok": True, "status": "paused-for-maintenance"}]
     cfg, results, now, current = config(), [], int(time.time()), state()
     speed = schedule_speed(now)
     if speed < 0:
@@ -1924,6 +2039,7 @@ def start_background_sync() -> dict[str, Any]:
     it to the web API, so a routine service restart (such as after an update)
     cut the transfer. recovera-peer-sync.service is never restarted by updates.
     """
+    require_not_in_maintenance()
     running = False
     LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
     # Probe the worker lock; closing the file releases the probe immediately.
@@ -2291,6 +2407,7 @@ def replication_activity() -> dict[str, Any]:
             "snapshot": item.get("snapshot"), "updated": item.get("updated"),
         })
     return {"generated": now, "appliance": appliance_name(cfg), "active": active,
+            "maintenance": maintenance_status(),
             "recent_outbound": recent_outbound, "recent_inbound": recent_inbound,
             "paired": {"targets": len(peers), "sources": len(sources)}}
 
@@ -2413,7 +2530,7 @@ def upgrade_install() -> dict[str, Any]:
     # response so the updater can commit its transaction first.
     run([
         "systemd-run", "--quiet", "--collect", "--unit=recovera-post-update-restart",
-        "--on-active=5s", "/bin/systemctl", "restart", "php8.1-fpm.service",
+        "--on-active=5s", "/bin/systemctl", "restart", php_fpm_service(),
         "recovera-peer.service", "recovera-peer-sync.timer",
     ], check=False, timeout=15)
     message = result.stdout.decode("utf-8", "replace").strip()
@@ -2653,6 +2770,10 @@ def parser() -> argparse.ArgumentParser:
     rep = sub.add_parser("replicate"); rep.add_argument("asset"); rep.add_argument("--peer", required=True); rep.add_argument("--snapshot")
     sync = sub.add_parser("sync"); sync.add_argument("--all", action="store_true", required=True)
     entry = sub.add_parser("ssh-entry"); entry.add_argument("source_id")
+    hold = sub.add_parser("maintenance", help="pause replication and drain running transfers")
+    hold.add_argument("action", choices=("on", "off", "status"))
+    hold.add_argument("--reason", default="maintenance")
+    hold.add_argument("--wait", type=int, default=0, help="seconds to wait for running transfers")
     return result
 
 
@@ -2684,6 +2805,13 @@ def main() -> int:
         elif args.command == "sync":
             with sync_lock(): print(json.dumps({"results": configured_sync()}, indent=2))
         elif args.command == "ssh-entry": ssh_entry(args.source_id)
+        elif args.command == "maintenance":
+            if args.action == "on":
+                answer = maintenance_on(args.reason, args.wait)
+                print(json.dumps(answer, indent=2))
+                return 0 if answer["idle"] else 4
+            if args.action == "off": print(json.dumps(maintenance_off(), indent=2))
+            else: print(json.dumps({"maintenance": maintenance_status(), "busy": replication_busy()}, indent=2))
         return 0
     except Exception as exc:
         if args.command == "ssh-entry": print(json.dumps({"ok": False, "error": str(exc)}, separators=(",", ":")))

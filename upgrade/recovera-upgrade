@@ -34,6 +34,11 @@ PENDING_MARKER = Path("/host/recovera/pending")
 DEFAULT_PACKAGE_CACHE = Path("/var/cache/recovera-upgrade/packages")
 DEFAULT_TRANSACTION_ROOT = Path("/var/lib/recovera-upgrade/transactions")
 DEFAULT_LOCK = Path("/run/lock/recovera-upgrade.lock")
+DEFAULT_OS_RELEASE = Path("/etc/os-release")
+# Appliances on this release keep the historical, unprefixed channel names
+# (stable.json). Every other OS release reads "<codename>-<channel>".
+LEGACY_OS = ("ubuntu", "22.04")
+PHP_FPM_SERVICE_RE = re.compile(r"^php(?:[0-9]+\.[0-9]+)?-fpm(?:\.service)?$")
 FORBIDDEN_PACKAGE_RE = re.compile(
     r"^(?:linux-(?:image|headers|modules|tools)|grub|shim|initramfs-tools|"
     r"systemd|libc6|zfs(?:utils|initramfs|dkms|modules)?)(?:[-:].*)?$"
@@ -96,6 +101,56 @@ def read_config(path):
         if not config.get(required):
             raise UpgradeError(f"missing {required} in {path}")
     return config
+
+
+def local_os():
+    """Identify the running OS from os-release (ID, VERSION_ID, VERSION_CODENAME)."""
+    path = Path(os.environ.get("RECOVERA_OS_RELEASE", DEFAULT_OS_RELEASE))
+    values = {}
+    try:
+        lines = path.read_text().splitlines()
+    except OSError as exc:
+        raise UpgradeError(f"cannot identify the operating system from {path}: {exc}") from exc
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        values[key.strip()] = value.strip().strip('"').strip("'")
+    return {
+        "id": values.get("ID", ""),
+        "version_id": values.get("VERSION_ID", ""),
+        "codename": values.get("VERSION_CODENAME", ""),
+    }
+
+
+def effective_channel(channel, os_info):
+    """Map the administrator's channel (e.g. stable) to this OS release's channel."""
+    if (os_info.get("id"), os_info.get("version_id")) == LEGACY_OS:
+        return channel
+    codename = str(os_info.get("codename", ""))
+    if not re.fullmatch(r"[a-z][a-z0-9]{1,15}", codename):
+        raise UpgradeError("cannot determine this operating system's release codename")
+    prefix = codename + "-"
+    return channel if channel.startswith(prefix) else prefix + channel
+
+
+def check_manifest_os(manifest, os_info=None):
+    """Refuse a package release built for a different OS release."""
+    os_info = os_info or local_os()
+    target = manifest.get("os")
+    if target is None:
+        # Releases before 0.6.36 carry no OS and were all built for 22.04.
+        if (os_info.get("id"), os_info.get("version_id")) == LEGACY_OS:
+            return
+        raise UpgradeError("package release does not declare its operating system")
+    if not isinstance(target, dict) or set(target) != {"id", "version_id"}:
+        raise UpgradeError("package release contains an invalid operating system")
+    if (str(target["id"]), str(target["version_id"])) != (os_info.get("id"), os_info.get("version_id")):
+        raise UpgradeError(
+            f"package release is for {target['id']} {target['version_id']}; this appliance runs "
+            f"{os_info.get('id') or 'unknown'} {os_info.get('version_id') or 'unknown'}"
+        )
 
 
 def config_path(config, name, default):
@@ -446,6 +501,7 @@ def validate_manifest(manifest, pointer, config):
         validate_image_manifest(manifest)
     elif release_type == "package":
         validate_package_manifest(manifest)
+        check_manifest_os(manifest)
     else:
         raise UpgradeError("unknown release type")
     return manifest
@@ -752,8 +808,34 @@ def verify_package_plan(debs):
         raise UpgradeError("package plan contains unsigned or unlisted packages: " + " ".join(unexpected))
 
 
+def installed_php_fpm_services():
+    """Installed phpX.Y-fpm units, newest PHP first."""
+    result = run(["systemctl", "list-unit-files", "--no-legend", "--plain", "php*-fpm.service"],
+                 check=False, capture=True)
+    found = re.findall(r"^(php([0-9]+)\.([0-9]+)-fpm\.service)\s",
+                       result.stdout.decode("utf-8", "replace"), re.MULTILINE)
+    found.sort(key=lambda item: (int(item[1]), int(item[2])), reverse=True)
+    return [name for name, _, _ in found]
+
+
 def required_services(config):
-    return config.get("REQUIRED_SERVICES", "").split()
+    """REQUIRED_SERVICES with PHP-FPM resolved to the installed version.
+
+    "php-fpm.service" (or a phpX.Y-fpm unit that is no longer installed after
+    an OS release upgrade) means whichever PHP-FPM unit this appliance has.
+    """
+    services = []
+    php_units = None
+    for name in config.get("REQUIRED_SERVICES", "").split():
+        if PHP_FPM_SERVICE_RE.fullmatch(name):
+            if php_units is None:
+                php_units = installed_php_fpm_services()
+            unit = name if name.endswith(".service") else name + ".service"
+            if unit not in php_units and php_units:
+                name = php_units[0]
+        if name not in services:
+            services.append(name)
+    return services
 
 
 def validate_services(config):
@@ -1043,6 +1125,9 @@ def main():
     os.environ["NEEDRESTART_SUSPEND"] = "1"
     try:
         config = read_config(args.config)
+        if args.command in ("check", "install"):
+            config["CHANNEL_REQUESTED"] = config["CHANNEL"]
+            config["CHANNEL"] = effective_channel(config["CHANNEL"], local_os())
         return {
             "check": command_check,
             "install": command_install,

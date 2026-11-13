@@ -35,7 +35,13 @@ download only entries whose installed versions differ. Follow
 1. Put the channel's complete current application `.deb` set and every offline
    dependency in a clean directory. The appliance will skip unchanged files.
 2. Increment the human version and the global monotonic release sequence.
-3. Build the schema-2 manifest with `tools/build-package-release.sh`.
+   The sequence is one counter shared by every channel; the builder refuses a
+   sequence that is not above the highest one in `upgrade/channels/*.json`, and
+   it must also be above every published but unpromoted release.
+3. Build the schema-2 manifest with `tools/build-package-release.sh`. Pass
+   `--os-version` (default `22.04`). The manifest records
+   `"os": {"id": "ubuntu", "version_id": ...}` and updaters from 0.6.36 refuse a
+   release built for a different OS release.
 4. Sign the manifest on the isolated release workstation and verify every
    digest on a second machine.
 5. Test installation and forced rollback on both disposable appliances.
@@ -45,6 +51,21 @@ download only entries whose installed versions differ. Follow
 
 Platform, boot, kernel, libc, systemd, and ZFS packages are not valid routine
 updates. Ship those through the image path.
+
+### Channels per OS release
+
+The administrator's update channel is `stable` everywhere. The updater maps it
+to the channel for the running OS release:
+
+| Appliance OS | Pointer file | Manifest `channel` |
+|---|---|---|
+| Ubuntu 22.04 | `upgrade/channels/stable.json` (unchanged) | `stable` |
+| Ubuntu 24.04 | `upgrade/channels/noble-stable.json` | `noble-stable` |
+
+Build a 24.04 release with `--os-version 24.04` (channel `noble-stable` by
+default). Gateway tokens are per channel: a token used by 24.04 appliances, or
+by an appliance that will be moved to 24.04, must also authorize
+`noble-stable`.
 
 ## Appliance image release
 

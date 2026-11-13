@@ -127,6 +127,23 @@ Appliances identify each other by their current device name (the hostname set
 by **Name the Device**), refreshed on every transfer, followed by their
 address.
 
+## Maintenance hold
+
+`sudo recovera-peer maintenance on --reason "..." [--wait SECONDS]` pauses
+replication on an appliance, for example before an operating-system change:
+
+- scheduled and **Synchronize now** runs send nothing;
+- paired sources are refused (`asset-info` and receives). They keep their
+  resume token and retry with their normal back-off, at most an hour apart;
+- the automatic update window skips this appliance.
+
+Transfers already running are not interrupted. `--wait` waits up to that many
+seconds for them to finish and exits with status 4 if any are still running,
+listing them. To stop one early, stop `recovera-peer-sync.service`; it resumes
+from its token later. `maintenance status` shows the hold and running work, and
+`maintenance off` ends it. The hold lives in `/run/recovera/maintenance`, so a
+reboot clears it. The Synchronize panel shows when a hold is active.
+
 ## Connectivity check
 
 **Configure → Networking → Run Outbound Connectivity Check** runs Recovera's

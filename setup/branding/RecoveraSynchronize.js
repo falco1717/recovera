@@ -189,6 +189,16 @@
         note.style.cssText = 'color:#6c757d;font-size:.9em;';
         body.appendChild(note);
 
+        if (data.maintenance) {
+            var hold = el('div', null, 'Replication is paused for maintenance (' +
+                (data.maintenance.reason || 'maintenance') + ')' +
+                (data.maintenance.since ? ' since ' + when(data.maintenance.since) : '') +
+                '. Transfers resume from where they stopped when it ends.');
+            hold.style.cssText = 'margin-top:8px;padding:8px 10px;border-radius:4px;' +
+                'background:#fff3cd;color:#664d03;';
+            body.appendChild(hold);
+        }
+
         var active = data.active || {};
         var outbound = active.outbound || [];
         var inbound = active.inbound || [];
