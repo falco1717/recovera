@@ -199,7 +199,10 @@ resize2fs "$image"
 e2fsck -fy "$image"
 
 compressed=$OUTPUT/recovera-$VERSION.img.xz
-xz -T0 "-$COMPRESSION_LEVEL" -c "$image" > "$compressed"
+# Unbounded -T0 starts one ~160 MB encoder per core; on a busy build host that
+# exhausted memory and the kernel killed xz. Within the limit xz reduces its
+# thread count itself, and the output does not depend on the thread count.
+xz -T0 --memlimit-compress="${RECOVERA_XZ_MEMLIMIT:-1GiB}" "-$COMPRESSION_LEVEL" -c "$image" > "$compressed"
 rm -f "$OUTPUT"/recovera-$VERSION.img.xz.part-*
 split -b "$PART_SIZE" -d -a 3 "$compressed" "$OUTPUT/recovera-$VERSION.img.xz.part-"
 
