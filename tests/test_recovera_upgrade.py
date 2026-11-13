@@ -1123,7 +1123,8 @@ class RecoveraUpgradeTests(unittest.TestCase):
         builder = (ROOT / "tools" / "build-upgrade-image.sh").read_text()
         for value in ('"$mountpoint/etc/netplan"/90-NM-*.yaml', '"$mountpoint/root/.ssh/authorized_keys"',
                       '"$mountpoint/var/lib/NetworkManager/secret_key"', '"$mountpoint/etc/recovera/gateway-token"',
-                      'cloud-init.disabled', 'passwd -l ubuntu'):
+                      'cloud-init.disabled', 'passwd -l ubuntu',
+                      '"$mountpoint/etc/sudoers.d/90-cloud-init-users"'):
             self.assertIn(value, builder)
         migration = (ROOT / "upgrade" / "recovera-migrate-config").read_text()
         self.assertIn("for path in /etc/netplan/90-NM-*.yaml; do copy_path", migration)
