@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# One-command installer for an existing Ubuntu 22.04 amd64 VM.
+# One-command installer for an existing Ubuntu 22.04 or 24.04 amd64 VM (the bundle
+# decides which: 5.6.x packages are 22.04 builds, 5.12.x packages 24.04 builds).
 set -Eeuo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -12,7 +13,8 @@ usage() {
   cat <<'EOF'
 Usage: ./install.sh [--bundle PATH] [--check]
 
-Installs the complete Recovera appliance on an existing Ubuntu 22.04 amd64 VM.
+Installs the complete Recovera appliance on an existing Ubuntu 22.04 or 24.04
+amd64 VM, matching the bundle.
 
   --bundle PATH  Use a previously downloaded recovera-setup.tar.
   --check        Validate the VM and simulate package installation only.
@@ -101,7 +103,10 @@ if [ "$(id -u)" -ne 0 ]; then
 fi
 
 . /etc/os-release
-[ "${VERSION_ID:-}" = 22.04 ] || die "Ubuntu 22.04 is required (found ${PRETTY_NAME:-unknown})"
+case "${VERSION_ID:-}" in
+  22.04|24.04) ;;
+  *) die "Ubuntu 22.04 or 24.04 is required (found ${PRETTY_NAME:-unknown})" ;;
+esac
 [ "$(dpkg --print-architecture)" = amd64 ] || die "amd64 is required"
 
 work="$(mktemp -d /var/tmp/recovera-install.XXXXXX)"
@@ -128,6 +133,8 @@ install -m 0755 "$ROOT/setup/setup.sh" "$payload/setup.sh"
 install -m 0755 "$ROOT/setup/migrate-layout.sh" "$payload/migrate-layout.sh"
 install -m 0644 "$ROOT/setup/setup.conf" "$payload/setup.conf"
 install -m 0644 "$ROOT/setup/README.txt" "$payload/README.txt"
+install -m 0644 "$ROOT/setup/recovera-dnsmasq.conf" "$payload/recovera-dnsmasq.conf"
+install -m 0644 "$ROOT/setup/target-recovera.conf" "$payload/target-recovera.conf"
 rm -rf "$payload/wheels"
 cp -a "$ROOT/setup/wheels" "$payload/wheels"
 rm -rf "$payload/peer"

@@ -23,6 +23,17 @@ function curlRequest(array $arguments): string
     return (string) $output;
 }
 
+/** Read a Recovera-patched web file from the 5.6.x (commonlookandfeel/) or 5.12.x (flat) layout. */
+function recoveraWebFile(string $base, string $relative): string
+{
+    foreach (["$base/commonlookandfeel/$relative", "$base/$relative"] as $path) {
+        if (is_file($path)) {
+            return (string) file_get_contents($path);
+        }
+    }
+    return '';
+}
+
 $username = 'recovera_page_test_' . bin2hex(random_bytes(4));
 $password = bin2hex(random_bytes(18));
 $cookie = tempnam('/tmp', 'recovera-cookie-');
@@ -70,24 +81,17 @@ try {
     if (!str_ends_with($agents, "\n200") || !str_contains($agents, 'RecoveraProtectStatus.js')) {
         throw new RuntimeException('Protect page did not render successfully');
     }
-    $recoveryTemplate = (string) @file_get_contents(
-        '/usr/lib/datto/device/templates/commonlookandfeel/Assets/RecoveryPoints/index.html.twig');
-    $recoveryScript = (string) @file_get_contents(
-        '/datto/web/commonlookandfeel/js/App/Assets/RecoveraRecoveryPoints.js');
+    $recoveryTemplate = recoveraWebFile('/usr/lib/datto/device/templates', 'Assets/RecoveryPoints/index.html.twig');
+    $recoveryScript = recoveraWebFile('/datto/web', 'js/App/Assets/RecoveraRecoveryPoints.js');
     if (!str_contains($recoveryTemplate, 'RecoveraRecoveryPoints.js') ||
         !str_contains($recoveryScript, 'v1/device/snapshot/send')) {
         throw new RuntimeException('Native recovery-point queue bridge is not installed');
     }
-    $protectTemplate = (string) @file_get_contents(
-        '/usr/lib/datto/device/templates/commonlookandfeel/Agents/Add/index.html.twig');
-    $replicationTemplate = (string) @file_get_contents(
-        '/usr/lib/datto/device/templates/commonlookandfeel/Assets/Configure/cloud.backup.html.twig');
-    $protectScript = (string) @file_get_contents(
-        '/datto/web/commonlookandfeel/js/App/Agents/RecoveraProtectSystem.js');
-    $listTemplate = (string) @file_get_contents(
-        '/usr/lib/datto/device/templates/commonlookandfeel/Agents/List/index.html.twig');
-    $statusScript = (string) @file_get_contents(
-        '/datto/web/commonlookandfeel/js/App/Agents/RecoveraProtectStatus.js');
+    $protectTemplate = recoveraWebFile('/usr/lib/datto/device/templates', 'Agents/Add/index.html.twig');
+    $replicationTemplate = recoveraWebFile('/usr/lib/datto/device/templates', 'Assets/Configure/cloud.backup.html.twig');
+    $protectScript = recoveraWebFile('/datto/web', 'js/App/Agents/RecoveraProtectSystem.js');
+    $listTemplate = recoveraWebFile('/usr/lib/datto/device/templates', 'Agents/List/index.html.twig');
+    $statusScript = recoveraWebFile('/datto/web', 'js/App/Agents/RecoveraProtectStatus.js');
     if (!str_contains($protectTemplate, 'RecoveraProtectSystem.js') ||
         !str_contains($protectTemplate, 'recovera-protect-csrf') ||
         !str_contains($replicationTemplate, "inWizard or feature.isSupported('FEATURE_PEER_REPLICATION')") ||
@@ -98,10 +102,8 @@ try {
         !str_contains($statusScript, 'Replication destination')) {
         throw new RuntimeException('Protect a System replication integration is not installed');
     }
-    $homeTemplate = (string) @file_get_contents(
-        '/usr/lib/datto/device/templates/commonlookandfeel/Home/deviceInfo.block.html.twig');
-    $homeScript = (string) @file_get_contents(
-        '/datto/web/commonlookandfeel/js/App/Home/RecoveraHome.js');
+    $homeTemplate = recoveraWebFile('/usr/lib/datto/device/templates', 'Home/deviceInfo.block.html.twig');
+    $homeScript = recoveraWebFile('/datto/web', 'js/App/Home/RecoveraHome.js');
     if (!str_contains($homeTemplate, 'recovera-offsite-servers') ||
         !str_contains($homeTemplate, 'RecoveraHome.js') ||
         !str_contains($homeScript, '/api/recovera/offsite-target/status')) {

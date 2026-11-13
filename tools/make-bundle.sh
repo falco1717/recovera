@@ -22,12 +22,23 @@ echo "checking export checksums..."
 
 rm -rf "$B"; mkdir -p "$B/lists" "$B/debs"
 cp "$REPO/setup/setup.sh" "$REPO/setup/migrate-layout.sh" \
-  "$REPO/setup/setup.conf" "$REPO/setup/README.txt" "$B/"
+  "$REPO/setup/setup.conf" "$REPO/setup/README.txt" \
+  "$REPO/setup/recovera-dnsmasq.conf" "$REPO/setup/target-recovera.conf" "$B/"
 cp -r "$REPO/setup/wheels" "$B/wheels"
 cp -r "$REPO/setup/peer" "$B/peer"
 cp -r "$REPO/setup/branding" "$B/branding"
 cp -r "$REPO/setup/isolation" "$B/isolation"
+chmod 0755 "$B/isolation/recovera-cloud-isolation"
 cp -r "$REPO/upgrade" "$B/upgrade"
+chmod 0755 \
+  "$B/upgrade/recovera-upgrade" \
+  "$B/upgrade/recovera-upgrade-schedule" \
+  "$B/upgrade/recovera-image-boot" \
+  "$B/upgrade/recovera-migrate-config" \
+  "$B/upgrade/07_recovera_images" \
+  "$B/upgrade/initramfs-hook-recovera" \
+  "$B/upgrade/initramfs-local-top-recovera" \
+  "$B/upgrade/initramfs-local-bottom-recovera"
 sed -i 's/\r$//' "$B/setup.sh" "$B/setup.conf" "$B/README.txt"
 chmod 755 "$B/setup.sh" "$B/migrate-layout.sh"
 cp "$EXPORT/lists/manual.txt" "$EXPORT/lists/portable.txt" \
@@ -52,10 +63,20 @@ done < "$PRUNE"
 # establish the exact rollback baseline required by routine package updates.
 recovera_version=$(tr -d '[:space:]' < "$REPO/VERSION")
 [ -n "$recovera_version" ] || { echo "VERSION is empty"; exit 1; }
+# The source export may already contain an older locally built Recovera package
+# with a larger Debian revision.  Keeping both lets apt select that stale package
+# instead of the package built from this source tree.
+rm -f "$B"/debs/recovera-appliance_*.deb
 bash "$REPO/tools/build-recovera-appliance-deb.sh" \
   --version "${recovera_version}-1" --output "$B/debs" >/dev/null
 
-source_deb=$(find "$B/debs" -maxdepth 1 -name 'datto-siris-os-2_*.deb' -print -quit)
+source_deb=
+for candidate in "$B"/debs/*.deb; do
+  if [ "$(dpkg-deb -f "$candidate" Package 2>/dev/null || true)" = datto-siris-os-2 ]; then
+    source_deb=$candidate
+    break
+  fi
+done
 [ -n "$source_deb" ] || { echo "required base application package not found"; exit 1; }
 tmp=$(mktemp -d)
 cleanup() {
@@ -139,10 +160,10 @@ if [ -f "$B/conffiles/conffiles.tgz" ]; then
   # The application pool used Telegraf only as the secondary owner of its Unix
   # socket. Apache already runs as www-data, so keep the socket usable without
   # retaining a telemetry-only system group.
-  fpm_pool="$tmp/conffiles/etc/php/8.1/fpm/pool.d/siris.conf"
-  if [ -f "$fpm_pool" ]; then
+  for fpm_pool in "$tmp"/conffiles/etc/php/*/fpm/pool.d/siris.conf; do
+    [ -f "$fpm_pool" ] || continue
     sed -Ei 's/^([[:space:]]*listen\.group[[:space:]]*=[[:space:]]*)telegraf([[:space:]]*)$/\1www-data\2/' "$fpm_pool"
-  fi
+  done
 
   awk -F '\t' '
     NR == FNR { if ($0 !~ /^[[:space:]]*(#|$)/) prune[$1] = 1; next }
@@ -246,7 +267,7 @@ if [ -f "$B/conffiles/conffiles.tgz" ]; then
     echo "source host identity or unused host configuration survived" >&2
     exit 1
   fi
-  if tar -xOzf "$B/conffiles/conffiles.tgz" ./etc/php/8.1/fpm/pool.d/siris.conf 2>/dev/null |
+  if tar -xOzf "$B/conffiles/conffiles.tgz" --wildcards './etc/php/*/fpm/pool.d/siris.conf' 2>/dev/null |
      grep -Eq '^[[:space:]]*listen\.group[[:space:]]*=[[:space:]]*telegraf[[:space:]]*$'; then
     echo "Telegraf PHP-FPM socket group survived" >&2
     exit 1
@@ -266,11 +287,12 @@ for excluded in \
   lib/systemd/system/filebeat.service.d \
   lib/systemd/system/fluent-bit.service.d \
   lib/systemd/system/telegraf.service.d \
-  lib/systemd/system/wiz-sensor.service.d; do
+  lib/systemd/system/wiz-sensor.service.d \
+  usr/lib64/libvirt/connection-driver/libvirt_driver_libxl.so; do
   [ ! -e "$tmp/check/$excluded" ] || { echo "excluded path survived: $excluded"; exit 1; }
 done
-! grep -Eq '^[[:space:]]*listen\.group[[:space:]]*=[[:space:]]*telegraf[[:space:]]*$' \
-  "$tmp/check/etc/php/8.1/fpm/pool.d/siris.conf" || {
+! cat "$tmp"/check/etc/php/*/fpm/pool.d/siris.conf 2>/dev/null |
+  grep -Eq '^[[:space:]]*listen\.group[[:space:]]*=[[:space:]]*telegraf[[:space:]]*$' || {
     echo "Telegraf PHP-FPM socket group survived in application package"; exit 1;
   }
 ! grep -Eq '(telegraf package file list not found|systemctl preset[[:space:]\\]*(fluent-bit|telegraf|al-agent|filebeat))' \

@@ -46,12 +46,65 @@ raw = re.sub(r"\n[ \t]+", " ", match.group(1)).strip()
 requirements = [item.strip() for item in raw.split(",") if item.strip()]
 removed = [item for item in requirements if package_name(item) in pruned]
 kept = [item for item in requirements if package_name(item) not in pruned]
-if not removed:
-    die("no excluded dependencies were found in the source appliance package")
+if removed:
+    wrapped = "Depends: " + ",\n ".join(kept)
+    text = text[: match.start()] + wrapped + text[match.end() :]
+    control.write_text(text.rstrip("\n") + "\n", encoding="utf-8")
 
-wrapped = "Depends: " + ",\n ".join(kept)
-text = text[: match.start()] + wrapped + text[match.end() :]
-control.write_text(text, encoding="utf-8")
+# The source postinst enables every vendor unit in one xargs batch. Recovera
+# intentionally masks cloud/control-plane units, so GNU xargs returns 123 when
+# any preset command rejects a masked unit and the postinst's `set -e` aborts.
+# Preserve local unit setup while allowing those deliberate masks. Salt is also
+# excluded above and must not be passed to a later explicit preset call.
+postinst = root / "DEBIAN" / "postinst"
+if not postinst.is_file():
+    die("missing source package postinst")
+postinst_text = postinst.read_text(encoding="utf-8")
+# The status console's venv is installed while package operations are confined
+# to the offline repository. Reuse the distro/netifaces modules supplied by
+# Ubuntu and install only the bundled npyscreen wheel without resolving PyPI.
+venv_source = "python3 -m venv /opt/npyscreen-venv"
+venv_offline = "python3 -m venv --system-site-packages /opt/npyscreen-venv"
+if venv_source in postinst_text:
+    postinst_text = postinst_text.replace(venv_source, venv_offline, 1)
+elif venv_offline not in postinst_text:
+    die("expected npyscreen virtualenv creation in postinst")
+pip_source = (
+    "/opt/npyscreen-venv/bin/pip install --no-input "
+    "npyscreen==4.10.5 distro~=1.5 netifaces==0.10.6"
+)
+pip_offline = "/opt/npyscreen-venv/bin/pip install --no-input --no-deps npyscreen==4.10.5"
+if pip_source in postinst_text:
+    postinst_text = postinst_text.replace(pip_source, pip_offline, 1)
+elif pip_offline not in postinst_text:
+    die("expected npyscreen pip install in postinst")
+postinst_text, count = re.subn(
+    r"(ls /lib/systemd/system \| grep -E '\^datto-\.\+\(service\|timer\|target\|path\)\$' \| xargs -r -l systemctl preset)(?! \|\| true)",
+    r"\1 || true",
+    postinst_text,
+)
+if count == 0 and "xargs -r -l systemctl preset || true" not in postinst_text:
+    die(f"expected one vendor preset batch in postinst, found {count}")
+postinst_text, count = re.subn(
+    r"(?m)^([ \t]*)salt-minion\.service[ \t]*$",
+    "",
+    postinst_text,
+)
+if count == 0 and re.search(r"(?m)^[ \t]*salt-minion\.service[ \t]*$", postinst_text):
+    die(f"expected one salt-minion preset entry in postinst, found {count}")
+# Removing the following salt-minion line makes rly-client the last command in
+# the backslash-continued preset list. Drop that continuation and tolerate a
+# deliberately masked relay unit. Match the exact source form so a changed
+# upstream maintainer script fails closed instead of silently emitting a bad
+# package.
+rly_source = "            rly-client.service \\\n"
+rly_tolerated = "            rly-client.service || true\n"
+count = postinst_text.count(rly_source)
+if count == 0 and postinst_text.count(rly_tolerated) != 1:
+    die(f"expected one continued rly-client preset entry in postinst, found {count}")
+if count == 1:
+    postinst_text = postinst_text.replace(rly_source, rly_tolerated)
+postinst.write_text(postinst_text, encoding="utf-8")
 
 # Never clone the originating appliance's TLS/log-shipping private identity or
 # configuration/service units for packages intentionally excluded above.
@@ -72,6 +125,9 @@ removed_paths = (
     "lib/systemd/system/fluent-bit.service.d",
     "lib/systemd/system/telegraf.service.d",
     "lib/systemd/system/wiz-sensor.service.d",
+    # Recovera uses QEMU/KVM. This optional Xen 4.16 plug-in cannot resolve
+    # against Ubuntu 24.04's Xen ABI and makes libvirtd abort during discovery.
+    "usr/lib64/libvirt/connection-driver/libvirt_driver_libxl.so",
 )
 for relative in removed_paths:
     path = root / relative
@@ -83,9 +139,11 @@ for relative in removed_paths:
 # The application PHP-FPM pool assigned its socket to Telegraf solely so that
 # the removed telemetry agent could scrape statistics. Apache already connects
 # as www-data; make that the socket group and remove the stale explanation.
-fpm_pool = root / "etc" / "php" / "8.1" / "fpm" / "pool.d" / "siris.conf"
-if not fpm_pool.is_file():
-    die("missing application PHP-FPM pool configuration")
+# PHP 8.1 on 22.04 builds, 8.3 on 24.04 builds.
+fpm_pools = sorted((root / "etc" / "php").glob("*/fpm/pool.d/siris.conf"))
+if len(fpm_pools) != 1:
+    die(f"expected one application PHP-FPM pool configuration, found {len(fpm_pools)}")
+fpm_pool = fpm_pools[0]
 fpm_text = fpm_pool.read_text(encoding="utf-8")
 fpm_text, count = re.subn(
     r"; We need to set the ownership on the fpm unix-socket in such a way that\n"
@@ -94,14 +152,16 @@ fpm_text, count = re.subn(
     "; Apache connects to the application socket as www-data.\n",
     fpm_text,
 )
-if count != 1:
+if count == 0 and "; Apache connects to the application socket as www-data." not in fpm_text:
     die(f"expected one Telegraf PHP-FPM comment block, found {count}")
 fpm_text, count = re.subn(
     r"(?m)^([ \t]*listen\.group[ \t]*=[ \t]*)telegraf([ \t]*)$",
     r"\1www-data\2",
     fpm_text,
 )
-if count != 1:
+if count == 0 and not re.search(
+    r"(?m)^[ \t]*listen\.group[ \t]*=[ \t]*www-data[ \t]*$", fpm_text
+):
     die(f"expected one Telegraf PHP-FPM socket group, found {count}")
 fpm_pool.write_text(fpm_text, encoding="utf-8")
 
@@ -130,7 +190,7 @@ telegraf_block = re.compile(
     re.DOTALL,
 )
 postinst_text, count = telegraf_block.subn("\n", postinst_text)
-if count != 1:
+if count == 0 and "The Telegraf package does not install its systemd unit file" in postinst_text:
     die(f"expected one Telegraf postinst block, found {count}")
 postinst_text, count = re.subn(
     r"\n        # Add the telegraf service account.*?\n        usermod -a -G ssl-cert telegraf \|\| true\n",
@@ -138,7 +198,7 @@ postinst_text, count = re.subn(
     postinst_text,
     flags=re.DOTALL,
 )
-if count != 1:
+if count == 0 and "Add the telegraf service account" in postinst_text:
     die(f"expected one Telegraf account postinst block, found {count}")
 for service in (
     "fluent-bit.service",
@@ -149,7 +209,7 @@ for service in (
     postinst_text, count = re.subn(
         rf"^            {re.escape(service)}(?: \\)?\n", "", postinst_text, flags=re.MULTILINE
     )
-    if count != 1:
+    if count == 0 and re.search(rf"(?m)^[ \t]*{re.escape(service)}(?: \\)?$", postinst_text):
         die(f"expected one {service} postinst preset entry, found {count}")
 postinst_text = postinst_text.replace(
     "            dtcserver.service \\\n", "            dtcserver.service\n", 1

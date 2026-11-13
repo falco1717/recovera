@@ -1,7 +1,7 @@
-{% extends 'commonlookandfeel/Default/layout.main.html.twig' %}
+{% extends 'Default/layout.main.html.twig' %}
 {% set title = 'Off-site Target' %}
 {% block scripts %}
-    <script src="{{ asset('commonlookandfeel/js/App/Configure/RecoveraTarget.js') }}"></script>
+    <script src="{{ asset('js/App/Configure/RecoveraTarget.js') }}"></script>
 {% endblock %}
 {% block content %}
 <div id="recovera-target" data-api="{{ path('recovera_target_api', {'operation':'status'})|replace({'status':''}) }}">

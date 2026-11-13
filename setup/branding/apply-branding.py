@@ -14,6 +14,41 @@ from pathlib import Path
 ROOT = Path("/usr/lib/datto/device")
 WEB = Path("/datto/web")
 
+# Web UI layout prefix. Images up to 5.6.x keep templates and assets under
+# commonlookandfeel/ (plus a vintage/ copy of some templates); 5.12.x is flat.
+# Set by main() from the installed tree; "" means the flat layout.
+LAYOUT = ""
+
+
+def detect_layout(root: "Path | None" = None) -> str:
+    root = ROOT if root is None else root
+    return "commonlookandfeel/" if (root / "templates/commonlookandfeel").is_dir() else ""
+
+
+def asset(relative: str) -> str:
+    """Path of a web asset, as used by Twig asset() and under /datto/web."""
+    return LAYOUT + relative
+
+
+def script_tag(relative: str) -> str:
+    return f"<script type=\"text/javascript\" src=\"{{{{ asset('{asset(relative)}') }}}}\"></script>"
+
+
+def template_paths(relative: str, *, vintage: bool = False) -> list[Path]:
+    paths = [ROOT / "templates" / (LAYOUT + relative)]
+    if vintage and LAYOUT:
+        paths.append(ROOT / "templates/vintage" / relative)
+    return paths
+
+
+def localize(text: str) -> str:
+    """Adapt a flat-layout resource (Twig template, controller) to this image."""
+    if not LAYOUT:
+        return text
+    text = text.replace("{% extends 'Default/", "{% extends '" + LAYOUT + "Default/")
+    text = text.replace("asset('js/", "asset('" + LAYOUT + "js/")
+    return text.replace("render('Configure/", "render('" + LAYOUT + "Configure/")
+
 # Cache-bust the branding stylesheet so updated CSS reaches browsers that
 # already cached the previous copy (phones in particular).
 BRAND_CSS_SOURCE = Path(__file__).with_name("recovera-brand.css")
@@ -37,13 +72,13 @@ def update(path: Path, transform) -> bool:
 
 def add_global_branding(text: str) -> str:
     needle = "</head>"
-    css = "/commonlookandfeel/UI/css/recovera-brand.css"
+    css = "/" + asset("UI/css/recovera-brand.css")
     css_link = f"{css}?v={CSS_VERSION}"
-    device_settings = "/commonlookandfeel/js/App/Configure/RecoveraDeviceSettings.js"
+    device_settings = "/" + asset("js/App/Configure/RecoveraDeviceSettings.js")
     # Replace any existing recovera-brand.css link (any version) with the
     # current cache-busted one; inject it if it is not present yet.
     text, replaced = re.subn(
-        r'<link rel="stylesheet" href="/commonlookandfeel/UI/css/recovera-brand\.css(?:\?v=[^"]*)?" />',
+        r'<link rel="stylesheet" href="/(?:commonlookandfeel/)?UI/css/recovera-brand\.css(?:\?v=[^"]*)?" />',
         f'<link rel="stylesheet" href="{css_link}" />',
         text,
     )
@@ -170,6 +205,8 @@ def add_target_menu(text: str) -> str:
     position = -1
     for anchor in (
         "menu.configure.offsite",
+        "path('offsite_configure')",
+        'path("offsite_configure")',
         "path('configure_offsite')",
         'path("configure_offsite")',
         "menu.configure.device",
@@ -218,7 +255,7 @@ def patch_offsite_template(text: str) -> str:
     marker = "RecoveraOffsiteApiClient.js"
     if marker not in text:
         needle = "{% block scripts %}\n"
-        script = "    <script type=\"text/javascript\" src=\"{{ asset('commonlookandfeel/js/App/Configure/OffsiteSync/RecoveraOffsiteApiClient.js') }}\"></script>\n"
+        script = "    " + script_tag("js/App/Configure/OffsiteSync/RecoveraOffsiteApiClient.js") + "\n"
         text = text.replace(needle, needle + script, 1)
     if "recovera-offsite-csrf" not in text:
         text = text.replace("{% block content %}", "{% block content %}\n    <div id=\"recovera-offsite-csrf\" class=\"d-none\">{{ csrfTag() }}</div>", 1)
@@ -229,16 +266,23 @@ def patch_offsite_javascript(text: str) -> str:
     return text.replace("}(Datto.API.Client, jQuery,", "}(Datto.App.RecoveraOffsiteApiClient, jQuery,")
 
 
+BROKEN_RECOVERY_POINTS_TAG = re.compile(
+    r'<script type=\\"text/javascript\\" src=\\"'
+    r"(\{\{ asset\('[^']*RecoveraRecoveryPoints\.js'\) \}\})"
+    r'\\"></script>'
+)
+
+
 def patch_recovery_points_template(text: str) -> str:
+    # Releases up to 0.6.37 wrote this tag with literal backslashes before its
+    # quotes, so browsers never ran the script. Repair it in place.
+    text = BROKEN_RECOVERY_POINTS_TAG.sub(r'<script type="text/javascript" src="\1"></script>', text)
     if "RecoveraRecoveryPoints.js" not in text:
         pattern = re.compile(
             r'(?P<script><script[^>]+RecoveryPointsView\.js[^>]*></script>)'
         )
-        text = pattern.sub(
-            r"\g<script>\n<script type=\"text/javascript\" src=\"{{ asset('commonlookandfeel/js/App/Assets/RecoveraRecoveryPoints.js') }}\"></script>",
-            text,
-            count=1,
-        )
+        addition = script_tag("js/App/Assets/RecoveraRecoveryPoints.js")
+        text = pattern.sub(lambda match: match.group("script") + "\n" + addition, text, count=1)
     if "recovera-recovery-points-csrf" not in text:
         text = text.replace(
             "{% block content %}",
@@ -255,8 +299,8 @@ def patch_protect_system_index(text: str) -> str:
         "canOffsite: true",
     )
     if "RecoveraProtectSystem.js" not in text:
-        needle = "    <script type=\"text/javascript\" src=\"{{ asset('commonlookandfeel/js/App/Agents/WizardSystem.js') }}\"></script>\n"
-        script = "    <script type=\"text/javascript\" src=\"{{ asset('commonlookandfeel/js/App/Agents/RecoveraProtectSystem.js') }}\"></script>\n"
+        needle = "    " + script_tag("js/App/Agents/WizardSystem.js") + "\n"
+        script = "    " + script_tag("js/App/Agents/RecoveraProtectSystem.js") + "\n"
         text = text.replace(needle, needle + script, 1)
     if "recovera-protect-csrf" not in text:
         text = text.replace(
@@ -282,24 +326,21 @@ def patch_replication_pane(text: str) -> str:
     return text
 
 
-SYNCHRONIZE_SCRIPT = (
-    "<script type=\"text/javascript\" "
-    "src=\"{{ asset('commonlookandfeel/js/App/Synchronize/RecoveraSynchronize.js') }}\"></script>"
-)
 SYNCHRONIZE_PANEL = '<div id="recovera-sync-panel" class="recovera-sync-panel"></div>'
 
 
 def patch_synchronize_template(text: str) -> str:
     """Show Recovera appliance replication on the native Synchronize page."""
     if "RecoveraSynchronize.js" not in text:
+        synchronize_script = script_tag("js/App/Synchronize/RecoveraSynchronize.js")
         pattern = re.compile(r"(?P<script><script[^>]+Synchronize/ReplicationStatusView\.js[^>]*></script>)")
-        patched, count = pattern.subn(lambda match: match.group("script") + "\n    " + SYNCHRONIZE_SCRIPT,
+        patched, count = pattern.subn(lambda match: match.group("script") + "\n    " + synchronize_script,
                                       text, count=1)
         if not count:
             start = text.find("{% block scripts %}")
             end = text.find("{% endblock %}", start) if start >= 0 else -1
             if end >= 0:
-                patched = text[:end] + "    " + SYNCHRONIZE_SCRIPT + "\n" + text[end:]
+                patched = text[:end] + "    " + synchronize_script + "\n" + text[end:]
         text = patched
     if 'id="recovera-sync-panel"' not in text:
         body = '<div id="synchronizeBody">'
@@ -311,10 +352,6 @@ def patch_synchronize_template(text: str) -> str:
     return text
 
 
-NETWORK_CHECK_SCRIPT = (
-    "<script type=\"text/javascript\" "
-    "src=\"{{ asset('commonlookandfeel/js/App/Configure/Network/RecoveraNetworkCheck.js') }}\"></script>"
-)
 
 
 def patch_network_status_template(text: str) -> str:
@@ -322,7 +359,8 @@ def patch_network_status_template(text: str) -> str:
     if "RecoveraNetworkCheck.js" in text:
         return text
     pattern = re.compile(r"(?P<script><script[^>]+Configure/Network/ConnectivityView\.js[^>]*></script>)")
-    return pattern.sub(lambda match: match.group("script") + "\n" + NETWORK_CHECK_SCRIPT, text, count=1)
+    addition = script_tag("js/App/Configure/Network/RecoveraNetworkCheck.js")
+    return pattern.sub(lambda match: match.group("script") + "\n" + addition, text, count=1)
 
 
 def patch_home_device_info(text: str) -> str:
@@ -330,7 +368,7 @@ def patch_home_device_info(text: str) -> str:
         text = text.replace(
             "{% set numOffsiteTargets = deviceInfo.offsiteTargets|length %}",
             "{% set numOffsiteTargets = deviceInfo.offsiteTargets|length %}\n"
-            "<script type=\"text/javascript\" src=\"{{ asset('commonlookandfeel/js/App/Home/RecoveraHome.js') }}\"></script>",
+            + script_tag("js/App/Home/RecoveraHome.js"),
             1,
         )
     if 'id="recovera-offsite-servers"' not in text:
@@ -370,91 +408,80 @@ recovera_access:
 
 
 def main() -> int:
+    global LAYOUT
     if len(sys.argv) != 2:
         raise SystemExit("usage: apply-branding.py LOGO_PNG")
     logo_source = Path(sys.argv[1])
     if not logo_source.is_file():
         raise SystemExit(f"logo not found: {logo_source}")
+    LAYOUT = detect_layout()
 
     logo_target = WEB / "UI/img/recovera-logo.png"
-    css_target = WEB / "commonlookandfeel/UI/css/recovera-brand.css"
+    css_target = WEB / asset("UI/css/recovera-brand.css")
     logo_target.parent.mkdir(parents=True, exist_ok=True)
     css_target.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(logo_source, logo_target)
     shutil.copy2(Path(__file__).with_name("recovera-brand.css"), css_target)
     resources = Path(__file__).parent
     controller = ROOT / "src/App/Controller/Web/Configure/RecoveraTargetController.php"
-    target_template = ROOT / "templates/commonlookandfeel/Configure/RecoveraTarget/index.html.twig"
-    target_js = WEB / "commonlookandfeel/js/App/Configure/RecoveraTarget.js"
-    access_template = ROOT / "templates/commonlookandfeel/Configure/RecoveraAccess/index.html.twig"
-    access_js = WEB / "commonlookandfeel/js/App/Configure/RecoveraAccess.js"
-    offsite_js = WEB / "commonlookandfeel/js/App/Configure/OffsiteSync/RecoveraOffsiteApiClient.js"
-    recovery_points_js = WEB / "commonlookandfeel/js/App/Assets/RecoveraRecoveryPoints.js"
-    protect_system_js = WEB / "commonlookandfeel/js/App/Agents/RecoveraProtectSystem.js"
-    home_js = WEB / "commonlookandfeel/js/App/Home/RecoveraHome.js"
-    device_settings_js = WEB / "commonlookandfeel/js/App/Configure/RecoveraDeviceSettings.js"
-    synchronize_js = WEB / "commonlookandfeel/js/App/Synchronize/RecoveraSynchronize.js"
-    network_check_js = WEB / "commonlookandfeel/js/App/Configure/Network/RecoveraNetworkCheck.js"
+    templates = ROOT / "templates" / LAYOUT
+    scripts = WEB / asset("js/App")
     for source, target in (
         (resources / "RecoveraTargetController.php", controller),
-        (resources / "recovera-target.html.twig", target_template),
-        (resources / "RecoveraTarget.js", target_js),
-        (resources / "recovera-access.html.twig", access_template),
-        (resources / "RecoveraAccess.js", access_js),
-        (resources / "RecoveraOffsiteApiClient.js", offsite_js),
-        (resources / "RecoveraRecoveryPoints.js", recovery_points_js),
-        (resources / "RecoveraProtectSystem.js", protect_system_js),
-        (resources / "RecoveraHome.js", home_js),
-        (resources / "RecoveraDeviceSettings.js", device_settings_js),
-        (resources / "RecoveraSynchronize.js", synchronize_js),
-        (resources / "RecoveraNetworkCheck.js", network_check_js),
+        (resources / "recovera-target.html.twig", templates / "Configure/RecoveraTarget/index.html.twig"),
+        (resources / "RecoveraTarget.js", scripts / "Configure/RecoveraTarget.js"),
+        (resources / "recovera-access.html.twig", templates / "Configure/RecoveraAccess/index.html.twig"),
+        (resources / "RecoveraAccess.js", scripts / "Configure/RecoveraAccess.js"),
+        (resources / "RecoveraOffsiteApiClient.js", scripts / "Configure/OffsiteSync/RecoveraOffsiteApiClient.js"),
+        (resources / "RecoveraRecoveryPoints.js", scripts / "Assets/RecoveraRecoveryPoints.js"),
+        (resources / "RecoveraProtectSystem.js", scripts / "Agents/RecoveraProtectSystem.js"),
+        (resources / "RecoveraHome.js", scripts / "Home/RecoveraHome.js"),
+        (resources / "RecoveraDeviceSettings.js", scripts / "Configure/RecoveraDeviceSettings.js"),
+        (resources / "RecoveraSynchronize.js", scripts / "Synchronize/RecoveraSynchronize.js"),
+        (resources / "RecoveraNetworkCheck.js", scripts / "Configure/Network/RecoveraNetworkCheck.js"),
     ):
         target.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(source, target)
+        if source.suffix in (".twig", ".php"):
+            target.write_text(localize(source.read_text(encoding="utf-8")), encoding="utf-8")
+            shutil.copymode(source, target)
+        else:
+            shutil.copy2(source, target)
     legacy_redirect = WEB / "configure/offsite/index.php"
     if legacy_redirect.is_file() and "Recovera Peer Replication" in legacy_redirect.read_text(encoding="utf-8"):
         legacy_redirect.unlink()
         with contextlib.suppress(OSError):
             legacy_redirect.parent.rmdir()
 
-    for path in (
-        ROOT / "templates/commonlookandfeel/Default/layout.base.html.twig",
-        ROOT / "templates/vintage/Default/layout.base.html.twig",
-    ):
+    for path in template_paths("Default/layout.base.html.twig", vintage=True):
         update(path, add_global_branding)
-    for relative in (
-        "templates/commonlookandfeel/Default/desktop.menu.html.twig",
-        "templates/commonlookandfeel/Default/mobile.menu.html.twig",
-    ):
-        path = ROOT / relative
-        update(path, replace_nav_logo)
-        update(path, add_target_menu)
+    for relative in ("Default/desktop.menu.html.twig", "Default/mobile.menu.html.twig"):
+        for path in template_paths(relative):
+            update(path, replace_nav_logo)
+            update(path, add_target_menu)
 
-    update(ROOT / "templates/commonlookandfeel/Default/menu.html.twig", add_target_visibility)
-    update(ROOT / "templates/commonlookandfeel/Configure/OffsiteSync/index.html.twig", patch_offsite_template)
-    update(WEB / "commonlookandfeel/js/App/Configure/OffsiteSync/OffsiteSyncSettingsView.js", patch_offsite_javascript)
-    for path in (
-        ROOT / "templates/commonlookandfeel/Assets/RecoveryPoints/index.html.twig",
-        ROOT / "templates/vintage/Assets/RecoveryPoints/index.html.twig",
-    ):
+    for path in template_paths("Default/menu.html.twig"):
+        update(path, add_target_visibility)
+    for path in template_paths("Configure/OffsiteSync/index.html.twig"):
+        update(path, patch_offsite_template)
+    update(WEB / asset("js/App/Configure/OffsiteSync/OffsiteSyncSettingsView.js"), patch_offsite_javascript)
+    for path in template_paths("Assets/RecoveryPoints/index.html.twig", vintage=True):
         update(path, patch_recovery_points_template)
-    update(ROOT / "templates/commonlookandfeel/Agents/Add/index.html.twig", patch_protect_system_index)
-    update(ROOT / "templates/commonlookandfeel/Assets/Configure/cloud.backup.html.twig", patch_replication_pane)
-    update(ROOT / "templates/commonlookandfeel/Home/deviceInfo.block.html.twig", patch_home_device_info)
-    for path in (
-        ROOT / "templates/commonlookandfeel/Synchronize/index.html.twig",
-        ROOT / "templates/vintage/Synchronize/index.html.twig",
-    ):
+    for path in template_paths("Agents/Add/index.html.twig"):
+        update(path, patch_protect_system_index)
+    for path in template_paths("Assets/Configure/cloud.backup.html.twig"):
+        update(path, patch_replication_pane)
+    for path in template_paths("Home/deviceInfo.block.html.twig"):
+        update(path, patch_home_device_info)
+    for path in template_paths("Synchronize/index.html.twig", vintage=True):
         update(path, patch_synchronize_template)
-    for path in (
-        ROOT / "templates/commonlookandfeel/Configure/Network/ip.status.html.twig",
-        ROOT / "templates/vintage/Configure/Network/ip.status.html.twig",
-    ):
+    for path in template_paths("Configure/Network/ip.status.html.twig", vintage=True):
         update(path, patch_network_status_template)
     update(ROOT / "config/routes.yaml", add_routes)
 
-    update(ROOT / "templates/commonlookandfeel/Authentication/index.login.html.twig", brand_login)
-    update(ROOT / "templates/commonlookandfeel/Default/layout.wizard.three.html.twig", brand_wizard)
+    for path in template_paths("Authentication/index.login.html.twig"):
+        update(path, brand_login)
+    for path in template_paths("Default/layout.wizard.three.html.twig"):
+        update(path, brand_wizard)
 
     for path in (ROOT / "translations").glob("*messages.en_US.yml"):
         update(path, brand_translation)

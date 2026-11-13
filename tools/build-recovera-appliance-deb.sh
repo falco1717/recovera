@@ -72,6 +72,10 @@ install -m 0755 "$ROOT/setup/migrate-layout.sh" "$stage/usr/local/lib/recovera/m
 install -m 0755 "$ROOT/setup/setup.sh" "$stage/usr/share/recovera/setup/setup.sh"
 install -m 0755 "$ROOT/setup/migrate-layout.sh" "$stage/usr/share/recovera/setup/migrate-layout.sh"
 install -m 0644 "$ROOT/setup/README.txt" "$stage/usr/share/recovera/setup/README.txt"
+install -m 0644 "$ROOT/setup/recovera-dnsmasq.conf" \
+  "$stage/usr/share/recovera/setup/recovera-dnsmasq.conf"
+install -m 0644 "$ROOT/setup/target-recovera.conf" \
+  "$stage/usr/share/recovera/setup/target-recovera.conf"
 for file in install-recovera-agent.sh install-recovera-agent-transfer.sh \
             datto-cow-reserve-fix.sh recovera-agent-transfer; do
   install -m 0755 "$ROOT/agents/linux/$file" "$stage/usr/share/recovera/agents/linux/$file"
@@ -132,6 +136,20 @@ if [ -d /opt/recovera ]; then
   install -m 0755 /usr/share/recovera/setup/setup.sh /opt/recovera/setup.sh
   install -m 0755 /usr/share/recovera/setup/migrate-layout.sh /opt/recovera/migrate-layout.sh
   install -m 0644 /usr/share/recovera/setup/README.txt /opt/recovera/README.txt
+  install -m 0644 /usr/share/recovera/setup/recovera-dnsmasq.conf /opt/recovera/recovera-dnsmasq.conf
+  install -m 0644 /usr/share/recovera/setup/target-recovera.conf /opt/recovera/target-recovera.conf
+fi
+. /etc/os-release
+if [ "${VERSION_ID:-}" = 24.04 ]; then
+  # Ubuntu 24.04 runtime fixes: dnsmasq beside systemd-resolved, and the target
+  # (iSCSI) service loading target_core_mod itself. They take effect when those
+  # services next start; an update never restarts target.service, because
+  # stopping it clears the iSCSI targets of a running restore.
+  install -d -m 0755 /etc/dnsmasq.d /etc/systemd/system/target.service.d
+  install -m 0644 /usr/share/recovera/setup/recovera-dnsmasq.conf /etc/dnsmasq.d/recovera.conf
+  install -m 0644 /usr/share/recovera/setup/target-recovera.conf \
+    /etc/systemd/system/target.service.d/zz-recovera.conf
+  rm -f /etc/systemd/system/target.service.d/recovera.conf
 fi
 install -d -m 0755 /etc/recovera /var/cache/recovera-upgrade/packages /var/lib/recovera-upgrade/transactions
 if [ ! -f /etc/recovera/upgrade.conf ]; then
@@ -155,6 +173,16 @@ systemctl enable recovera-upgrade-check.timer recovera-upgrade-validate.service 
 systemctl try-restart recovera-upgrade-check.timer >/dev/null || true
 if id recovera-repl >/dev/null 2>&1 && [ -f /etc/recovera-peer/config.json ]; then
   python3 /usr/lib/recovera/branding/apply-peer-ui.py
+  # The flat (5.12.x) web UI compiles routes into Symfony's production cache;
+  # rebuild it so the Recovera pages resolve at once. Never fail the update.
+  if [ ! -d /usr/lib/datto/device/templates/commonlookandfeel ] && \
+     [ -f /usr/lib/datto/device/app/console.php ]; then
+    (
+      cd /usr/lib/datto/device &&
+        php app/console.php cache:clear --env=prod --no-warmup >/dev/null &&
+        php app/console.php cache:warmup --env=prod >/dev/null
+    ) || echo "recovera-appliance: Symfony cache rebuild failed; it rebuilds on first use" >&2
+  fi
   visudo -cf /etc/sudoers.d/recovera-peer >/dev/null
   sshd -t
   a2enmod proxy proxy_http >/dev/null
@@ -165,7 +193,8 @@ if id recovera-repl >/dev/null 2>&1 && [ -f /etc/recovera-peer/config.json ]; th
     php_fpm=$(systemctl list-unit-files --no-legend --plain 'php*-fpm.service' 2>/dev/null \
       | awk '{print $1}' | sort -V | tail -n 1)
     systemctl restart "${php_fpm:-php8.1-fpm.service}" recovera-peer.service recovera-peer-sync.timer
-    systemctl reload apache2
+    systemctl reset-failed apache2.service >/dev/null 2>&1 || true
+    systemctl restart apache2.service
   fi
 fi
 exit 0

@@ -17,7 +17,8 @@ payload is private and must not be copied into the Git repository.
 5. Tag the merge commit (for example `v0.6.0`) and push the tag.
 6. Create a GitHub release for the tag and attach `SHA256SUMS`. The release notes
    must identify the pinned payload tag and link to the upgrade/rollback guide.
-7. On two clean Ubuntu 22.04 VMs, install from the tag, pair the appliances,
+7. On two clean VMs of the bundle's Ubuntu release (24.04 for 5.12.x, 22.04
+   for 5.6.x), install from the tag, pair the appliances,
    replicate a recovery point, and run `setup.sh verify` on both systems.
 8. Build an unregistered appliance, run `sudo tools/prepare-ova.sh`, power it
    off without rebooting it, and export the OVA. Import the exported OVA twice

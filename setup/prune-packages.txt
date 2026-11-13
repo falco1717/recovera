@@ -12,6 +12,10 @@ td-agent-bit
 td-agent-bit-headers
 wiz-sensor
 
+# Recovera does not enroll in or call a source-vendor Salt control plane.
+# Ubuntu 24.04 also no longer ships salt-minion in the base repositories.
+salt-minion
+
 # Debug symbols are not required at runtime.
 libc6-dbg
 
@@ -30,3 +34,16 @@ linux-modules-5.15.0-170-fips
 linux-modules-extra-5.15.0-170-fips
 ubuntu-fips
 ubuntu-fips-userspace
+openssl-fips-module-3
+
+# The reference VM runs on Ubuntu 24.04's supported generic kernel. Do not
+# carry the older Jammy HWE kernel build or source-vendor boot artwork into a
+# fresh Noble installation.
+linux-headers-6.8.0-94-generic
+linux-hwe-6.8-headers-6.8.0-94
+linux-hwe-6.8-tools-6.8.0-94
+linux-image-6.8.0-94-generic
+linux-modules-6.8.0-94-generic
+linux-modules-extra-6.8.0-94-generic
+linux-tools-6.8.0-94-generic
+plymouth-theme-datto

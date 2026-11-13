@@ -17,7 +17,7 @@ final class RecoveraTargetController extends AbstractController
      */
     public function indexAction(): Response
     {
-        return $this->render('commonlookandfeel/Configure/RecoveraTarget/index.html.twig');
+        return $this->render('Configure/RecoveraTarget/index.html.twig');
     }
 
     /**
@@ -26,7 +26,7 @@ final class RecoveraTargetController extends AbstractController
      */
     public function accessAction(): Response
     {
-        return $this->render('commonlookandfeel/Configure/RecoveraAccess/index.html.twig');
+        return $this->render('Configure/RecoveraAccess/index.html.twig');
     }
 
     /**
