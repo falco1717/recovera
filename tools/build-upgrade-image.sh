@@ -148,8 +148,10 @@ ff02::1 ip6-allnodes
 ff02::2 ip6-allrouters
 EOF
 chroot "$mountpoint" passwd -l backup-admin >/dev/null 2>&1 || true
-# A cloud image's default account carries no purpose on an appliance.
+# A cloud image's default account carries no purpose on an appliance, and
+# neither does cloud-init's passwordless sudo rule for it.
 chroot "$mountpoint" passwd -l ubuntu >/dev/null 2>&1 || true
+rm -f "$mountpoint/etc/sudoers.d/90-cloud-init-users"
 mkdir -p "$mountpoint"/{dev,proc,sys,run,tmp,host,mnt,media,var/tmp} \
   "$mountpoint/usr/local/lib/recovera-upgrade" \
   "$mountpoint/usr/local/share/recovera-upgrade" \
