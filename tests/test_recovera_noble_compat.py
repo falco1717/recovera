@@ -71,6 +71,11 @@ class RecoveraNobleCompatibilityTests(unittest.TestCase):
         self.assertIn("TRANSITION_CHANNEL=jammy-noble-transition", builder)
         self.assertIn("GATEWAY_TOKEN_FILE=/etc/recovera/gateway-token", builder)
 
+    def test_newer_bundle_restages_its_packages(self):
+        setup = (ROOT / "setup" / "setup.sh").read_text(encoding="utf-8")
+        stage = setup[setup.index("stage_bundle() {"):setup.index("verify_checksums() {")]
+        self.assertIn('! cmp -s "$BUNDLE/debs/SHA256SUMS" "$INSTALL_DIR/debs/SHA256SUMS"', stage)
+
 
 if __name__ == "__main__":
     unittest.main()

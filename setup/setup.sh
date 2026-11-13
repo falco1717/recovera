@@ -234,7 +234,9 @@ stage_bundle() {   # copy the bundle to /opt/recovera so nothing depends on /hom
   rm -rf "$INSTALL_DIR/upgrade"; cp -a "$BUNDLE/upgrade" "$INSTALL_DIR/"
   rm -rf "$INSTALL_DIR/isolation"; cp -a "$BUNDLE/isolation" "$INSTALL_DIR/"
   if [ -d "$BUNDLE/conffiles" ]; then rm -rf "$INSTALL_DIR/conffiles"; cp -a "$BUNDLE/conffiles" "$INSTALL_DIR/"; fi
-  if [ ! -f "$INSTALL_DIR/debs/.verified" ]; then
+  # Re-stage when the bundle's package set differs from the staged one: a newer
+  # bundle run over an existing install must not keep the older packages.
+  if [ ! -f "$INSTALL_DIR/debs/.verified" ] ||      ! cmp -s "$BUNDLE/debs/SHA256SUMS" "$INSTALL_DIR/debs/SHA256SUMS"; then
     rm -rf "$INSTALL_DIR/debs"; cp -a "$BUNDLE/debs" "$INSTALL_DIR/"
   fi
   chmod 755 "$INSTALL_DIR/setup.sh"
