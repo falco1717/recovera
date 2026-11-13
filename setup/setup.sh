@@ -1418,7 +1418,9 @@ p79_image_updater() {
   [ -f "$source/keys/recovera-release-signers" ] || { log "Recovera release signer list is missing"; return 1; }
   install -d -m 0755 /etc/recovera /usr/local/lib/recovera-upgrade \
     /usr/local/share/recovera-upgrade /host/recovera || return 1
-  install -m 0755 "$source/recovera-upgrade" /usr/local/sbin/recovera-upgrade || return 1
+  install -m 0755 "$source/recovera-upgrade" /usr/local/sbin/recovera-upgradectl || return 1
+  rm -f /usr/local/sbin/recovera-upgrade
+  ln -sfn recovera-upgradectl /usr/local/sbin/recovera-upgrade || return 1
   install -m 0755 "$source/recovera-upgrade-schedule" \
     /usr/local/sbin/recovera-upgrade-schedule || return 1
   install -m 0755 "$source/recovera-image-boot" \

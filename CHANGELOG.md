@@ -1,5 +1,33 @@
 # Changelog
 
+## v0.6.46 - 2026-11-13
+
+The image-update architecture work: one updater with explicit phases, a dry
+run, and more safety checks. See `docs/image-update-architecture.md`.
+
+- The updater installs as `recovera-upgradectl`; `recovera-upgrade` remains a
+  link to it, so timers, the peer service and the web UI are unchanged.
+- New commands: `query --channel C` / `query --alias VERSION`,
+  `download VERSION`, `stage VERSION`, `upgrade VERSION [--reboot] [--dry-run]`.
+  The dry run resolves the release, verifies its signature, chooses the
+  artifact, runs every check, estimates download and disk space (counting any
+  partial download) and changes nothing; it exits 3 when blocked.
+- Update phases (`DOWNLOADING`, `VERIFYING`, `STAGING`, `READY_TO_REBOOT`,
+  `REBOOTING`, `VERIFYING_BOOT`, `COMPLETE`, `FAILED`, `ROLLED_BACK`,
+  `BLOCKED`) are recorded in `/host/recovera/phase.json` with the target,
+  artifact and download progress, and `/run/recovera-upgrade/status.json` is
+  rebuilt for the UI on every run. `AVAILABLE` and `IDLE` are derived from the
+  cached checks, so a check never overwrites a staged update.
+  `recovera-upgradectl status` shows the phase and the rollback version.
+- New checks before an install: a backup that is not idle
+  (`snapctl asset:backup:list`), dpkg/apt holding its lock, a device migration
+  holding `/datto/config/migration.lock`, and a missing default route. A
+  blocked operating-system upgrade is recorded as `BLOCKED` (not failed) and
+  retried in the next window.
+- `upgrade/schema/image-manifest.schema.json` (JSON Schema 2020-12) documents
+  the image manifest, including reserved fields for release notes, key ID,
+  required space, rollback target, expiry, rollout rules and deltas.
+
 ## v0.6.45 - 2026-11-13
 
 Large-image delivery for the Ubuntu 22.04 → 24.04 transition, and two findings
