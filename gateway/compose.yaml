@@ -8,7 +8,7 @@ services:
       RECOVERA_GATEWAY_BIND: 0.0.0.0
       RECOVERA_GATEWAY_PORT: 8080
       RECOVERA_GATEWAY_REPOSITORY: ${RECOVERA_GATEWAY_REPOSITORY:-falco1717/recovera}
-      RECOVERA_GATEWAY_CHANNELS: ${RECOVERA_GATEWAY_CHANNELS:-stable jammy-noble-transition noble-stable}
+      RECOVERA_GATEWAY_CHANNELS: ${RECOVERA_GATEWAY_CHANNELS:-stable jammy-noble-transition noble-stable jammy-noble-candidate-transition}
       RECOVERA_GATEWAY_SYNC_INTERVAL: ${RECOVERA_GATEWAY_SYNC_INTERVAL:-900}
     ports:
       - 127.0.0.1:8080:8080
