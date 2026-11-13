@@ -1612,6 +1612,13 @@ class RecoveraUpgradeTests(unittest.TestCase):
         with self.assertRaises(jsonschema.ValidationError):
             jsonschema.validate(dict(manifest, sequence=0), schema)
 
+    def test_verify_does_not_count_an_updated_recovera_package_as_drift(self):
+        setup = (ROOT / "setup" / "setup.sh").read_text()
+        verify = setup[setup.index("verify() {"):]
+        verify = verify[:verify.index('check "packages at tested versions')]
+        self.assertIn("""want=$(grep -vc '^recovera-appliance=' "$INSTALL_DIR/lists/all-packages-versions.txt")""", verify)
+        self.assertEqual(verify.count("grep -v '^recovera-appliance='"), 2)
+
 
 if __name__ == "__main__":
     unittest.main()

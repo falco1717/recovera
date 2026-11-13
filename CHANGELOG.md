@@ -24,6 +24,10 @@ run, and more safety checks. See `docs/image-update-architecture.md`.
   holding `/datto/config/migration.lock`, and a missing default route. A
   blocked operating-system upgrade is recorded as `BLOCKED` (not failed) and
   retried in the next window.
+- `setup.sh verify` no longer reports "packages at tested versions" as failed
+  just because the signed updater installed a newer `recovera-appliance` than
+  the install bundle pinned (true of every updated appliance; seen on the
+  24.04 image after the gateway-backed transition test).
 - `upgrade/schema/image-manifest.schema.json` (JSON Schema 2020-12) documents
   the image manifest, including reserved fields for release notes, key ID,
   required space, rollback target, expiry, rollout rules and deltas.

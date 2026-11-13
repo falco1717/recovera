@@ -1625,8 +1625,11 @@ verify() {
   check() { if eval "$2" >/dev/null 2>&1; then printf '  ok    %s\n' "$1"; else printf '  FAIL  %s\n' "$1"; fails=$((fails+1)); fi; }
   echo "Recovera appliance verification $(ts) on $(hostname)"
   echo "  kernel $(uname -r), fips_enabled=$(cat /proc/sys/crypto/fips_enabled 2>/dev/null || echo n/a)"
-  want=$(wc -l < "$INSTALL_DIR/lists/all-packages-versions.txt")
-  have=$(comm -12 <(sort "$INSTALL_DIR/lists/all-packages-versions.txt") <(dpkg-query -W -f='${Package}=${Version}\n' | sort) | wc -l)
+  # recovera-appliance is updated by the signed Recovera updater after install,
+  # so the bundle's pinned version of it is not a drift signal.
+  want=$(grep -vc '^recovera-appliance=' "$INSTALL_DIR/lists/all-packages-versions.txt")
+  have=$(comm -12 <(grep -v '^recovera-appliance=' "$INSTALL_DIR/lists/all-packages-versions.txt" | sort) \
+    <(dpkg-query -W -f='${Package}=${Version}\n' | grep -v '^recovera-appliance=' | sort) | wc -l)
   cyc=$(journalctl -b -o cat 2>/dev/null | grep -c 'Found ordering cycle')
   sshlink=$(readlink /etc/ssh/sshd_config)
   mem_kb=$(awk '/^MemTotal:/{print $2}' /proc/meminfo)
