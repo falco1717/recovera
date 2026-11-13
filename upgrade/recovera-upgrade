@@ -1,8 +1,13 @@
 #!/usr/bin/env python3
-"""Signed package and image upgrade client for Recovera appliances."""
+"""Signed package and image upgrade client for Recovera appliances.
+
+Installed as recovera-upgradectl; recovera-upgrade is the same program.
+"""
 
 import argparse
 import base64
+import contextlib
+import datetime
 import hashlib
 import http.client
 import json
@@ -36,6 +41,18 @@ PENDING_MARKER = Path("/host/recovera/pending")
 DEFAULT_PACKAGE_CACHE = Path("/var/cache/recovera-upgrade/packages")
 DEFAULT_TRANSACTION_ROOT = Path("/var/lib/recovera-upgrade/transactions")
 DEFAULT_LOCK = Path("/run/lock/recovera-upgrade.lock")
+# Presentation copy of the update state for the web UI; rebuilt by every run.
+DEFAULT_STATUS_MIRROR = Path("/run/recovera-upgrade/status.json")
+DEFAULT_POLICY = Path("/etc/recovera/update-policy.json")
+PHASES = (
+    "IDLE", "CHECKING", "AVAILABLE", "DOWNLOADING", "VERIFYING", "STAGING",
+    "READY_TO_REBOOT", "BLOCKED", "REBOOTING", "VERIFYING_BOOT", "COMPLETE",
+    "FAILED", "ROLLED_BACK",
+)
+# An operation in progress (or a staged release waiting for its boot).
+ACTIVE_PHASES = ("DOWNLOADING", "VERIFYING", "STAGING", "READY_TO_REBOOT", "REBOOTING", "VERIFYING_BOOT")
+DPKG_LOCKS = (Path("/var/lib/dpkg/lock-frontend"), Path("/var/lib/dpkg/lock"))
+MIGRATION_LOCK = Path("/datto/config/migration.lock")
 DEFAULT_OS_RELEASE = Path("/etc/os-release")
 # Appliances on this release keep the historical, unprefixed channel names
 # (stable.json). Every other OS release reads "<codename>-<channel>".
@@ -69,6 +86,14 @@ class UpgradeError(RuntimeError):
 
 class NoReleaseError(UpgradeError):
     pass
+
+
+class BlockedError(UpgradeError):
+    """The appliance is not ready; nothing was changed. Retried later."""
+
+    def __init__(self, message, blockers=None):
+        super().__init__(message)
+        self.blockers = list(blockers or [message])
 
 
 def run(args, *, check=True, input_bytes=None, capture=False):
@@ -366,7 +391,7 @@ def validated_repository(config):
     return repository
 
 
-def download(url, target, config, *, api_asset=False, expected_size=None):
+def download(url, target, config, *, api_asset=False, expected_size=None, progress=None):
     """Download one asset to `target` through `target.partial`.
 
     With `expected_size` (image parts), an existing partial file is resumed
@@ -408,7 +433,17 @@ def download(url, target, config, *, api_asset=False, expected_size=None):
             raise UpgradeError("origin returned a partial response to a full request")
         try:
             with temporary.open(mode) as output:
-                shutil.copyfileobj(response, output, 1024 * 1024)
+                received = output.tell()
+                reported = received
+                while True:
+                    block = response.read(1024 * 1024)
+                    if not block:
+                        break
+                    output.write(block)
+                    received += len(block)
+                    if progress and received - reported >= 256 * 1024 * 1024:
+                        reported = received
+                        progress(received)
         except (OSError, http.client.HTTPException) as exc:
             received = temporary.stat().st_size if temporary.exists() else 0
             raise UpgradeError(f"download interrupted after {received} bytes: {exc}") from exc
@@ -494,7 +529,7 @@ def release_assets(pointer, config, source_dir=None):
     return {"__release_base_url__": f"https://github.com/{repo}/releases/download/{tag_path}"}
 
 
-def obtain_asset(name, assets, target, config, *, expected_size=None, expected_sha256=None):
+def obtain_asset(name, assets, target, config, *, expected_size=None, expected_sha256=None, progress=None):
     """Fetch one release asset. Image parts (with size and digest) resume and retry."""
     target = Path(target)
     if expected_sha256 and target.is_file():
@@ -507,7 +542,7 @@ def obtain_asset(name, assets, target, config, *, expected_size=None, expected_s
         if attempt:
             time.sleep(min(60, 10 * attempt))
         try:
-            _obtain_asset_once(name, assets, target, config, expected_size)
+            _obtain_asset_once(name, assets, target, config, expected_size, progress)
         except UpgradeError as exc:
             failure = exc
             continue
@@ -520,7 +555,7 @@ def obtain_asset(name, assets, target, config, *, expected_size=None, expected_s
     raise failure
 
 
-def _obtain_asset_once(name, assets, target, config, expected_size):
+def _obtain_asset_once(name, assets, target, config, expected_size, progress=None):
     if name in assets:
         source = assets[name]
     elif "__release_base_urls__" in assets and safe_asset_name(name):
@@ -536,14 +571,15 @@ def _obtain_asset_once(name, assets, target, config, expected_size):
         failures = []
         for candidate in source:
             try:
-                download(candidate, target, config, api_asset=True, expected_size=expected_size)
+                download(candidate, target, config, api_asset=True, expected_size=expected_size,
+                         progress=progress)
                 return
             except UpgradeError as exc:
                 failures.append(f"{urllib.parse.urlsplit(candidate).netloc}: {exc}")
         raise UpgradeError("all Recovera update gateways failed while downloading "
                            f"{name}: " + "; ".join(failures))
     else:
-        download(source, target, config, api_asset=True, expected_size=expected_size)
+        download(source, target, config, api_asset=True, expected_size=expected_size, progress=progress)
 
 
 def verify_signature(manifest_path, signature_path, signers):
@@ -663,6 +699,81 @@ def active_restores():
     return found
 
 
+def lock_is_held(path, kind="fcntl"):
+    """True when another process holds `path` (dpkg uses fcntl, PHP flock)."""
+    if fcntl is None or not Path(path).exists():
+        return False
+    try:
+        with open(path, "a") as stream:
+            try:
+                if kind == "flock":
+                    fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    fcntl.flock(stream, fcntl.LOCK_UN)
+                else:
+                    fcntl.lockf(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    fcntl.lockf(stream, fcntl.LOCK_UN)
+            except OSError:
+                return True
+    except OSError:
+        return False
+    return False
+
+
+def running_backups():
+    """Assets whose backup is not idle, from `snapctl asset:backup:list`."""
+    if not shutil.which("snapctl"):
+        return []
+    try:
+        result = subprocess.run(["snapctl", "asset:backup:list", "--no-ansi", "--no-interaction"],
+                                check=False, capture_output=True, timeout=120)
+    except (OSError, subprocess.SubprocessError):
+        return []
+    busy = []
+    for line in result.stdout.decode("utf-8", "replace").splitlines():
+        cells = [cell.strip() for cell in line.strip().strip("|").split("|")]
+        if len(cells) == 3 and re.fullmatch(r"[0-9a-fA-F]{32}", cells[0]) and cells[2].lower() != "idle":
+            busy.append(f"{cells[1] or cells[0]} ({cells[2]})")
+    return busy
+
+
+def default_route_present():
+    try:
+        rows = Path("/proc/net/route").read_text().splitlines()[1:]
+    except OSError:
+        return True
+    return any(len(fields) > 2 and fields[1] == "00000000" for fields in (row.split() for row in rows))
+
+
+def operational_checks(*, require_idle):
+    """Checks shared by every install: backups, package manager, migration, network."""
+    checks = []
+    backups = running_backups()
+    checks.append({"check": "backups", "ok": not backups, "blocking": require_idle,
+                   "detail": "backups are running: " + ", ".join(backups) if backups else "no backups are running"})
+    busy = any(lock_is_held(path) for path in DPKG_LOCKS)
+    checks.append({"check": "package-manager", "ok": not busy, "blocking": require_idle,
+                   "detail": "the package manager (dpkg/apt) is busy" if busy else "the package manager is idle"})
+    migrating = lock_is_held(MIGRATION_LOCK, "flock")
+    checks.append({"check": "migration", "ok": not migrating, "blocking": require_idle,
+                   "detail": "a device migration is running" if migrating else "no device migration is running"})
+    route = default_route_present()
+    checks.append({"check": "network", "ok": route, "blocking": True,
+                   "detail": "the appliance has a default route" if route else "the appliance has no default route"})
+    return checks
+
+
+def update_window(now=None):
+    """(open, window) for the configured automatic update window."""
+    window = {"start": 21, "end": 5}
+    with contextlib.suppress(OSError, ValueError, TypeError, KeyError, json.JSONDecodeError):
+        policy = json.loads(Path(os.environ.get("RECOVERA_UPGRADE_POLICY", DEFAULT_POLICY)).read_text())
+        window = {"start": int(policy["window"]["start"]), "end": int(policy["window"]["end"])}
+    hour = (now or datetime.datetime.now()).hour
+    start, end = window["start"], window["end"]
+    inside = start <= hour < end if start < end else hour >= start or hour < end
+    return inside, window
+
+
 def transition_readiness(manifest, host, *, require_drained):
     """Each precondition of an operating-system transition as {check, ok, detail}."""
     checks = []
@@ -699,6 +810,7 @@ def transition_readiness(manifest, host, *, require_drained):
     restores = active_restores()
     add("restores", not restores, "restores are active: " + ", ".join(restores) if restores
         else "no restores are active", blocking=require_drained)
+    checks.extend(operational_checks(require_idle=require_drained))
     return checks
 
 
@@ -721,7 +833,8 @@ def transition_preflight(manifest, host, args):
             raise UpgradeError(check["detail"])
     problems = [check["detail"] for check in checks if check["blocking"] and not check["ok"]]
     if problems:
-        raise UpgradeError("the appliance is not ready for this transition:\n- " + "\n- ".join(problems))
+        raise BlockedError("the appliance is not ready for this transition:\n- " + "\n- ".join(problems),
+                           problems)
 
 
 def safe_asset_name(name):
@@ -814,6 +927,101 @@ def state_path():
     return Path(os.environ.get("RECOVERA_UPGRADE_STATE", DEFAULT_STATE))
 
 
+def phase_path():
+    """Durable record of the latest update operation, beside the shared state."""
+    return state_path().with_name("phase.json")
+
+
+def status_mirror_path():
+    return Path(os.environ.get("RECOVERA_UPGRADE_STATUS_MIRROR", DEFAULT_STATUS_MIRROR))
+
+
+def read_phase():
+    try:
+        value = read_json(phase_path(), {})
+    except UpgradeError:
+        value = {}
+    return value if value.get("phase") in PHASES else {"phase": "IDLE"}
+
+
+def record_phase(phase, **details):
+    """Record the update lifecycle phase atomically, then refresh the mirror.
+
+    The phase describes the latest operation. Availability is not recorded
+    here: it is derived from the cached check results (see effective_phase),
+    so an hourly check never overwrites a staged update's phase. Bookkeeping
+    must never break an update, so write errors are ignored.
+    """
+    if phase not in PHASES:
+        raise ValueError(f"unknown update phase {phase}")
+    previous = read_phase()
+    value = {"phase": phase, "time": int(time.time())}
+    value.update({key: item for key, item in details.items() if item is not None})
+    if previous.get("phase") in ("COMPLETE", "FAILED", "ROLLED_BACK", "BLOCKED") and phase not in (
+            previous.get("phase"),):
+        value["last_result"] = {key: previous.get(key) for key in
+                                ("phase", "time", "target", "error", "blockers", "reason") if previous.get(key)}
+    elif previous.get("last_result"):
+        value["last_result"] = previous["last_result"]
+    if phase in ACTIVE_PHASES and previous.get("phase") in ACTIVE_PHASES:
+        for key in ("target", "sequence", "kind", "artifact", "started"):
+            if key not in value and previous.get(key) is not None:
+                value[key] = previous[key]
+    if phase in ACTIVE_PHASES and "started" not in value:
+        value["started"] = value["time"]
+    with contextlib.suppress(OSError, UpgradeError):
+        atomic_json(phase_path(), value, mode=0o644)
+    refresh_status_mirror()
+    return value
+
+
+def effective_phase(record, state):
+    """The phase to show: an operation in progress, else availability, else the last result."""
+    phase = record.get("phase", "IDLE")
+    if phase in ACTIVE_PHASES or phase == "BLOCKED" or (phase == "AVAILABLE" and record.get("downloaded")):
+        return phase
+    available = state.get("available") if isinstance(state.get("available"), dict) else {}
+    transition = state.get("transition_available") if isinstance(state.get("transition_available"), dict) else {}
+    if available.get("available") or transition.get("available"):
+        return "AVAILABLE"
+    return phase if phase in ("COMPLETE", "FAILED", "ROLLED_BACK") else "IDLE"
+
+
+def status_summary():
+    """Everything the UI shows about updates, composed from durable state."""
+    state = read_json(state_path(), {})
+    record = read_phase()
+    current = current_release()
+    previous = state.get("previous") or {}
+    pending = state.get("pending") or None
+    layout = read_json(layout_path(), {})
+    if previous.get("type", "image") == "image" and previous.get("version"):
+        rollback = previous if previous_image_available(previous, {"HOST_ROOT": str(state_path().parent.parent)}) else None
+    else:
+        rollback = previous if previous.get("version") and (layout.get("fallback_entry") or previous.get("type") == "package") else None
+    return {
+        "phase": effective_phase(record, status_state(current)),
+        "operation": record,
+        "current": {"version": current.get("version"), "sequence": current.get("sequence")},
+        "target": pending and {"version": pending.get("version"), "sequence": pending.get("sequence")},
+        "rollback": rollback and {"version": rollback.get("version"), "type": rollback.get("type", "image")},
+        "available": status_state(current).get("available"),
+        "transition": {"available": state.get("transition_available"),
+                       "approval": state.get("transition_approval"),
+                       "last_attempt": state.get("transition_last_attempt")},
+        "last_failure": state.get("last_failure"),
+        "updated": int(time.time()),
+    }
+
+
+def refresh_status_mirror(phase_override=None):
+    with contextlib.suppress(Exception):
+        value = status_summary()
+        if phase_override:
+            value["phase"] = phase_override
+        atomic_json(status_mirror_path(), value, mode=0o644)
+
+
 def layout_path():
     return Path(os.environ.get("RECOVERA_IMAGE_LAYOUT", DEFAULT_LAYOUT))
 
@@ -846,6 +1054,7 @@ def ensure_newer(manifest):
 
 
 def command_check(config, args):
+    refresh_status_mirror("CHECKING")
     current = current_release()
     try:
         with tempfile.TemporaryDirectory(prefix="recovera-upgrade-check-") as temporary:
@@ -931,10 +1140,17 @@ def image_download_dir(downloads, manifest):
 def assemble_image(config, manifest, assets, work):
     """Download and verify every image part; return their paths in order."""
     parts = []
+    total = int(manifest["image"]["size"])
+    done = 0
     for part in manifest["image"]["parts"]:
         local = work / part["name"]
+        base = done
+        record_phase("DOWNLOADING", progress={"bytes": done, "total": total})
         obtain_asset(part["name"], assets, local, config,
-                     expected_size=int(part["size"]), expected_sha256=part["sha256"])
+                     expected_size=int(part["size"]), expected_sha256=part["sha256"],
+                     progress=lambda received, base=base: record_phase(
+                         "DOWNLOADING", progress={"bytes": base + received, "total": total}))
+        done += int(part["size"])
         if local.stat().st_size != int(part["size"]) or sha256(local) != part["sha256"]:
             raise UpgradeError(f"image part verification failed: {part['name']}")
         parts.append(local)
@@ -1018,16 +1234,22 @@ def command_install_image(config, args, release):
     images.mkdir(parents=True, exist_ok=True)
     downloads.mkdir(parents=True, exist_ok=True)
     work = image_download_dir(downloads, manifest)
+    record_phase("DOWNLOADING", target=manifest["version"], sequence=int(manifest["sequence"]),
+                 kind="transition" if manifest.get("from") else "image",
+                 artifact={"kind": "full", "size": int(manifest["image"]["size"]),
+                           "parts": len(manifest["image"]["parts"])})
     parts = assemble_image(config, manifest, assets, work)
     filename = f"{manifest['version']}.img"
     target = images / filename
     pending = images / (filename + ".pending")
+    record_phase("VERIFYING")
     try:
         decompress_image(parts, manifest, pending)
     except BaseException:
         pending.unlink(missing_ok=True)
         raise
     inspect_image(pending, manifest)
+    record_phase("STAGING")
     migrate_appliance_config(pending)
     os.replace(pending, target)
     shutil.copyfile(manifest_path, images / f"{manifest['version']}.manifest.json")
@@ -1054,8 +1276,10 @@ def command_install_image(config, args, release):
         raise
     # The staged image no longer needs its downloaded parts.
     shutil.rmtree(work, ignore_errors=True)
+    record_phase("READY_TO_REBOOT")
     print(f"Recovera {manifest['version']} is verified and staged for one-time boot.")
     if args.reboot:
+        record_phase("REBOOTING")
         run(["systemctl", "reboot"])
     else:
         print("Reboot when ready: sudo systemctl reboot")
@@ -1210,6 +1434,7 @@ def commit_package_transaction(config, state):
     state["pending"] = None
     atomic_json(state_path(), state)
     PENDING_MARKER.unlink(missing_ok=True)
+    record_phase("COMPLETE", target=installed["version"], sequence=installed["sequence"], kind="package")
     print(f"Recovera {installed['version']} package update passed validation.")
 
 
@@ -1231,6 +1456,9 @@ def command_install_packages(config, args, release):
     rollback = []
     new_packages = []
     changes = []
+    record_phase("DOWNLOADING", target=manifest["version"], sequence=int(manifest["sequence"]), kind="package",
+                 artifact={"kind": "package", "size": sum(int(item["size"]) for item in manifest["packages"]),
+                           "packages": len(manifest["packages"])})
     for package in manifest["packages"]:
         old_version = installed_version(package["name"])
         if old_version != package["version"]:
@@ -1263,8 +1491,10 @@ def command_install_packages(config, args, release):
             shutil.copyfile(old_deb, destination)
             rollback.append({"name": package["name"], "version": old_version, "path": str(destination)})
 
+    record_phase("VERIFYING")
     if package_paths:
         verify_package_plan(package_paths)
+    record_phase("STAGING")
     transaction = {
         "type": "package", "version": manifest["version"], "sequence": int(manifest["sequence"]),
         "packages": [str(item) for item in package_paths], "rollback": rollback,
@@ -1284,6 +1514,7 @@ def command_install_packages(config, args, release):
             state["pending"] = None
             atomic_json(state_path(), state)
             PENDING_MARKER.unlink(missing_ok=True)
+            record_phase("ROLLED_BACK", reason="package installation failed")
         detail = (result.stdout + result.stderr).decode("utf-8", "replace")[-4000:]
         raise UpgradeError("package installation failed and was rolled back:\n" + detail)
     try:
@@ -1297,10 +1528,13 @@ def command_install_packages(config, args, release):
         state["pending"] = None
         atomic_json(state_path(), state)
         PENDING_MARKER.unlink(missing_ok=True)
+        record_phase("ROLLED_BACK", reason=str(exc))
         raise
     if manifest.get("reboot_required", False):
+        record_phase("READY_TO_REBOOT")
         print(f"Recovera {manifest['version']} package update is installed and awaiting reboot validation.")
         if args.reboot:
+            record_phase("REBOOTING")
             run(["systemctl", "reboot"])
         else:
             print("Reboot when ready: sudo systemctl reboot")
@@ -1329,6 +1563,7 @@ def command_mark_success(config, args):
         pending = state.get("pending")
         if not pending:
             raise UpgradeError("there is no pending upgrade")
+        record_phase("VERIFYING_BOOT", target=pending.get("version"), sequence=pending.get("sequence"))
         if pending.get("type") != "package" and pending.get("version") != current_release().get("version"):
             # GRUB's one-time entry was spent by a boot that never reached
             # validation (power loss, reset, crash), and this is the previous
@@ -1357,6 +1592,8 @@ def command_mark_success(config, args):
         state["pending"] = None
         atomic_json(state_path(), state)
         PENDING_MARKER.unlink(missing_ok=True)
+        record_phase("COMPLETE", target=current["version"], sequence=int(current["sequence"]),
+                     kind="transition" if pending.get("transition") else "image")
         print(f"Recovera {current['version']} passed validation and is now the default image.")
 
 
@@ -1372,6 +1609,7 @@ def record_interrupted_image(state, pending):
     state["pending"] = None
     atomic_json(state_path(), state)
     PENDING_MARKER.unlink(missing_ok=True)
+    record_phase("ROLLED_BACK", target=pending.get("version"), reason=reason)
     print(f"Recovera {pending.get('version')} did not reach validation; "
           "this appliance is running its previous system.")
 
@@ -1415,6 +1653,7 @@ def command_validation_failed(config, args):
         state["last_failure"] = {"version": failed_version, "reason": args.reason}
         atomic_json(state_path(), state)
         PENDING_MARKER.unlink(missing_ok=True)
+        record_phase("ROLLED_BACK", target=failed_version, reason=f"validation failed ({args.reason})")
         if args.reboot:
             run(["systemctl", "reboot"])
 
@@ -1429,6 +1668,7 @@ def record_boot_rollback(state, previous):
         state["installed_sequence"] = int(previous.get("sequence", 0))
     state["pending"] = None
     state["transition_approval"] = None
+    record_phase("ROLLED_BACK", target=current.get("version"), reason="operator requested rollback")
     if current.get("version") and (state.get("transition_last_attempt") or {}).get("version") == current.get("version"):
         state["transition_last_attempt"] = {"time": int(time.time()), "version": current.get("version"),
                                             "result": "rolled back by an administrator to the previous system"}
@@ -1476,8 +1716,12 @@ def command_status(config, args):
     except UpgradeError:
         os_info = None
     state = read_json(state_path(), {})
+    summary = status_summary()
     value = {
         "updater_version": UPDATER_VERSION,
+        "phase": summary["phase"],
+        "operation": summary["operation"],
+        "rollback": summary["rollback"],
         "os": os_info,
         "source": update_source(config),
         "transition": {"approval": state.get("transition_approval"),
@@ -1687,6 +1931,8 @@ def command_install_transition(config, args):
             transition_preflight(manifest, host, argparse.Namespace(allow_busy=True))
         except UpgradeError as exc:
             record_transition_attempt(manifest["version"], f"waiting: {exc}")
+            record_phase("BLOCKED", target=manifest["version"], kind="transition",
+                         blockers=getattr(exc, "blockers", [str(exc)]))
             raise
         layout = read_json(layout_path(), {})
         if layout.get("mode") != "loop-image-v1":
@@ -1697,6 +1943,8 @@ def command_install_transition(config, args):
             peer_maintenance("off")
             record_transition_attempt(manifest["version"],
                                       "deferred: replication was still running; it will be retried")
+            record_phase("BLOCKED", target=manifest["version"], kind="transition",
+                         blockers=["replication transfers were still running; retried in the next window"])
             print("replication is still running; the operating-system upgrade will be retried")
             return 0
         record_transition_attempt(manifest["version"], "downloading and installing")
@@ -1705,7 +1953,10 @@ def command_install_transition(config, args):
                 command_install_image(tconfig, argparse.Namespace(reboot=args.reboot, allow_busy=False), release)
         except Exception as exc:
             peer_maintenance("off")
-            record_transition_attempt(manifest["version"], f"failed before reboot: {exc}")
+            if isinstance(exc, BlockedError):
+                record_transition_attempt(manifest["version"], f"waiting: {exc}")
+            else:
+                record_transition_attempt(manifest["version"], f"failed before reboot: {exc}")
             raise
     return 0
 
@@ -1847,8 +2098,247 @@ def command_revert_image_layout(config, args):
     return 0
 
 
+def readable_channels(config):
+    """Channels this appliance reads, in order: its own, then its transition channel."""
+    own = config["CHANNEL"]
+    channels = [own]
+    with contextlib.suppress(UpgradeError):
+        transition = transition_config(config)["CHANNEL"]
+        if transition not in channels:
+            channels.append(transition)
+    return channels
+
+
+def describe_release(channel, pointer, manifest):
+    kind = manifest.get("type", "image")
+    if kind == "package":
+        size = sum(int(item["size"]) for item in manifest["packages"])
+    else:
+        size = int(manifest["image"]["size"])
+    current = current_release()
+    state = read_json(state_path(), {})
+    installed = max(int(current.get("sequence", 0) or 0), int(state.get("installed_sequence", 0) or 0))
+    return {
+        "channel": channel, "release_tag": pointer.get("release_tag"),
+        "version": manifest["version"], "sequence": int(manifest["sequence"]),
+        "type": kind, "transition": bool(manifest.get("from")),
+        "os": manifest.get("os"), "from": manifest.get("from"),
+        "download_size": size, "released": manifest.get("released"), "notes": manifest.get("notes"),
+        "newer_than_installed": int(manifest["sequence"]) > installed,
+    }
+
+
+def resolve_release(config, args, directory, *, version=None, channel=None):
+    """(channel, release) for a channel, or for the channel that offers `version`."""
+    channels = [channel] if channel else readable_channels(config)
+    failures = []
+    for name in channels:
+        scoped = dict(config)
+        scoped["CHANNEL"] = name
+        target = directory / name
+        target.mkdir(parents=True, exist_ok=True)
+        try:
+            release = get_release(scoped, release_arguments(args), target)
+        except NoReleaseError:
+            failures.append(f"{name}: nothing published")
+            continue
+        except UpgradeError as exc:
+            if channel:
+                raise
+            failures.append(f"{name}: {exc}")
+            continue
+        if version is None or release[2]["version"] == version:
+            return scoped, release
+        failures.append(f"{name}: offers {release[2]['version']}")
+    if channel:
+        raise NoReleaseError(f"nothing is published on {channel}")
+    raise UpgradeError(f"no channel this appliance reads offers {version}: " + "; ".join(failures))
+
+
+def command_query(config, args):
+    root = config_path(config, "TRANSACTION_ROOT", DEFAULT_TRANSACTION_ROOT)
+    root.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="query-", dir=root) as temporary:
+        if args.alias:
+            scoped, release = resolve_release(config, args, Path(temporary), version=args.alias)
+            result = describe_release(scoped["CHANNEL"], release[0], release[2])
+        else:
+            channel = effective_channel(args.query_channel, local_os()) if args.query_channel else config["CHANNEL"]
+            try:
+                scoped, release = resolve_release(config, args, Path(temporary), channel=channel)
+                result = describe_release(channel, release[0], release[2])
+            except NoReleaseError:
+                result = {"channel": channel, "version": None, "sequence": None}
+    print(json.dumps(result, indent=2, sort_keys=True))
+    return 0
+
+
+def release_kind(manifest):
+    if manifest.get("type") == "package":
+        return "package"
+    return "transition" if manifest.get("from") else "image"
+
+
+def downloaded_bytes(config, manifest):
+    """Bytes of this image release already in its download directory."""
+    if release_kind(manifest) == "package":
+        return 0
+    directory = (Path(config["HOST_ROOT"]) / "recovera/downloads" /
+                 f"image-{int(manifest['sequence'])}-{manifest['image']['sha256'][:16]}")
+    total = 0
+    for part in manifest["image"]["parts"]:
+        for name in (part["name"], part["name"] + ".partial"):
+            with contextlib.suppress(OSError):
+                total += min((directory / name).stat().st_size, int(part["size"]))
+                break
+    return total
+
+
+def upgrade_plan(config, scoped, release):
+    """What `upgrade` would do, every check it would run, and what blocks it."""
+    pointer, _, manifest, _, _ = release
+    kind = release_kind(manifest)
+    host = Path(config["HOST_ROOT"])
+    blockers, warnings, steps = [], [], []
+    try:
+        ensure_newer(manifest)
+    except UpgradeError as exc:
+        blockers.append(str(exc))
+    if kind == "package":
+        changes = [item for item in manifest["packages"] if installed_version(item["name"]) != item["version"]]
+        download = sum(int(item["size"]) for item in changes)
+        required = download * 2 + 128 * 1024 * 1024
+        root = config_path(config, "TRANSACTION_ROOT", DEFAULT_TRANSACTION_ROOT)
+        free = shutil.disk_usage(root if root.exists() else "/").free
+        checks = operational_checks(require_idle=True)
+        checks.append({"check": "disk-space", "ok": free >= required, "blocking": True,
+                       "detail": f"{free // 2**20} MiB free; the update needs {required // 2**20} MiB"})
+        artifact = {"kind": "package", "download_size": download,
+                    "packages": [f"{item['name']} {item['version']}" for item in changes]}
+        steps = ["download and verify the changed packages", "install them with rollback copies saved",
+                 "check the required services", "commit, or roll back automatically"]
+    else:
+        image = manifest["image"]
+        resume = downloaded_bytes(config, manifest)
+        download = int(image["size"]) - resume
+        required = int(image["size"]) + int(image["uncompressed_size"]) + 1024 * 1024 * 1024 - resume
+        free = shutil.disk_usage(host if host.exists() else "/").free
+        if kind == "transition":
+            checks = transition_readiness(manifest, host, require_drained=True)
+            for check in checks:
+                if check["check"] == "replication":
+                    check["blocking"] = False
+                    if not check["ok"]:
+                        check["detail"] = "replication will be paused and allowed to finish first"
+        else:
+            health = pool_health()
+            restores = active_restores()
+            checks = [{"check": "pool", "ok": health == "ONLINE", "blocking": True,
+                       "detail": f"homePool is {health or 'not imported'}"},
+                      {"check": "restores", "ok": not restores, "blocking": True,
+                       "detail": "restores are active: " + ", ".join(restores) if restores else "no restores are active"}]
+            checks += operational_checks(require_idle=True)
+            checks.append({"check": "disk-space", "ok": free >= required, "blocking": True,
+                           "detail": f"{free // 2**20} MiB free; the image needs {required // 2**20} MiB"})
+        artifact = {"kind": "full", "size": int(image["size"]), "parts": len(image["parts"]),
+                    "uncompressed_size": int(image["uncompressed_size"]), "already_downloaded": resume}
+        if read_json(layout_path(), {}).get("mode") != "loop-image-v1":
+            steps.append("convert the boot layout for image boot (prepare-image-layout)")
+        if kind == "transition":
+            steps.append("pause replication and wait for running transfers")
+        steps += ["download and verify the image parts (resuming any partial download)",
+                  "decompress and verify the image, copy this appliance's configuration into it",
+                  "stage it for one boot", "reboot; it becomes the default only after validation"]
+    blockers += [check["detail"] for check in checks if check["blocking"] and not check["ok"]]
+    last = read_json(state_path(), {}).get("last_failure") or {}
+    if last.get("version") == manifest["version"]:
+        warnings.append(f"an earlier attempt of {manifest['version']} failed: {last.get('reason')}")
+    window_open, window = update_window()
+    return {
+        "dry_run": True, "release": describe_release(scoped["CHANNEL"], pointer, manifest),
+        "artifact": artifact, "download_size": download, "required_space": required, "free_space": free,
+        "checks": checks, "blockers": blockers, "warnings": warnings, "steps": steps,
+        "update_window": {"open": window_open, **window,
+                          "note": "the automatic installer runs only inside this window"},
+        "ready": not blockers,
+    }
+
+
+def run_release(config, args, scoped, release, *, reboot):
+    """Install `release` now: packages in place, images staged, transitions approved and run."""
+    manifest = release[2]
+    kind = release_kind(manifest)
+    if kind == "transition":
+        state = read_json(state_path(), {})
+        state["transition_approval"] = {"version": manifest["version"], "sequence": int(manifest["sequence"]),
+                                        "approved": int(time.time()), "start": "now", "via": "command line"}
+        atomic_json(state_path(), state)
+        return command_install_transition(config, argparse.Namespace(
+            if_approved=False, drain_wait=args.drain_wait, reboot=reboot,
+            channel_file=getattr(args, "channel_file", None), source_dir=getattr(args, "source_dir", None),
+            signers=args.signers))
+    with UpgradeLock():
+        ensure_newer(manifest)
+        if kind == "package":
+            return command_install_packages(scoped, argparse.Namespace(reboot=reboot), release)
+        return command_install_image(scoped, argparse.Namespace(reboot=reboot, allow_busy=False), release)
+
+
+def command_download(config, args):
+    require_root()
+    root = config_path(config, "TRANSACTION_ROOT", DEFAULT_TRANSACTION_ROOT)
+    root.mkdir(parents=True, exist_ok=True)
+    with UpgradeLock(), tempfile.TemporaryDirectory(prefix="download-", dir=root) as temporary:
+        scoped, release = resolve_release(config, args, Path(temporary), version=args.version)
+        manifest = release[2]
+        if release_kind(manifest) == "package":
+            raise UpgradeError("package releases are downloaded as part of `upgrade`")
+        ensure_newer(manifest)
+        host = Path(config["HOST_ROOT"])
+        downloads = host / "recovera/downloads"
+        downloads.mkdir(parents=True, exist_ok=True)
+        needed = int(manifest["image"]["size"]) - downloaded_bytes(config, manifest)
+        if shutil.disk_usage(downloads).free < needed + 1024 * 1024 * 1024:
+            raise BlockedError(f"not enough space to download {manifest['version']}")
+        work = image_download_dir(downloads, manifest)
+        record_phase("DOWNLOADING", target=manifest["version"], sequence=int(manifest["sequence"]),
+                     kind=release_kind(manifest),
+                     artifact={"kind": "full", "size": int(manifest["image"]["size"]),
+                               "parts": len(manifest["image"]["parts"])})
+        assemble_image(scoped, manifest, release[1], work)
+        record_phase("AVAILABLE", target=manifest["version"], sequence=int(manifest["sequence"]),
+                     kind=release_kind(manifest), downloaded=True)
+    print(f"Recovera {manifest['version']} is downloaded and verified; stage it with "
+          f"`recovera-upgradectl stage {manifest['version']}`.")
+    return 0
+
+
+def command_stage(config, args):
+    require_root()
+    root = config_path(config, "TRANSACTION_ROOT", DEFAULT_TRANSACTION_ROOT)
+    root.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="stage-", dir=root) as temporary:
+        scoped, release = resolve_release(config, args, Path(temporary), version=args.version)
+        if release_kind(release[2]) == "package":
+            raise UpgradeError("package releases install in place; use `recovera-upgradectl upgrade VERSION`")
+        return run_release(config, args, scoped, release, reboot=False)
+
+
+def command_upgrade(config, args):
+    root = config_path(config, "TRANSACTION_ROOT", DEFAULT_TRANSACTION_ROOT)
+    root.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="upgrade-", dir=root) as temporary:
+        scoped, release = resolve_release(config, args, Path(temporary), version=args.version)
+        if args.dry_run:
+            plan = upgrade_plan(config, scoped, release)
+            print(json.dumps(plan, indent=2, sort_keys=True))
+            return 0 if plan["ready"] else 3
+        require_root()
+        return run_release(config, args, scoped, release, reboot=args.reboot)
+
+
 def parser():
-    value = argparse.ArgumentParser(prog="recovera-upgrade")
+    value = argparse.ArgumentParser(prog=Path(sys.argv[0]).name or "recovera-upgradectl")
     value.add_argument("--config", type=Path, default=Path(os.environ.get("RECOVERA_UPGRADE_CONFIG", DEFAULT_CONFIG)))
     value.add_argument("--signers", type=Path, default=Path(os.environ.get("RECOVERA_UPGRADE_SIGNERS", DEFAULT_SIGNERS)))
     sub = value.add_subparsers(dest="command", required=True)
@@ -1891,10 +2381,45 @@ def parser():
     failed = sub.add_parser("validation-failed")
     failed.add_argument("--reason", default="post-boot validation failed")
     failed.add_argument("--reboot", action="store_true")
+    query = sub.add_parser("query", help="show the release on a channel, or the channel offering a version")
+    target = query.add_mutually_exclusive_group()
+    target.add_argument("--channel", dest="query_channel")
+    target.add_argument("--alias", help="a release version, for example 0.6.45-noble.1")
+    download = sub.add_parser("download", help="download and verify an image release without staging it")
+    download.add_argument("version")
+    stage = sub.add_parser("stage", help="download, verify and stage an image for the next boot")
+    stage.add_argument("version")
+    stage.add_argument("--drain-wait", type=int, default=3 * 3600)
+    upgrade = sub.add_parser("upgrade", help="install a release; --dry-run only checks and plans")
+    upgrade.add_argument("version")
+    upgrade.add_argument("--dry-run", action="store_true")
+    upgrade.add_argument("--reboot", action="store_true")
+    upgrade.add_argument("--drain-wait", type=int, default=3 * 3600)
+    for command in (query, download, stage, upgrade):
+        command.add_argument("--channel-file", type=Path)
+        command.add_argument("--source-dir", type=Path)
     return value
 
 
+MUTATING_COMMANDS = ("install", "download", "stage", "upgrade", "install-transition", "rollback")
+
+
+def record_failure(exc, started):
+    """FAILED for an operation that stopped, BLOCKED when the appliance was not ready.
+
+    An outcome this run already recorded (rolled back, blocked) is kept.
+    """
+    record = read_phase()
+    if record.get("phase") in ("ROLLED_BACK", "BLOCKED") and int(record.get("time", 0)) >= started:
+        return
+    if isinstance(exc, BlockedError):
+        record_phase("BLOCKED", blockers=exc.blockers)
+    elif not isinstance(exc, NoReleaseError):
+        record_phase("FAILED", error=str(exc)[:2000])
+
+
 def main():
+    started = int(time.time())
     args = parser().parse_args()
     # Ubuntu's needrestart hook restarts services whose Python scripts apt just
     # replaced, which includes recovera-peer-sync.service while it is in the
@@ -1903,7 +2428,7 @@ def main():
     os.environ["NEEDRESTART_SUSPEND"] = "1"
     try:
         config = read_config(args.config)
-        if args.command in ("check", "install", "set-gateway-token"):
+        if args.command in ("check", "install", "set-gateway-token", "query", "download", "stage", "upgrade"):
             if getattr(args, "channel", None):
                 if not CHANNEL_RE.fullmatch(args.channel):
                     raise UpgradeError("invalid channel name")
@@ -1926,10 +2451,18 @@ def main():
             "cancel-transition": command_cancel_transition,
             "install-transition": command_install_transition,
             "revert-image-layout": command_revert_image_layout,
+            "query": command_query,
+            "download": command_download,
+            "stage": command_stage,
+            "upgrade": command_upgrade,
         }[args.command](config, args) or 0
     except (UpgradeError, FileNotFoundError, ValueError, subprocess.SubprocessError) as exc:
-        print(f"recovera-upgrade: {exc}", file=sys.stderr)
+        if args.command in MUTATING_COMMANDS and not getattr(args, "dry_run", False):
+            record_failure(exc, started)
+        print(f"{Path(sys.argv[0]).name or 'recovera-upgradectl'}: {exc}", file=sys.stderr)
         return 1
+    finally:
+        refresh_status_mirror()
 
 
 if __name__ == "__main__":

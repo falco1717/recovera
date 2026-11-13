@@ -161,7 +161,9 @@ mkdir -p "$mountpoint"/{dev,proc,sys,run,tmp,host,mnt,media,var/tmp} \
   "$mountpoint/etc/default/grub.d" "$mountpoint/etc/grub.d"
 chmod 1777 "$mountpoint/tmp" "$mountpoint/var/tmp"
 
-install -m 0755 "$REPO_ROOT/upgrade/recovera-upgrade" "$mountpoint/usr/local/sbin/recovera-upgrade"
+rm -f "$mountpoint/usr/local/sbin/recovera-upgrade"
+install -m 0755 "$REPO_ROOT/upgrade/recovera-upgrade" "$mountpoint/usr/local/sbin/recovera-upgradectl"
+ln -sfn recovera-upgradectl "$mountpoint/usr/local/sbin/recovera-upgrade"
 install -m 0755 "$REPO_ROOT/upgrade/recovera-image-boot" "$mountpoint/usr/local/lib/recovera-upgrade/recovera-image-boot"
 install -m 0755 "$REPO_ROOT/upgrade/recovera-migrate-config" "$mountpoint/usr/local/lib/recovera-upgrade/recovera-migrate-config"
 install -m 0755 "$REPO_ROOT/upgrade/initramfs-hook-recovera" "$mountpoint/etc/initramfs-tools/hooks/recovera-image"

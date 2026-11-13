@@ -11,6 +11,7 @@ import io
 import json
 from pathlib import Path
 import shutil
+import time
 import tempfile
 import unittest
 from unittest import mock
@@ -92,6 +93,13 @@ class RecoveraUpgradeTests(unittest.TestCase):
         cls.module = load_updater()
 
     def setUp(self):
+        # Never write the presentation mirror to the real /run.
+        self._mirror = tempfile.TemporaryDirectory()
+        self.addCleanup(self._mirror.cleanup)
+        mirror = mock.patch.dict("os.environ", {
+            "RECOVERA_UPGRADE_STATUS_MIRROR": str(Path(self._mirror.name) / "status.json")})
+        mirror.start()
+        self.addCleanup(mirror.stop)
         # Manifest validation checks the running OS; tests run on any host.
         patcher = mock.patch.object(self.module, "local_os", return_value=dict(self.JAMMY))
         patcher.start()
@@ -1377,6 +1385,232 @@ class RecoveraUpgradeTests(unittest.TestCase):
             self.assertIn("interrupted before validation", value["transition_last_attempt"]["result"])
             self.assertEqual(value["installed"]["version"], "0.6.45")
             self.assertFalse(marker.exists())
+
+    # --- 0.6.46: state machine, blockers, recovera-upgradectl verbs ---
+
+    def _state_env(self, root):
+        return {"RECOVERA_UPGRADE_STATE": str(Path(root) / "state.json"),
+                "RECOVERA_RELEASE_FILE": str(Path(root) / "release.json")}
+
+    def test_phase_record_keeps_operation_details_and_the_last_result(self):
+        with tempfile.TemporaryDirectory() as directory, \
+                mock.patch.dict("os.environ", self._state_env(directory)):
+            self.module.record_phase("DOWNLOADING", target="1.0-noble.1", sequence=50,
+                                     artifact={"kind": "full", "size": 10})
+            value = self.module.record_phase("VERIFYING")
+            self.assertEqual((value["target"], value["sequence"]), ("1.0-noble.1", 50))
+            self.assertIn("started", value)
+            self.module.record_phase("ROLLED_BACK", reason="validation failed (exit-code)")
+            value = self.module.record_phase("DOWNLOADING", target="1.0-noble.2", sequence=51)
+            self.assertEqual(value["last_result"]["phase"], "ROLLED_BACK")
+            self.assertEqual(json.loads((Path(directory) / "phase.json").read_text())["target"], "1.0-noble.2")
+            with self.assertRaises(ValueError):
+                self.module.record_phase("SOMETHING")
+            mirror = json.loads(Path(os.environ["RECOVERA_UPGRADE_STATUS_MIRROR"]).read_text())
+            self.assertEqual(mirror["phase"], "DOWNLOADING")
+
+    def test_effective_phase_derives_availability_without_overwriting_work(self):
+        effective = self.module.effective_phase
+        available = {"available": {"available": True}}
+        self.assertEqual(effective({"phase": "COMPLETE"}, available), "AVAILABLE")
+        self.assertEqual(effective({"phase": "COMPLETE"}, {}), "COMPLETE")
+        self.assertEqual(effective({"phase": "READY_TO_REBOOT"}, available), "READY_TO_REBOOT")
+        self.assertEqual(effective({"phase": "IDLE"}, {"transition_available": {"available": True}}), "AVAILABLE")
+        self.assertEqual(effective({"phase": "BLOCKED"}, available), "BLOCKED")
+        self.assertEqual(effective({"phase": "AVAILABLE", "downloaded": True}, {}), "AVAILABLE")
+        self.assertEqual(effective({"phase": "CHECKING"}, {}), "IDLE")
+
+    def test_validation_outcomes_are_recorded_as_phases(self):
+        with tempfile.TemporaryDirectory() as directory, \
+                mock.patch.dict("os.environ", self._state_env(directory)):
+            root = Path(directory)
+            (root / "release.json").write_text(json.dumps({"schema": 1, "sequence": 47, "version": "0.6.45-noble.1"}))
+            pending = {"version": "0.6.45-noble.1", "sequence": 47, "transition": True, "image": "x.img"}
+            marker = root / "pending"
+            for outcome in ("success", "failed"):
+                (root / "state.json").write_text(json.dumps({
+                    "previous": {"type": "package", "version": "0.6.45", "sequence": 46}, "pending": pending}))
+                marker.write_text("")
+                with mock.patch.object(self.module, "UpgradeLock", lambda: contextlib.nullcontext()), \
+                     mock.patch.object(self.module, "require_root", lambda: None), \
+                     mock.patch.object(self.module, "PENDING_MARKER", marker), \
+                     mock.patch.object(self.module, "validate_services"), \
+                     mock.patch.object(self.module, "previous_image_available", return_value=False), \
+                     mock.patch.object(self.module, "run"), \
+                     mock.patch("sys.stdout", new_callable=io.StringIO):
+                    if outcome == "success":
+                        self.module.command_mark_success({"HOST_ROOT": directory}, argparse.Namespace())
+                        self.assertEqual(self.module.read_phase()["phase"], "COMPLETE")
+                    else:
+                        self.module.command_validation_failed(
+                            {"HOST_ROOT": directory}, argparse.Namespace(reason="exit-code", reboot=False))
+                        record = self.module.read_phase()
+                        self.assertEqual(record["phase"], "ROLLED_BACK")
+                        self.assertIn("exit-code", record["reason"])
+
+    def test_running_backups_reads_the_snapctl_table(self):
+        table = (b"+----------------------------------+----------+---------+\n"
+                 b"| Key                              | Display  | Status  |\n"
+                 b"+----------------------------------+----------+---------+\n"
+                 b"| 296ba4afbd774227a212ac02deeb1c9d | jprod-sb | idle    |\n"
+                 b"| 54ac7151f5d14bbf8dac2924fa40bbf1 | RJ-OR-SB | running |\n"
+                 b"+----------------------------------+----------+---------+\n")
+        completed = subprocess.CompletedProcess([], 0, stdout=table, stderr=b"")
+        with mock.patch.object(self.module.shutil, "which", return_value="/usr/bin/snapctl"), \
+             mock.patch.object(self.module.subprocess, "run", return_value=completed):
+            self.assertEqual(self.module.running_backups(), ["RJ-OR-SB (running)"])
+        with mock.patch.object(self.module.shutil, "which", return_value=None):
+            self.assertEqual(self.module.running_backups(), [])
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "fcntl locks")
+    def test_held_locks_are_detected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "lock"
+            path.write_text("")
+            self.assertFalse(self.module.lock_is_held(path))
+            holder = subprocess.Popen([sys.executable, "-c",
+                "import fcntl,sys,time; f=open(sys.argv[1],'a'); fcntl.lockf(f, fcntl.LOCK_EX); "
+                "print('held', flush=True); time.sleep(30)", str(path)], stdout=subprocess.PIPE)
+            try:
+                holder.stdout.readline()
+                self.assertTrue(self.module.lock_is_held(path))
+            finally:
+                holder.kill()
+                holder.wait()
+            with open(path, "a") as stream:
+                import fcntl
+                fcntl.flock(stream, fcntl.LOCK_EX)
+                self.assertTrue(self.module.lock_is_held(path, "flock"))
+
+    def test_update_window_handles_overnight_windows(self):
+        import datetime
+        with tempfile.TemporaryDirectory() as directory:
+            policy = Path(directory) / "policy.json"
+            policy.write_text(json.dumps({"channel": "stable", "window": {"start": 21, "end": 5}}))
+            with mock.patch.dict("os.environ", {"RECOVERA_UPGRADE_POLICY": str(policy)}):
+                self.assertTrue(self.module.update_window(datetime.datetime(2026, 1, 1, 23))[0])
+                self.assertTrue(self.module.update_window(datetime.datetime(2026, 1, 1, 4))[0])
+                self.assertFalse(self.module.update_window(datetime.datetime(2026, 1, 1, 12))[0])
+            policy.write_text(json.dumps({"window": {"start": 1, "end": 4}}))
+            with mock.patch.dict("os.environ", {"RECOVERA_UPGRADE_POLICY": str(policy)}):
+                self.assertEqual(self.module.update_window(datetime.datetime(2026, 1, 1, 2)),
+                                 (True, {"start": 1, "end": 4}))
+
+    def test_transition_readiness_includes_operational_checks(self):
+        manifest = {"from": {"os_version_ids": ["22.04"]}, "image": {"size": 1, "uncompressed_size": 1}}
+        with mock.patch.object(self.module, "pool_health", return_value="ONLINE"), \
+             mock.patch.object(self.module, "replication_drained", return_value=(True, "idle")), \
+             mock.patch.object(self.module, "active_restores", return_value=[]), \
+             mock.patch.object(self.module, "running_backups", return_value=["RJ-OR-SB (running)"]), \
+             mock.patch.object(self.module, "lock_is_held", return_value=False), \
+             mock.patch.object(self.module, "default_route_present", return_value=True):
+            lenient = self.module.transition_readiness(manifest, Path("."), require_drained=False)
+            strict = self.module.transition_readiness(manifest, Path("."), require_drained=True)
+        backups = [check for check in lenient if check["check"] == "backups"][0]
+        self.assertFalse(backups["ok"])
+        self.assertFalse(backups["blocking"])
+        self.assertTrue([check for check in strict if check["check"] == "backups"][0]["blocking"])
+        self.assertEqual({check["check"] for check in strict} >= {"backups", "package-manager", "migration", "network"}, True)
+        with mock.patch.object(self.module, "transition_readiness", return_value=strict), \
+             self.assertRaises(self.module.BlockedError) as raised:
+            self.module.transition_preflight(manifest, Path("."), argparse.Namespace(allow_busy=False))
+        self.assertIn("backups are running: RJ-OR-SB (running)", raised.exception.blockers)
+
+    def test_failures_record_failed_or_blocked_but_keep_a_rollback(self):
+        with tempfile.TemporaryDirectory() as directory, \
+                mock.patch.dict("os.environ", self._state_env(directory)):
+            started = int(time.time())
+            self.module.record_failure(self.module.UpgradeError("gateway unreachable"), started)
+            self.assertEqual(self.module.read_phase()["phase"], "FAILED")
+            self.module.record_failure(self.module.BlockedError("busy", ["backups are running"]), started)
+            self.assertEqual(self.module.read_phase()["blockers"], ["backups are running"])
+            self.module.record_phase("ROLLED_BACK", reason="package installation failed")
+            self.module.record_failure(self.module.UpgradeError("package installation failed"), started)
+            self.assertEqual(self.module.read_phase()["phase"], "ROLLED_BACK")
+
+    def test_parser_offers_the_upgradectl_verbs(self):
+        parse = self.module.parser().parse_args
+        self.assertEqual(parse(["query", "--channel", "noble-stable"]).query_channel, "noble-stable")
+        self.assertEqual(parse(["query", "--alias", "0.6.45-noble.1"]).alias, "0.6.45-noble.1")
+        self.assertEqual(parse(["download", "0.6.45-noble.1"]).version, "0.6.45-noble.1")
+        self.assertEqual(parse(["stage", "0.6.45-noble.1"]).version, "0.6.45-noble.1")
+        arguments = parse(["upgrade", "0.6.45-noble.1", "--dry-run"])
+        self.assertTrue(arguments.dry_run)
+        self.assertFalse(arguments.reboot)
+        with self.assertRaises(SystemExit), mock.patch("sys.stderr", new_callable=io.StringIO):
+            parse(["query", "--channel", "a", "--alias", "b"])
+
+    def test_resolve_release_finds_the_channel_that_offers_a_version(self):
+        def fake(config, _args, _directory):
+            if config["CHANNEL"] == "stable":
+                return ({"release_tag": "package-v0.6.45"}, {}, {"version": "0.6.45", "sequence": 46}, None, None)
+            return ({"release_tag": "image-v0.6.45-noble.1"}, {}, {"version": "0.6.45-noble.1", "sequence": 47}, None, None)
+        config = {"CHANNEL": "stable", "TRANSITION_CHANNEL": "jammy-noble-candidate-transition"}
+        arguments = argparse.Namespace(channel_file=None, source_dir=None, signers=Path("signers"))
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(self.module, "get_release", fake):
+            scoped, release = self.module.resolve_release(config, arguments, Path(directory), version="0.6.45-noble.1")
+            self.assertEqual(scoped["CHANNEL"], "jammy-noble-candidate-transition")
+            self.assertEqual(release[2]["sequence"], 47)
+            with self.assertRaisesRegex(self.module.UpgradeError, "offers 0.6.45"):
+                self.module.resolve_release(config, arguments, Path(directory), version="9.9")
+
+    def test_dry_run_plans_without_changing_anything(self):
+        manifest = {"version": "0.6.45-noble.1", "sequence": 47, "channel": "jammy-noble-candidate-transition",
+                    "from": {"os_version_ids": ["22.04"], "minimum_version": "0.6.45"},
+                    "os": {"id": "ubuntu", "version_id": "24.04"},
+                    "image": {"size": 1000, "uncompressed_size": 4000, "sha256": "ab" * 32,
+                              "parts": [{"name": "p0", "size": 1000, "sha256": "cd" * 32}]}}
+        release = ({"release_tag": "image-v0.6.45-noble.1"}, {}, manifest, None, None)
+        readiness = [{"check": "pool", "ok": True, "blocking": True, "detail": "homePool is ONLINE"},
+                     {"check": "replication", "ok": False, "blocking": True, "detail": "not paused"},
+                     {"check": "backups", "ok": False, "blocking": True, "detail": "backups are running: X (running)"}]
+        with tempfile.TemporaryDirectory() as directory, \
+                mock.patch.dict("os.environ", self._state_env(directory)):
+            config = {"HOST_ROOT": directory, "CHANNEL": "stable"}
+            before = sorted(item.name for item in Path(directory).iterdir())
+            with mock.patch.object(self.module, "transition_readiness", return_value=readiness), \
+                 mock.patch.object(self.module, "ensure_newer"):
+                plan = self.module.upgrade_plan(config, dict(config, CHANNEL=manifest["channel"]), release)
+            self.assertEqual(sorted(item.name for item in Path(directory).iterdir()), before)
+        self.assertTrue(plan["dry_run"])
+        self.assertFalse(plan["ready"])
+        self.assertEqual(plan["blockers"], ["backups are running: X (running)"])
+        self.assertEqual(plan["artifact"]["kind"], "full")
+        self.assertEqual(plan["download_size"], 1000)
+        self.assertIn("replication will be paused", [c for c in plan["checks"] if c["check"] == "replication"][0]["detail"])
+        self.assertTrue(any("convert the boot layout" in step for step in plan["steps"]))
+
+    def test_updater_installs_as_upgradectl_with_the_old_name_kept(self):
+        deb = (ROOT / "tools" / "build-recovera-appliance-deb.sh").read_text()
+        self.assertIn('"$stage/usr/local/sbin/recovera-upgradectl"', deb)
+        self.assertIn('ln -sfn recovera-upgradectl "$stage/usr/local/sbin/recovera-upgrade"', deb)
+        image = (ROOT / "tools" / "build-upgrade-image.sh").read_text()
+        self.assertIn('ln -sfn recovera-upgradectl "$mountpoint/usr/local/sbin/recovera-upgrade"', image)
+        setup = (ROOT / "setup" / "setup.sh").read_text()
+        self.assertIn("ln -sfn recovera-upgradectl /usr/local/sbin/recovera-upgrade", setup)
+        # Every caller keeps working through the old name.
+        for unit in ("recovera-upgrade-validate.service",):
+            self.assertIn("/usr/local/sbin/recovera-upgrade ", (ROOT / "upgrade" / unit).read_text())
+
+    CANDIDATE_MANIFEST = {'architecture': 'amd64', 'channel': 'jammy-noble-candidate-transition', 'from': {'minimum_version': '0.6.45', 'os_version_ids': ['22.04']}, 'image': {'compression': 'xz', 'parts': [{'name': 'recovera-0.6.45-noble.1.img.xz.part-000', 'sha256': 'b0efbe6f0509408775d463a68ff0992917fb701cea97db761f6015eb352e0adb', 'size': 1992294400}, {'name': 'recovera-0.6.45-noble.1.img.xz.part-001', 'sha256': '4171faec7fd00d2cde49f0f8989259788095cbc11ea68a50880089257ce288be', 'size': 411362464}], 'sha256': 'a76fc89d198a336bba28f354d38a408791000485028f417c076c870fd5a59536', 'size': 2403656864, 'uncompressed_sha256': 'eac71bc2526f472e9659d65becd9779d7b1c01eb8e1a65d5d75331717377d7ed', 'uncompressed_size': 11294453760}, 'minimum_updater': 1, 'os': {'id': 'ubuntu', 'version_id': '24.04'}, 'schema': 1, 'sequence': 47, 'version': '0.6.45-noble.1'}
+
+    def test_image_manifest_schema_describes_what_the_builder_writes(self):
+        schema = json.loads((ROOT / "upgrade" / "schema" / "image-manifest.schema.json").read_text())
+        self.assertEqual(schema["$schema"], "https://json-schema.org/draft/2020-12/schema")
+        self.assertEqual(set(schema["required"]),
+                         {"schema", "version", "sequence", "channel", "architecture", "minimum_updater", "image"})
+        manifest = self.CANDIDATE_MANIFEST
+        self.assertTrue(set(manifest) <= set(schema["properties"]))
+        self.assertTrue(set(manifest["image"]) <= set(schema["properties"]["image"]["properties"]))
+        # The updater accepts the same manifest, and ignores reserved fields.
+        self.module.validate_image_manifest(dict(manifest, released="2026-11-13T23:00:00Z", deltas=[]))
+        try:
+            import jsonschema
+        except ImportError:
+            return
+        jsonschema.validate(manifest, schema)
+        with self.assertRaises(jsonschema.ValidationError):
+            jsonschema.validate(dict(manifest, sequence=0), schema)
 
 
 if __name__ == "__main__":

@@ -84,7 +84,10 @@ for file in datto-cow-reserve-fix.service recovera-agent-transfer.service; do
   install -m 0644 "$ROOT/agents/linux/$file" "$stage/usr/share/recovera/agents/linux/$file"
 done
 
-install -m 0755 "$ROOT/upgrade/recovera-upgrade" "$stage/usr/local/sbin/recovera-upgrade"
+# recovera-upgradectl is the updater; recovera-upgrade stays as its other name
+# for the timers, the peer service and the web UI.
+install -m 0755 "$ROOT/upgrade/recovera-upgrade" "$stage/usr/local/sbin/recovera-upgradectl"
+ln -sfn recovera-upgradectl "$stage/usr/local/sbin/recovera-upgrade"
 install -m 0755 "$ROOT/upgrade/recovera-upgrade-schedule" "$stage/usr/local/sbin/recovera-upgrade-schedule"
 install -m 0755 "$ROOT/upgrade/recovera-image-boot" "$stage/usr/local/lib/recovera-upgrade/"
 install -m 0755 "$ROOT/upgrade/recovera-migrate-config" "$stage/usr/local/lib/recovera-upgrade/"

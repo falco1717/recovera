@@ -165,13 +165,26 @@ module, so the pool imports on either.
 
 ## Appliance commands
 
+The updater is `recovera-upgradectl`; `recovera-upgrade` is the same program.
+
 ```bash
-sudo recovera-upgrade status
-sudo recovera-upgrade check
-sudo recovera-upgrade install
-sudo recovera-upgrade install --reboot
-sudo recovera-upgrade rollback
+sudo recovera-upgradectl status                          # phase, current / target / rollback versions
+sudo recovera-upgradectl check
+sudo recovera-upgradectl query --channel noble-stable    # what a channel offers
+sudo recovera-upgradectl query --alias 0.6.45-noble.1    # which channel offers a version
+sudo recovera-upgradectl upgrade 0.6.45-noble.1 --dry-run   # every check and the plan; changes nothing
+sudo recovera-upgradectl download 0.6.45-noble.1         # fetch and verify an image only
+sudo recovera-upgradectl stage 0.6.45-noble.1            # stage it for the next boot
+sudo recovera-upgradectl upgrade 0.6.45-noble.1 --reboot
+sudo recovera-upgradectl install                         # the channel's latest release
+sudo recovera-upgradectl rollback
 ```
+
+`stage` and `upgrade` of an operating-system transition count as the
+administrator's approval and run the same unattended flow (replication paused
+and drained first). `upgrade --dry-run` exits 0 when ready and 3 when blocked,
+listing each blocker. See [the architecture document](image-update-architecture.md)
+for the update phases.
 
 The hourly timer checks for availability while the configured Update Window is
 open and the Update Channel is set to Stable. When a newer signed release is
