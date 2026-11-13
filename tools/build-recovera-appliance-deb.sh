@@ -40,7 +40,7 @@ Section: admin
 Priority: optional
 Architecture: all
 Maintainer: Recovera Project <noreply@recovera.local>
-Depends: python3, openssh-client, openssh-server, sudo, apache2, php8.1-fpm, xz-utils, zfsutils-linux, gdisk, cloud-guest-utils, parted, util-linux, udev
+Depends: python3, openssh-client, openssh-server, sudo, apache2, php8.1-fpm | php8.3-fpm, xz-utils, zfsutils-linux, gdisk, cloud-guest-utils, parted, util-linux, udev
 Description: Recovera appliance control plane
  Recovera branding, private replication, administrator integration, and signed
  package/image upgrade client for an already provisioned Recovera appliance.
@@ -159,7 +159,9 @@ if id recovera-repl >/dev/null 2>&1 && [ -f /etc/recovera-peer/config.json ]; th
   apache2ctl configtest >/dev/null
   systemctl enable recovera-peer.service recovera-peer-sync.timer >/dev/null
   if [ "${RECOVERA_DEFER_SERVICE_RESTART:-0}" != 1 ]; then
-    systemctl restart php8.1-fpm recovera-peer.service recovera-peer-sync.timer
+    php_fpm=$(systemctl list-unit-files --no-legend --plain 'php*-fpm.service' 2>/dev/null \
+      | awk '{print $1}' | sort -V | tail -n 1)
+    systemctl restart "${php_fpm:-php8.1-fpm.service}" recovera-peer.service recovera-peer-sync.timer
     systemctl reload apache2
   fi
 fi

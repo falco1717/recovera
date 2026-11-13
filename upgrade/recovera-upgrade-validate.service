@@ -1,6 +1,6 @@
 [Unit]
 Description=Validate a newly booted Recovera release
-After=apache2.service php8.1-fpm.service recovera-peer.service
+After=apache2.service php8.1-fpm.service php8.3-fpm.service recovera-peer.service
 ConditionPathExists=/host/recovera/pending
 
 [Service]

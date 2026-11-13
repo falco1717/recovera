@@ -1,5 +1,33 @@
 # Changelog
 
+## v0.6.36 - 2026-11-12
+
+Groundwork that must reach every 22.04 appliance before any Ubuntu 24.04
+appliance or OS-transition release exists. Nothing changes for 22.04 appliances
+today: they keep reading the `stable` channel.
+
+- The updater maps the administrator's channel to one per OS release:
+  `stable` on Ubuntu 22.04 (unchanged), `noble-stable` on 24.04.
+- Package manifests declare their OS (`"os": {"id": "ubuntu", "version_id":
+  "22.04"}`) and the updater refuses one built for a different OS release.
+  Older manifests without it are accepted only on 22.04.
+- `build-package-release.sh` takes `--os-version`, keeps `noble-*` channels for
+  24.04 releases only, and requires the sequence to exceed every channel's, so
+  moving to a new channel never looks like a downgrade.
+- `REQUIRED_SERVICES` accepts `php-fpm.service`, resolved to the installed
+  `phpX.Y-fpm` unit; a listed `phpX.Y-fpm` that is no longer installed resolves
+  the same way. The control package depends on `php8.1-fpm | php8.3-fpm` and
+  restarts whichever is installed.
+- `recovera-peer maintenance on|off|status` pauses replication and drains
+  running transfers without interrupting them; sources keep their resume
+  token. The update window skips appliances in maintenance, and the
+  Synchronize panel shows the hold.
+- `asset-info` reports the target's OS version and ZFS userland/module
+  versions, for mixed-version replication.
+- New pools are pinned to the OpenZFS 2.2 feature set
+  (`compatibility=openzfs-2.2-linux`) when the installed ZFS knows it, so an
+  accidental `zpool upgrade` cannot strand a pool.
+
 ## v0.6.35 - 2026-11-07
 
 - Replication streams are compressed in transit with zstd when both appliances

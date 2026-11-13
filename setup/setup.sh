@@ -1060,7 +1060,11 @@ p70_zfs() {
       [ -e "$l" ] && [ "$(readlink -f "$l")" = "$(readlink -f "$dev")" ] && { id=$l; break; }
     done
     log "creating $P on $dev (${id:-no stable id}), $(lsblk -dno SIZE "$dev")"
-    zpool create -o ashift=12 -O compression=on -O mountpoint=/$P "$P" "${id:-$dev}" || return 1
+    # Pin new pools to the OpenZFS 2.2 feature set when this userland knows it, so
+    # an accidental `zpool upgrade` cannot strand the pool on a 2.2 kernel module.
+    local compat=()
+    [ -e /usr/share/zfs/compatibility.d/openzfs-2.2-linux ] && compat=(-o compatibility=openzfs-2.2-linux)
+    zpool create -o ashift=12 "${compat[@]}" -O compression=on -O mountpoint=/$P "$P" "${id:-$dev}" || return 1
   fi
   zfs list "$P/.recv" >/dev/null 2>&1 || zfs create "$P/.recv"
   zfs list "$P/os"    >/dev/null 2>&1 || zfs create "$P/os"

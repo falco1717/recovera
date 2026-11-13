@@ -21,9 +21,18 @@ def load_updater():
 
 
 class RecoveraUpgradeTests(unittest.TestCase):
+    JAMMY = {"id": "ubuntu", "version_id": "22.04", "codename": "jammy"}
+    NOBLE = {"id": "ubuntu", "version_id": "24.04", "codename": "noble"}
+
     @classmethod
     def setUpClass(cls):
         cls.module = load_updater()
+
+    def setUp(self):
+        # Manifest validation checks the running OS; tests run on any host.
+        patcher = mock.patch.object(self.module, "local_os", return_value=dict(self.JAMMY))
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def manifest(self):
         return {
@@ -438,6 +447,133 @@ class RecoveraUpgradeTests(unittest.TestCase):
         setup = (ROOT / "setup" / "setup.sh").read_text()
         self.assertIn("install-updater)", setup)
         self.assertIn("p79_image_updater || exit 1", setup)
+
+    # --- 0.6.36: OS-aware channels, manifest OS, PHP-FPM resolution ---
+
+    def test_local_os_reads_os_release(self):
+        with tempfile.TemporaryDirectory() as directory:
+            release = Path(directory) / "os-release"
+            release.write_text('NAME="Ubuntu"\nID=ubuntu\nVERSION_ID="24.04"\nVERSION_CODENAME=noble\n')
+            module = load_updater()
+            with mock.patch.dict("os.environ", {"RECOVERA_OS_RELEASE": str(release)}):
+                self.assertEqual(module.local_os(), self.NOBLE)
+            with mock.patch.dict("os.environ", {"RECOVERA_OS_RELEASE": str(Path(directory) / "none")}):
+                with self.assertRaises(module.UpgradeError):
+                    module.local_os()
+
+    def test_effective_channel_keeps_legacy_names_on_jammy(self):
+        self.assertEqual(self.module.effective_channel("stable", self.JAMMY), "stable")
+        self.assertEqual(self.module.effective_channel("stable", self.NOBLE), "noble-stable")
+        self.assertEqual(self.module.effective_channel("noble-stable", self.NOBLE), "noble-stable")
+        with self.assertRaises(self.module.UpgradeError):
+            self.module.effective_channel("stable", {"id": "ubuntu", "version_id": "26.04", "codename": ""})
+
+    def test_main_uses_the_os_channel_for_check_and_install_only(self):
+        seen = {}
+
+        def capture(config, _args):
+            seen.update(config)
+            return 0
+
+        base = {"REPOSITORY": "falco1717/recovera", "CHANNEL": "stable",
+                "CHANNEL_BRANCH": "main", "HOST_ROOT": "/host"}
+        with mock.patch.object(self.module, "local_os", return_value=dict(self.NOBLE)), \
+             mock.patch.object(self.module, "read_config", side_effect=lambda _path: dict(base)), \
+             mock.patch.object(self.module, "command_check", side_effect=capture), \
+             mock.patch.object(self.module.sys, "argv", ["recovera-upgrade", "check"]):
+            self.assertEqual(self.module.main(), 0)
+        self.assertEqual(seen["CHANNEL"], "noble-stable")
+        self.assertEqual(seen["CHANNEL_REQUESTED"], "stable")
+        seen.clear()
+        with mock.patch.object(self.module, "local_os", side_effect=AssertionError("not needed")), \
+             mock.patch.object(self.module, "read_config", side_effect=lambda _path: dict(base)), \
+             mock.patch.object(self.module, "command_status", side_effect=capture), \
+             mock.patch.object(self.module.sys, "argv", ["recovera-upgrade", "status"]):
+            self.assertEqual(self.module.main(), 0)
+        self.assertEqual(seen["CHANNEL"], "stable")
+
+    def test_package_manifest_must_match_the_running_os(self):
+        manifest = self.package_manifest()
+        pointer = {"version": "0.7.1", "sequence": 8}
+        with mock.patch.object(self.module.platform, "machine", return_value="x86_64"):
+            # Legacy manifests without "os" were all built for 22.04.
+            self.module.validate_manifest(manifest, pointer, {"CHANNEL": "stable"})
+            manifest["os"] = {"id": "ubuntu", "version_id": "22.04"}
+            self.module.validate_manifest(manifest, pointer, {"CHANNEL": "stable"})
+            manifest["os"] = {"id": "ubuntu", "version_id": "24.04"}
+            with self.assertRaisesRegex(self.module.UpgradeError, "24.04"):
+                self.module.validate_manifest(manifest, pointer, {"CHANNEL": "stable"})
+            manifest["os"] = "ubuntu-22.04"
+            with self.assertRaises(self.module.UpgradeError):
+                self.module.validate_manifest(manifest, pointer, {"CHANNEL": "stable"})
+        noble = self.package_manifest()
+        with self.assertRaisesRegex(self.module.UpgradeError, "does not declare"):
+            self.module.check_manifest_os(noble, self.NOBLE)
+        noble["os"] = {"id": "ubuntu", "version_id": "24.04"}
+        self.module.check_manifest_os(noble, self.NOBLE)
+
+    def test_required_services_resolve_the_installed_php_fpm(self):
+        def units(listing):
+            return mock.Mock(returncode=0, stdout=listing.encode(), stderr=b"")
+
+        both = "php8.1-fpm.service enabled enabled\nphp8.3-fpm.service enabled enabled\n"
+        noble = "php8.3-fpm.service enabled enabled\n"
+        cases = [
+            ("apache2.service php-fpm.service recovera-peer.service", both,
+             ["apache2.service", "php8.3-fpm.service", "recovera-peer.service"]),
+            ("apache2.service php8.1-fpm.service", both, ["apache2.service", "php8.1-fpm.service"]),
+            ("apache2.service php8.1-fpm.service", noble, ["apache2.service", "php8.3-fpm.service"]),
+            ("php-fpm.service php8.1-fpm.service", noble, ["php8.3-fpm.service"]),
+            ("apache2.service php-fpm.service", "", ["apache2.service", "php-fpm.service"]),
+        ]
+        for configured, listing, expected in cases:
+            with self.subTest(configured=configured, listing=listing), \
+                 mock.patch.object(self.module, "run", return_value=units(listing)):
+                self.assertEqual(self.module.required_services({"REQUIRED_SERVICES": configured}), expected)
+        with mock.patch.object(self.module, "run") as run:
+            self.assertEqual(self.module.required_services({"REQUIRED_SERVICES": "apache2.service"}),
+                             ["apache2.service"])
+            run.assert_not_called()
+        conf = (ROOT / "upgrade" / "recovera-upgrade.conf").read_text()
+        self.assertIn("REQUIRED_SERVICES=apache2.service php-fpm.service recovera-peer.service", conf)
+
+    def test_control_package_supports_both_php_releases(self):
+        control = (ROOT / "tools" / "build-recovera-appliance-deb.sh").read_text()
+        self.assertIn("php8.1-fpm | php8.3-fpm", control)
+        self.assertNotIn("systemctl restart php8.1-fpm ", control)
+        self.assertIn("'php*-fpm.service'", control)
+
+    def test_package_release_declares_os_and_uses_one_sequence_counter(self):
+        builder = (ROOT / "tools" / "build-package-release.sh").read_text()
+        self.assertIn("'os': {'id': 'ubuntu', 'version_id': os_version}", builder)
+        self.assertIn("--os-version", builder)
+        self.assertIn('OS_PREFIX=noble-', builder)
+        self.assertIn('"$ROOT"/upgrade/channels/*.json', builder)
+        self.assertIn("the highest sequence on any channel", builder)
+
+    def test_schedule_skips_while_in_maintenance(self):
+        loader = importlib.machinery.SourceFileLoader(
+            "recovera_upgrade_schedule", str(ROOT / "upgrade" / "recovera-upgrade-schedule"))
+        with tempfile.TemporaryDirectory() as directory:
+            hold = Path(directory) / "maintenance"
+            hold.write_text("{}")
+            policy = Path(directory) / "policy.json"
+            policy.write_text(json.dumps({"channel": "stable", "window": {"start": 0, "end": 0}}))
+            environment = {"RECOVERA_MAINTENANCE": str(hold), "RECOVERA_UPGRADE_POLICY": str(policy)}
+            with mock.patch.dict("os.environ", environment):
+                spec = importlib.util.spec_from_loader(loader.name, loader)
+                schedule = importlib.util.module_from_spec(spec)
+                loader.exec_module(schedule)
+                with mock.patch.object(schedule.subprocess, "run") as run, \
+                     mock.patch("sys.stdout", new_callable=io.StringIO):
+                    self.assertEqual(schedule.main(), 0)
+                run.assert_not_called()
+
+    def test_new_pools_pin_the_openzfs_2_2_feature_set_when_available(self):
+        for script in ("setup/setup.sh", "tools/prepare-ova.sh"):
+            text = (ROOT / script).read_text()
+            self.assertIn("compatibility.d/openzfs-2.2-linux ] && compat=(-o compatibility=openzfs-2.2-linux)", text)
+            self.assertIn('zpool create -o ashift=12 "${compat[@]}"', text)
 
 
 if __name__ == "__main__":

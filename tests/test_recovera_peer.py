@@ -342,7 +342,10 @@ class RecoveraPeerTests(unittest.TestCase):
         install_call = execute.call_args_list[0]
         self.assertEqual(install_call.args[0][-1], "install")
         self.assertEqual(install_call.kwargs["env"]["RECOVERA_DEFER_SERVICE_RESTART"], "1")
-        self.assertEqual(execute.call_args_list[1].args[0][0], "systemd-run")
+        restart = execute.call_args_list[-1].args[0]
+        self.assertEqual(restart[0], "systemd-run")
+        # The mocked unit listing has no PHP-FPM, so the 22.04 default is used.
+        self.assertIn("php8.1-fpm.service", restart)
 
     @unittest.skipUnless(os.name == "posix", "Unix sockets are exercised on Linux CI")
     def test_unix_socket_serves_http_without_tcp(self):
@@ -1327,7 +1330,7 @@ class RecoveraPeerTests(unittest.TestCase):
         source_text = SCRIPT.read_text(encoding="utf-8")
         self.assertIn('_remember_name("sources", source_id, metadata["source_name"])', source_text)
         self.assertIn('_remember_name("peers", peer_id, remote.get("appliance_name"))', source_text)
-        self.assertIn('"appliance_name": appliance_name(cfg), "stream_codecs": local_stream_codecs()}', source_text)
+        self.assertIn('"appliance_name": appliance_name(cfg), "stream_codecs": local_stream_codecs(),', source_text)
 
     def test_resumed_send_measures_progress_from_the_token_not_the_estimate(self):
         token = self.resume_token([("bytes", 21_520_000_000)])
@@ -1415,6 +1418,86 @@ class RecoveraPeerTests(unittest.TestCase):
         with mock.patch.object(self.peer, "ssh_base", return_value=["sh", "-c"]):
             self.peer.transfer_stream(["cat", str(payload)], {}, ["sh", "-c", remote], codec="zstd")
         self.assertEqual(received.read_bytes(), payload.read_bytes())
+
+    # --- 0.6.36: maintenance drain and peer version facts ---
+
+    def test_asset_info_reports_os_and_zfs_versions(self):
+        os_release = self.root / "os-release"
+        os_release.write_text('NAME="Ubuntu"\nVERSION_ID="22.04"\nVERSION_CODENAME=jammy\n')
+        version = mock.Mock(returncode=0,
+                            stdout=b"zfs-2.1.5-1ubuntu6~22.04.6\nzfs-kmod-2.2.2-0ubuntu9.4\n")
+        with mock.patch.object(self.peer, "OS_RELEASE_PATH", os_release), \
+             mock.patch.object(self.peer, "run", return_value=version):
+            self.assertEqual(self.peer.os_version_id(), "22.04")
+            self.assertEqual(self.peer.zfs_versions(),
+                             {"userland": "2.1.5-1ubuntu6~22.04.6", "kmod": "2.2.2-0ubuntu9.4"})
+        with mock.patch.object(self.peer, "run", side_effect=self.peer.PeerError("missing")):
+            self.assertEqual(self.peer.zfs_versions(), {"userland": None, "kmod": None})
+        source = SCRIPT.read_text(encoding="utf-8")
+        self.assertIn('"os_version_id": os_version_id(), "zfs_version": zfs_versions()}', source)
+
+    def test_maintenance_refuses_new_replication_and_clears(self):
+        path = self.root / "run" / "maintenance"
+        with mock.patch.object(self.peer, "MAINTENANCE_PATH", path), \
+             mock.patch.object(self.peer, "PROC_ROOT", self.root / "noproc"):
+            self.assertIsNone(self.peer.maintenance_status())
+            answer = self.peer.maintenance_on("OS   transition", wait_seconds=0)
+            self.assertTrue(answer["idle"])
+            self.assertEqual(answer["maintenance"]["reason"], "OS transition")
+            self.assertEqual(self.peer.configured_sync(),
+                             [{"ok": True, "status": "paused-for-maintenance"}])
+            with self.assertRaisesRegex(self.peer.PeerError, "maintenance"):
+                self.peer.start_background_sync()
+            for command in ("asset-info abc", "receive a b c d", "receive-resume a b c"):
+                with mock.patch.dict(os.environ, {"SSH_ORIGINAL_COMMAND": command}), \
+                     mock.patch.object(self.peer, "receive_dataset") as receive, \
+                     mock.patch.object(self.peer, "asset_info_received") as info:
+                    with self.assertRaisesRegex(self.peer.PeerError, "in maintenance"):
+                        self.peer.ssh_entry("12345678-1234")
+                    receive.assert_not_called()
+                    info.assert_not_called()
+            since = self.peer.maintenance_status()["since"]
+            self.assertEqual(self.peer.maintenance_on("again")["maintenance"]["since"], since)
+            self.assertEqual(self.peer.maintenance_off()["was"]["reason"], "again")
+            self.assertIsNone(self.peer.maintenance_status())
+            self.assertFalse(path.exists())
+        kinds = [item["kind"] for item in self.peer.state()["events"]]
+        self.assertEqual(kinds.count("maintenance-started"), 1)
+        self.assertEqual(kinds.count("maintenance-ended"), 1)
+
+    def test_maintenance_waits_for_running_receives_and_reports_them(self):
+        proc = self.root / "proc"
+        (proc / "4242").mkdir(parents=True)
+        (proc / "4242" / "cmdline").write_bytes(
+            b"zfs\0receive\0-u\0-s\0homePool/home/agents/" + b"a" * 32 + b"\0")
+        path = self.root / "run" / "maintenance"
+        with mock.patch.object(self.peer, "MAINTENANCE_PATH", path), \
+             mock.patch.object(self.peer, "PROC_ROOT", proc), \
+             mock.patch.object(self.peer.time, "sleep") as sleep:
+            answer = self.peer.maintenance_on("transition", wait_seconds=0)
+            self.assertFalse(answer["idle"])
+            self.assertIn("pid 4242", answer["busy"][0])
+            sleep.assert_not_called()
+
+    def test_replication_activity_reports_maintenance(self):
+        path = self.root / "run" / "maintenance"
+        with mock.patch.object(self.peer, "MAINTENANCE_PATH", path), \
+             mock.patch.object(self.peer, "PROC_ROOT", self.root / "noproc"):
+            self.assertIsNone(self.peer.replication_activity()["maintenance"])
+            self.peer.maintenance_on("transition")
+            self.assertEqual(self.peer.replication_activity()["maintenance"]["reason"], "transition")
+        panel = (SCRIPT.parents[1] / "branding" / "RecoveraSynchronize.js").read_text(encoding="utf-8")
+        self.assertIn("data.maintenance", panel)
+
+    def test_post_update_restart_uses_installed_php_fpm(self):
+        units = mock.Mock(returncode=0, stdout=(b"php8.1-fpm.service disabled enabled\n"
+                                                b"php8.3-fpm.service enabled enabled\n"))
+        with mock.patch.object(self.peer, "run", return_value=units):
+            self.assertEqual(self.peer.php_fpm_service(), "php8.3-fpm.service")
+        with mock.patch.object(self.peer, "run", return_value=mock.Mock(returncode=1, stdout=b"")):
+            self.assertEqual(self.peer.php_fpm_service(), "php8.1-fpm.service")
+        self.assertNotIn('"restart", "php8.1-fpm.service"', SCRIPT.read_text(encoding="utf-8"))
+
 
 if __name__ == "__main__":
     unittest.main()

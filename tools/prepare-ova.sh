@@ -75,7 +75,10 @@ compact_data_pool() {
     dd if=/dev/zero of="$pool_dev" bs=4M count=16 conv=fsync status=none
   fi
 
-  zpool create -o ashift=12 -O compression=on -O mountpoint=/homePool \
+  # Pin to the OpenZFS 2.2 feature set when this userland knows it (see setup.sh).
+  compat=()
+  [ -e /usr/share/zfs/compatibility.d/openzfs-2.2-linux ] && compat=(-o compatibility=openzfs-2.2-linux)
+  zpool create -o ashift=12 "${compat[@]}" -O compression=on -O mountpoint=/homePool \
     homePool "$pool_dev"
   zfs create homePool/.recv
   zfs create homePool/os
