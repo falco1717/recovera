@@ -162,8 +162,10 @@ conf=/etc/recovera/upgrade.conf
 grep -q '^GATEWAY_TOKEN_FILE=' "$conf" || echo 'GATEWAY_TOKEN_FILE=/etc/recovera/gateway-token' >> "$conf"
 if ! grep -q '^UPDATE_ORIGINS=.' "$conf"; then
   sed -i '/^UPDATE_ORIGINS=/d' "$conf"
-  echo 'UPDATE_ORIGINS=https://recoveragw.rjproductionsut.com' >> "$conf"
+  echo 'UPDATE_ORIGINS=https://recoveragw.rjproductionsut.com,https://recoveragwb.rjproductionsut.com' >> "$conf"
 fi
+# 0.6.39 configured only gateway A; add gateway B for failover.
+sed -i 's|^UPDATE_ORIGINS=https://recoveragw.rjproductionsut.com$|UPDATE_ORIGINS=https://recoveragw.rjproductionsut.com,https://recoveragwb.rjproductionsut.com|' "$conf"
 grep -q '^TRANSITION_CHANNEL=' "$conf" || echo 'TRANSITION_CHANNEL=jammy-noble-transition' >> "$conf"
 if [ -d /var/www/siris ] || [ -d /var/www/html ]; then
   python3 /usr/lib/recovera/branding/apply-branding.py /usr/local/share/recovera/recovera-logo.png

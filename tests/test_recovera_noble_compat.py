@@ -65,7 +65,8 @@ class RecoveraNobleCompatibilityTests(unittest.TestCase):
 
     def test_package_points_existing_configs_at_the_update_gateway(self):
         builder = (ROOT / "tools" / "build-recovera-appliance-deb.sh").read_text(encoding="utf-8")
-        self.assertIn("UPDATE_ORIGINS=https://recoveragw.rjproductionsut.com", builder)
+        self.assertIn("UPDATE_ORIGINS=https://recoveragw.rjproductionsut.com,https://recoveragwb.rjproductionsut.com", builder)
+        self.assertIn("s|^UPDATE_ORIGINS=https://recoveragw.rjproductionsut.com$|", builder)
         self.assertIn("grep -q '^UPDATE_ORIGINS=.'", builder)
         self.assertIn("TRANSITION_CHANNEL=jammy-noble-transition", builder)
         self.assertIn("GATEWAY_TOKEN_FILE=/etc/recovera/gateway-token", builder)

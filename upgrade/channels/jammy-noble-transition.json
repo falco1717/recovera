@@ -1,0 +1,10 @@
+{
+  "schema": 1,
+  "channel": "jammy-noble-transition",
+  "type": "image",
+  "release_tag": null,
+  "manifest_asset": null,
+  "signature_asset": null,
+  "sequence": 0,
+  "version": null
+}

@@ -133,6 +133,63 @@ class RecoveraGatewayGitHubTests(unittest.TestCase):
         request = opener.open.call_args.args[0]
         self.assertEqual(dict(request.header_items())["Authorization"], "Bearer read-only-secret")
 
+    def cache_for(self, directory, channels):
+        configuration = mock.Mock()
+        configuration.cache = Path(directory)
+        configuration.channels = channels
+        configuration.repository = "falco1717/recovera"
+        configuration.branch = "main"
+        return self.module.Cache(configuration)
+
+    @staticmethod
+    def contents(pointer):
+        import base64
+        return {"content": base64.b64encode(json.dumps(pointer).encode()).decode()}
+
+    def test_unpublished_channel_serves_an_empty_pointer(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cache = self.cache_for(directory, ["jammy-noble-transition"])
+            empty = {"schema": 1, "channel": "jammy-noble-transition", "release_tag": None,
+                     "manifest_asset": None, "signature_asset": None, "sequence": 0, "version": None}
+            with mock.patch.object(cache.github, "json", return_value=self.contents(empty)):
+                result = cache.sync_channel("jammy-noble-transition")
+            self.assertIsNone(result["release_tag"])
+            served = cache.read_channel("jammy-noble-transition")
+            self.assertIsNone(served["release_tag"])
+            self.assertEqual(served["sequence"], 0)
+            with self.assertRaises(self.module.GatewayError):
+                cache.release_channel("image-v0.7.0")
+            wrong = dict(empty, channel="stable")
+            with mock.patch.object(cache.github, "json", return_value=self.contents(wrong)):
+                with self.assertRaises(self.module.GatewayError):
+                    cache.sync_channel("jammy-noble-transition")
+
+    def test_one_failing_channel_does_not_stop_the_others(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cache = self.cache_for(directory, ["stable", "jammy-noble-transition", "noble-stable"])
+            calls = []
+
+            def sync_channel(channel):
+                calls.append(channel)
+                if channel == "jammy-noble-transition":
+                    raise self.module.GatewayError("GitHub is unavailable")
+                return {"channel": channel, "release_tag": "package-v1", "version": "1"}
+
+            with mock.patch.object(cache, "sync_channel", side_effect=sync_channel):
+                results = cache.sync()
+            self.assertEqual(calls, ["stable", "jammy-noble-transition", "noble-stable"])
+            self.assertEqual(results[1], {"channel": "jammy-noble-transition", "error": "GitHub is unavailable"})
+            self.assertEqual(results[2]["channel"], "noble-stable")
+
+    def test_saltbox_gateways_serve_the_os_upgrade_channels(self):
+        for name in ("compose.saltbox.yaml", "compose.yaml"):
+            self.assertIn("stable jammy-noble-transition noble-stable", (GATEWAY / name).read_text())
+        self.assertIn("stable jammy-noble-transition noble-stable", (GATEWAY / "install-saltbox.sh").read_text())
+        for channel in ("jammy-noble-transition", "noble-stable"):
+            pointer = json.loads((ROOT / "upgrade" / "channels" / f"{channel}.json").read_text())
+            self.assertEqual(pointer["channel"], channel)
+            self.assertEqual(pointer["schema"], 1)
+
     def test_gateway_handles_another_process_winning_release_publish(self):
         source = (GATEWAY / "recovera-gateway").read_text()
         self.assertIn("errno.ENOTEMPTY", source)

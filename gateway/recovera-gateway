@@ -210,7 +210,8 @@ class Cache:
             value = json.loads(self.channel_path(channel).read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
             raise GatewayError("channel is not cached") from exc
-        if value.get("channel") != channel or not TAG_RE.fullmatch(str(value.get("release_tag", ""))):
+        tag = value.get("release_tag")
+        if value.get("channel") != channel or (tag is not None and not TAG_RE.fullmatch(str(tag))):
             raise GatewayError("cached channel is invalid")
         return value
 
@@ -278,8 +279,18 @@ class Cache:
         except (KeyError, ValueError, json.JSONDecodeError) as exc:
             raise GatewayError("GitHub channel response is invalid") from exc
         tag = pointer.get("release_tag")
-        if (pointer.get("schema") != 1 or pointer.get("channel") != channel
-                or not TAG_RE.fullmatch(str(tag or ""))):
+        if pointer.get("schema") != 1 or pointer.get("channel") != channel:
+            raise GatewayError("channel pointer is invalid")
+        if tag is None:
+            # A declared channel with nothing published yet. Serve the empty
+            # pointer so appliances report "no release" rather than an error.
+            empty = {"schema": 1, "channel": channel, "release_tag": None, "manifest_asset": None,
+                     "signature_asset": None, "sequence": 0, "version": None}
+            atomic_bytes(self.channel_path(channel), json.dumps(
+                empty, indent=2, sort_keys=True
+            ).encode("utf-8") + b"\n", mode=0o644)
+            return {"channel": channel, "release_tag": None, "version": None}
+        if not TAG_RE.fullmatch(str(tag)):
             raise GatewayError("channel pointer is invalid")
         tag_path = urllib.parse.quote(tag, safe="")
         release = self.github.json(f"/repos/{owner_repo}/releases/tags/{tag_path}")
@@ -333,8 +344,16 @@ class Cache:
         return {"channel": channel, "release_tag": tag, "version": pointer.get("version")}
 
     def sync(self):
+        # Each channel stands alone: one unavailable channel must not stop the
+        # others (or a later one in the list) from being refreshed.
+        results = []
         with self.lock:
-            return [self.sync_channel(channel) for channel in self.configuration.channels]
+            for channel in self.configuration.channels:
+                try:
+                    results.append(self.sync_channel(channel))
+                except Exception as exc:
+                    results.append({"channel": channel, "error": str(exc)})
+        return results
 
 
 class GatewayHandler(http.server.BaseHTTPRequestHandler):
