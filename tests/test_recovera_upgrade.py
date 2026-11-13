@@ -1072,6 +1072,62 @@ class RecoveraUpgradeTests(unittest.TestCase):
         self.assertEqual(self.module.release_arguments(argparse.Namespace(
             signers=None, channel_file=arguments.channel_file, source_dir=arguments.source_dir)).source_dir, Path("assets"))
 
+    # --- 0.6.44: findings from the first end-to-end transition test ---
+
+    def test_rollback_from_the_first_image_boots_the_conventional_root(self):
+        # After a transition the state still held the 22.04 package transaction;
+        # rollback must boot 22.04, not reinstall packages that are not in the image.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = root / "state.json"
+            state.write_text(json.dumps({
+                "installed": {"schema": 1, "sequence": 43, "version": "0.6.42-noble.test2"},
+                "installed_sequence": 43,
+                "previous": {"type": "package", "version": "0.6.43", "sequence": 42},
+                "transition_last_attempt": {"version": "0.6.42-noble.test2", "result": "completed"},
+            }))
+            layout = root / "layout.json"
+            layout.write_text(json.dumps({"mode": "loop-image-v1", "fallback_entry": "gnulinux-simple-x"}))
+            release = root / "release.json"
+            release.write_text(json.dumps({"schema": 1, "sequence": 43, "version": "0.6.42-noble.test2"}))
+            boot_helper = root / "boot-helper"
+            boot_helper.write_text("")
+            environment = {"RECOVERA_UPGRADE_STATE": str(state), "RECOVERA_RELEASE_FILE": str(release),
+                           "RECOVERA_IMAGE_LAYOUT": str(layout)}
+            with mock.patch.dict("os.environ", environment), \
+                 mock.patch.object(self.module, "UpgradeLock", lambda: contextlib.nullcontext()), \
+                 mock.patch.object(self.module, "require_root", lambda: None), \
+                 mock.patch.object(self.module, "BOOT_HELPER", boot_helper), \
+                 mock.patch.object(self.module, "PENDING_MARKER", root / "pending"), \
+                 mock.patch.object(self.module, "rollback_package_transaction") as package_rollback, \
+                 mock.patch.object(self.module, "run") as run, \
+                 mock.patch("sys.stdout", new_callable=io.StringIO):
+                self.module.command_rollback({"HOST_ROOT": str(root)}, argparse.Namespace(reboot=False))
+            package_rollback.assert_not_called()
+            self.assertEqual(run.call_args_list[0].args[0], [boot_helper, "fallback"])
+            value = json.loads(state.read_text())
+            self.assertEqual(value["installed"]["version"], "0.6.43")
+            self.assertEqual(value["installed_sequence"], 42)
+            self.assertIn("rolled back", value["transition_last_attempt"]["result"])
+        source = UPDATER.read_text()
+        stage = source[source.index("def command_install_image"):source.index("def dpkg_field")]
+        self.assertIn('"last_transaction": None', stage)
+
+    def test_image_keeps_its_own_software_version_markers(self):
+        migration = (ROOT / "upgrade" / "recovera-migrate-config").read_text()
+        self.assertIn("for name in os2Version sirisUIVersion syncVersion; do", migration)
+        self.assertLess(migration.index('cp -a "$target/datto/config/$name" "$versions/$name"'),
+                        migration.index("  /datto/config \\"))
+        self.assertLess(migration.index("  /datto/config \\"),
+                        migration.index('cp -a "$versions/$name" "$target/datto/config/$name"'))
+
+    def test_image_builder_copies_boot_and_drops_installer_payload(self):
+        builder = (ROOT / "tools" / "build-upgrade-image.sh").read_text()
+        self.assertIn('if mountpoint -q "$ROOT/boot"; then', builder)
+        self.assertIn("--exclude='/home/*'", builder)
+        self.assertIn("--exclude='/var/log/journal/*'", builder)
+        self.assertIn("! -name 'recovera-appliance_*.deb' -delete", builder)
+
 
 if __name__ == "__main__":
     unittest.main()

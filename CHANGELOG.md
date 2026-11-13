@@ -1,5 +1,27 @@
 # Changelog
 
+## v0.6.44 - 2026-11-13
+
+Fixes from the first end-to-end Ubuntu 22.04 → 24.04 transition on a test
+appliance (Recovera-Builder): the unattended upgrade completed, the 24.04 image
+passed validation with its hostname, host ID, MAC/IP, time zone, registration
+and pool intact, and the GRUB fallback returned it to the untouched 22.04 root.
+
+- `recovera-upgrade rollback` on the first image now boots the previous system.
+  It used to find the 22.04 package transaction still in the shared state and
+  try to reinstall packages whose files exist only on the 22.04 root. Staging an
+  image clears that transaction, and a boot rollback records the previous system
+  as installed and ends the transition approval.
+- The image keeps its own software-version markers (`/datto/config/os2Version`,
+  `sirisUIVersion`, `syncVersion`); the migration had overwritten 5.12.2 with the
+  22.04 appliance's 5.6.3.
+- Image builder: copies a separately mounted `/boot` (Ubuntu 24.04 cloud images
+  keep the kernels there, so the first build had none), leaves out files under
+  `/home` (the backup pool's mountpoint) and the builder's journal and apt
+  archives, and keeps only `recovera-appliance` from the 2 GB offline installer
+  package set.
+- Readiness checks that pass now say so instead of showing their failure text.
+
 ## v0.6.43 - 2026-11-13
 
 - The operating-system image migration also carries NetworkManager's

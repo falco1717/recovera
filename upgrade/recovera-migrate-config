@@ -13,6 +13,13 @@ copy_path() {
   rsync -aHAX --numeric-ids --relative "$path" "$target/"
 }
 
+# /datto/config is carried as appliance state, but these files describe the
+# installed software, which the image replaces. Keep the image's values.
+versions=$(mktemp -d)
+for name in os2Version sirisUIVersion syncVersion; do
+  [ -e "$target/datto/config/$name" ] && cp -a "$target/datto/config/$name" "$versions/$name"
+done
+
 # Explicitly scoped persistent state. Never copy recovery points, transient
 # runtime state, logs, caches, package databases, or a complete /etc tree.
 for path in \
@@ -40,6 +47,10 @@ for path in \
   copy_path "$path"
 done
 for path in /etc/ssh/ssh_host_*; do copy_path "$path"; done
+for name in os2Version sirisUIVersion syncVersion; do
+  [ -e "$versions/$name" ] && cp -a "$versions/$name" "$target/datto/config/$name"
+done
+rm -rf "$versions"
 # Ubuntu 24.04 NetworkManager keeps connections as netplan files.
 for path in /etc/netplan/90-NM-*.yaml; do copy_path "$path"; done
 
