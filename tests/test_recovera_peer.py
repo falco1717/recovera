@@ -1,4 +1,7 @@
 import contextlib
+import argparse
+import contextlib
+import subprocess
 import importlib.machinery
 import importlib.util
 import json
@@ -1497,6 +1500,63 @@ class RecoveraPeerTests(unittest.TestCase):
         with mock.patch.object(self.peer, "run", return_value=mock.Mock(returncode=1, stdout=b"")):
             self.assertEqual(self.peer.php_fpm_service(), "php8.1-fpm.service")
         self.assertNotIn('"restart", "php8.1-fpm.service"', SCRIPT.read_text(encoding="utf-8"))
+
+    # --- 0.6.39: OS upgrade and gateway token endpoints ---
+
+    def test_os_upgrade_start_approves_then_runs_in_its_own_unit(self):
+        self.peer.UPGRADE_COMMAND.parent.mkdir(parents=True, exist_ok=True)
+        self.peer.UPGRADE_COMMAND.write_text("#!/bin/sh\n")
+        calls = []
+
+        def fake_run(argv, **kwargs):
+            calls.append((argv, kwargs))
+            output = b'{"available": true, "version": "0.7.0"}' if "check-transition" in argv else b"{}"
+            return mock.Mock(returncode=0, stdout=output, stderr=b"")
+
+        with mock.patch.object(self.peer, "run", side_effect=fake_run):
+            result = self.peer.upgrade_transition_action({"action": "start", "version": "0.7.0"})
+        self.assertTrue(result["available"])
+        commands = [argv for argv, _ in calls]
+        approve = next(argv for argv in commands if "approve-transition" in argv)
+        self.assertEqual(approve[-4:], ["--version", "0.7.0", "--start", "now"])
+        unit = next(argv for argv in commands if argv[0] == "systemd-run")
+        self.assertIn("--unit=recovera-os-upgrade", unit)
+        self.assertEqual(unit[-2:], ["install-transition", "--if-approved"])
+        self.assertLess(commands.index(approve), commands.index(unit))
+
+        calls.clear()
+        with mock.patch.object(self.peer, "run", side_effect=fake_run):
+            self.peer.upgrade_transition_action({"action": "approve", "version": "0.7.0"})
+            self.peer.upgrade_transition_action({"action": "cancel"})
+        commands = [argv for argv, _ in calls]
+        self.assertFalse(any(argv[0] == "systemd-run" for argv in commands))
+        self.assertTrue(any("cancel-transition" in argv for argv in commands))
+        for bad in ({"action": "start", "version": "../x"}, {"action": "explode"}):
+            with self.subTest(bad=bad), self.assertRaises(self.peer.PeerError):
+                self.peer.upgrade_transition_action(bad)
+
+    def test_gateway_token_is_passed_on_stdin_not_argv(self):
+        self.peer.UPGRADE_COMMAND.parent.mkdir(parents=True, exist_ok=True)
+        self.peer.UPGRADE_COMMAND.write_text("#!/bin/sh\n")
+        result = mock.Mock(returncode=0, stdout=b'{"installed": true}', stderr=b"")
+        with mock.patch.object(self.peer, "run", return_value=result) as execute:
+            self.assertTrue(self.peer.upgrade_gateway_token({"token": " rgt1.abc.def \n"})["installed"])
+        argv = execute.call_args.args[0]
+        self.assertEqual(argv[-1], "set-gateway-token")
+        self.assertNotIn("rgt1.abc.def", " ".join(argv))
+        self.assertEqual(execute.call_args.kwargs["input_data"], b"rgt1.abc.def")
+        with self.assertRaises(self.peer.PeerError):
+            self.peer.upgrade_gateway_token({"token": ""})
+        failed = mock.Mock(returncode=1, stdout=b"", stderr=b"recovera-upgrade: 401 from gateway")
+        with mock.patch.object(self.peer, "run", return_value=failed):
+            with self.assertRaisesRegex(self.peer.PeerError, "^401 from gateway$"):
+                self.peer.upgrade_gateway_token({"token": "rgt1.a.b"})
+        controller = CONTROLLER.read_text(encoding="utf-8")
+        self.assertIn("'update-transition' => [$request->isMethod('POST') ? 'POST' : 'GET', '/v1/admin/update/transition']", controller)
+        self.assertIn("'update-gateway-token' => ['POST', '/v1/admin/update/gateway-token']", controller)
+        panel = (SCRIPT.parents[1] / "branding" / "RecoveraDeviceSettings.js").read_text(encoding="utf-8")
+        self.assertIn("settingRecoveraOsUpgrade", panel)
+        self.assertIn("request('update-gateway-token', 'POST'", panel)
 
 
 if __name__ == "__main__":

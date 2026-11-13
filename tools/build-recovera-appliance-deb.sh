@@ -155,6 +155,16 @@ install -d -m 0755 /etc/recovera /var/cache/recovera-upgrade/packages /var/lib/r
 if [ ! -f /etc/recovera/upgrade.conf ]; then
   install -m 0600 /usr/share/recovera/defaults/upgrade.conf /etc/recovera/upgrade.conf
 fi
+# Existing configurations predate the update gateway. Add it (it is used once a
+# gateway access token is installed; until then GitHub remains the source) and
+# the opt-in operating-system upgrade channel. Explicit values are kept.
+conf=/etc/recovera/upgrade.conf
+grep -q '^GATEWAY_TOKEN_FILE=' "$conf" || echo 'GATEWAY_TOKEN_FILE=/etc/recovera/gateway-token' >> "$conf"
+if ! grep -q '^UPDATE_ORIGINS=.' "$conf"; then
+  sed -i '/^UPDATE_ORIGINS=/d' "$conf"
+  echo 'UPDATE_ORIGINS=https://recoveragw.rjproductionsut.com' >> "$conf"
+fi
+grep -q '^TRANSITION_CHANNEL=' "$conf" || echo 'TRANSITION_CHANNEL=jammy-noble-transition' >> "$conf"
 if [ -d /var/www/siris ] || [ -d /var/www/html ]; then
   python3 /usr/lib/recovera/branding/apply-branding.py /usr/local/share/recovera/recovera-logo.png
 fi

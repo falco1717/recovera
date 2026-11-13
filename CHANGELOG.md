@@ -1,5 +1,29 @@
 # Changelog
 
+## v0.6.39 - 2026-11-13
+
+Updates through the Recovera update gateway by default, and an operating-system
+upgrade that appliances pull from it and run unattended once an administrator
+approves it.
+
+- `UPDATE_ORIGINS` defaults to `https://recoveragw.rjproductionsut.com`, and the
+  package adds it, `GATEWAY_TOKEN_FILE` and `TRANSITION_CHANNEL` to existing
+  configurations that lack them (explicit values are kept). Without a gateway
+  access token an appliance keeps updating from GitHub instead of failing.
+- The update page shows the update source (gateway and token subject/expiry,
+  or GitHub) and accepts a gateway access token, which
+  `recovera-upgrade set-gateway-token` verifies against the gateway before
+  keeping it (and rolls back otherwise).
+- New **Operating System Upgrade** card: the published upgrade on the
+  `jammy-noble-transition` channel, a readiness checklist, and **Install in the
+  next update window** / **Install now** / **Cancel**.
+- `recovera-upgrade check-transition`, `approve-transition`,
+  `cancel-transition` and `install-transition`. The update window runs an
+  approved upgrade when no package update is due: layout conversion, a
+  replication drain (deferred to the next window if transfers do not finish),
+  then the verified image install and reboot. Validation failure or a crash
+  returns to the previous system and clears the approval; success clears it too.
+
 ## v0.6.38 - 2026-11-12
 
 One code base for both application releases: 5.6.x on Ubuntu 22.04 (the

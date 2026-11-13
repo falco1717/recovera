@@ -74,6 +74,32 @@ explicitly so all three operations update the files firmware actually reads.
 
 ## Moving an existing appliance to a new Ubuntu release
 
+From Recovera 0.6.39 the upgrade is delivered like any other release, through
+the update gateway, and an administrator only approves it:
+
+1. Publish the transition image on the `jammy-noble-transition` channel
+   (`upgrade/channels/jammy-noble-transition.json`). Appliances never install
+   from that channel on their own.
+2. On each appliance, **Configure → Device → Operating System Upgrade** shows
+   the available upgrade, its download size and a readiness checklist (starting
+   release, Recovera version, pool health, disk space, replication, restores).
+3. **Install in the next update window** approves it; **Install now** starts it
+   at once in its own `recovera-os-upgrade` unit. Either way it then runs
+   unattended (`recovera-upgrade install-transition`): it converts the boot
+   layout if needed, pauses replication and waits up to three hours for running
+   transfers (otherwise it releases the hold and retries in the next window),
+   downloads and verifies the image from the gateway, and reboots into it.
+4. The new system boots once and becomes the default only after validation. A
+   failure or crash returns the appliance to its previous system and clears the
+   approval, so it does not retry until approved again. The page shows the last
+   attempt.
+
+The command-line equivalents are `recovera-upgrade check-transition`,
+`approve-transition --version V [--start now]`, `cancel-transition` and
+`install-transition`. The manual procedure below remains available.
+
+### Manual procedure
+
 An appliance installed from the OVA runs from a conventional ext4 root. It can
 still move to a new Ubuntu release (22.04 to 24.04) without a hypervisor
 snapshot, because the new release arrives as a loop image and the 22.04 root

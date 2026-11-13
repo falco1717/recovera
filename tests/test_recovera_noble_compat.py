@@ -63,6 +63,13 @@ class RecoveraNobleCompatibilityTests(unittest.TestCase):
         self.assertIn("app/console.php cache:clear --env=prod", setup)
         self.assertIn("app/console.php cache:warmup --env=prod", setup)
 
+    def test_package_points_existing_configs_at_the_update_gateway(self):
+        builder = (ROOT / "tools" / "build-recovera-appliance-deb.sh").read_text(encoding="utf-8")
+        self.assertIn("UPDATE_ORIGINS=https://recoveragw.rjproductionsut.com", builder)
+        self.assertIn("grep -q '^UPDATE_ORIGINS=.'", builder)
+        self.assertIn("TRANSITION_CHANNEL=jammy-noble-transition", builder)
+        self.assertIn("GATEWAY_TOKEN_FILE=/etc/recovera/gateway-token", builder)
+
 
 if __name__ == "__main__":
     unittest.main()

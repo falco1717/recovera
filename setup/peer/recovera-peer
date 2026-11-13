@@ -2449,6 +2449,65 @@ def upgrade_output(command: str, *, timeout: int) -> subprocess.CompletedProcess
     return result
 
 
+def upgrade_command(arguments: list[str], *, timeout: int,
+                    input_data: bytes | None = None) -> dict[str, Any]:
+    """Run a recovera-upgrade subcommand that prints JSON."""
+    if not UPGRADE_COMMAND.is_file():
+        raise PeerError("Recovera updater is not installed")
+    result = run([str(UPGRADE_COMMAND), "--config", str(UPGRADE_CONFIG_PATH), *arguments],
+                 check=False, timeout=timeout, input_data=input_data)
+    if result.returncode != 0:
+        detail = result.stderr.decode("utf-8", "replace").strip()
+        raise PeerError(detail.removeprefix("recovera-upgrade: ") or "update command failed")
+    output = result.stdout.decode("utf-8", "replace").strip()
+    try:
+        return json.loads(output)
+    except json.JSONDecodeError:
+        return {"message": output}
+
+
+def upgrade_transition_status() -> dict[str, Any]:
+    """The published operating-system upgrade, readiness and approval."""
+    require_root()
+    return upgrade_command(["check-transition", "--cache"], timeout=180)
+
+
+def upgrade_transition_action(body: dict[str, Any]) -> dict[str, Any]:
+    """Approve (next update window), start now, or cancel the OS upgrade."""
+    require_root()
+    action = str(body.get("action", ""))
+    if action == "cancel":
+        upgrade_command(["cancel-transition"], timeout=60)
+        return upgrade_transition_status()
+    if action not in ("approve", "start"):
+        raise PeerError("unknown operating-system upgrade action")
+    version = str(body.get("version", ""))
+    if not re.fullmatch(r"[0-9A-Za-z][0-9A-Za-z._-]{0,63}", version):
+        raise PeerError("an operating-system upgrade version is required")
+    upgrade_command(["approve-transition", "--version", version,
+                     "--start", "now" if action == "start" else "window"], timeout=180)
+    if action == "start":
+        # Its own transient unit: the upgrade drains replication, converts the
+        # boot layout, downloads several GB and reboots, so it must not run in
+        # this web service (or its mount namespace).
+        result = run(["systemd-run", "--quiet", "--collect", "--unit=recovera-os-upgrade",
+                      str(UPGRADE_COMMAND), "--config", str(UPGRADE_CONFIG_PATH),
+                      "install-transition", "--if-approved"], check=False, timeout=15)
+        if result.returncode != 0:
+            raise PeerError("could not start the operating-system upgrade: " +
+                            result.stderr.decode("utf-8", "replace").strip())
+    return upgrade_transition_status()
+
+
+def upgrade_gateway_token(body: dict[str, Any]) -> dict[str, Any]:
+    """Install an update gateway access token (validated against the gateway)."""
+    require_root()
+    token = str(body.get("token", "")).strip()
+    if not token or len(token) > 8192:
+        raise PeerError("paste the gateway access token issued for this appliance")
+    return upgrade_command(["set-gateway-token"], timeout=120, input_data=token.encode("ascii", "replace"))
+
+
 def default_upgrade_policy() -> dict[str, Any]:
     return {"channel": "stable", "window": {"start": 21, "end": 5}}
 
@@ -2614,6 +2673,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             elif self.path in ("/v1/admin/status", "/v1/admin/queue-status", "/v1/admin/offsite",
                                 "/v1/admin/backup-admin-credential", "/v1/admin/update/status",
                                 "/v1/admin/update/check", "/v1/admin/update/policy",
+                                "/v1/admin/update/transition",
                                 "/v1/admin/storage/status", "/v1/admin/replication-activity",
                                 "/v1/admin/network-check", "/v1/admin/network-check/last"):
                 if not self.admin():
@@ -2630,6 +2690,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     self.reply(200, upgrade_status(check=True))
                 elif self.path == "/v1/admin/update/policy":
                     self.reply(200, {"policy": upgrade_policy()})
+                elif self.path == "/v1/admin/update/transition":
+                    self.reply(200, upgrade_transition_status())
                 elif self.path == "/v1/admin/storage/status":
                     self.reply(200, storage_expand_status())
                 elif self.path == "/v1/admin/replication-activity":
@@ -2700,6 +2762,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.reply(200, upgrade_install())
             elif self.path == "/v1/admin/update/policy":
                 self.reply(200, set_upgrade_policy(body))
+            elif self.path == "/v1/admin/update/transition":
+                self.reply(200, upgrade_transition_action(body))
+            elif self.path == "/v1/admin/update/gateway-token":
+                self.reply(200, upgrade_gateway_token(body))
             elif self.path == "/v1/admin/storage/expand":
                 if body.get("confirm") != "expand-to-maximum":
                     raise PeerError("storage expansion confirmation is required")

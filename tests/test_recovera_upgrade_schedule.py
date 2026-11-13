@@ -48,16 +48,22 @@ class RecoveraUpgradeScheduleTests(unittest.TestCase):
         )
 
     def test_current_release_does_not_install(self):
+        # With no package update due, only an approved OS upgrade may run.
         check = subprocess.CompletedProcess([], 3, "", "")
-        status, runner = self.run_inside_window([check])
+        transition = subprocess.CompletedProcess([], 0, "", "")
+        status, runner = self.run_inside_window([check, transition])
         self.assertEqual(status, 0)
-        self.assertEqual(runner.call_count, 1)
+        self.assertEqual(runner.call_args_list[-1],
+                         mock.call([self.module.UPDATER, "install-transition", "--if-approved"], check=False))
 
     def test_no_available_release_does_not_install(self):
+        # With no package update due, only an approved OS upgrade may run.
         check = subprocess.CompletedProcess([], 0, json.dumps({"available": False}), "")
-        status, runner = self.run_inside_window([check])
+        transition = subprocess.CompletedProcess([], 0, "", "")
+        status, runner = self.run_inside_window([check, transition])
         self.assertEqual(status, 0)
-        self.assertEqual(runner.call_count, 1)
+        self.assertEqual(runner.call_args_list[-1],
+                         mock.call([self.module.UPDATER, "install-transition", "--if-approved"], check=False))
 
     def test_invalid_check_output_fails_closed(self):
         check = subprocess.CompletedProcess([], 0, "not-json", "")
