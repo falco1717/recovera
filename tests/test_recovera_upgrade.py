@@ -876,7 +876,7 @@ class RecoveraUpgradeTests(unittest.TestCase):
             self.assertEqual(source["token"]["subject"], "Backup-Bitches")
             self.assertFalse(source["token"]["expired"])
         conf = (ROOT / "upgrade" / "recovera-upgrade.conf").read_text()
-        self.assertIn("UPDATE_ORIGINS=https://recoveragw.rjproductionsut.com", conf)
+        self.assertIn("UPDATE_ORIGINS=https://recoveragw.rjproductionsut.com,https://recoveragwb.rjproductionsut.com", conf)
         self.assertIn("TRANSITION_CHANNEL=jammy-noble-transition", conf)
 
     def test_gateway_token_is_validated_before_installing(self):
@@ -923,7 +923,7 @@ class RecoveraUpgradeTests(unittest.TestCase):
                      mock.patch.object(self.module, "fetch_channel", return_value={}) as fetch:
                     self.assertEqual(self.module.command_set_gateway_token(config, arguments), 0)
                 fetched = fetch.call_args.args[0]
-                self.assertEqual(fetched["UPDATE_ORIGINS"], "https://recoveragw.rjproductionsut.com")
+                self.assertEqual(fetched["UPDATE_ORIGINS"], "https://recoveragw.rjproductionsut.com,https://recoveragwb.rjproductionsut.com")
             self.assertEqual(token_path.read_text().strip(), good)
             self.assertIn("GATEWAY_TOKEN_FILE=" + str(token_path), conf.read_text())
 

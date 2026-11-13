@@ -41,7 +41,7 @@ DEFAULT_OS_RELEASE = Path("/etc/os-release")
 LEGACY_OS = ("ubuntu", "22.04")
 PHP_FPM_SERVICE_RE = re.compile(r"^php(?:[0-9]+\.[0-9]+)?-fpm(?:\.service)?$")
 CHANNEL_RE = re.compile(r"^[0-9A-Za-z][0-9A-Za-z._-]{0,31}$")
-DEFAULT_UPDATE_ORIGIN = "https://recoveragw.rjproductionsut.com"
+DEFAULT_UPDATE_ORIGIN = "https://recoveragw.rjproductionsut.com,https://recoveragwb.rjproductionsut.com"
 DEFAULT_TRANSITION_CHANNEL = "jammy-noble-transition"
 GATEWAY_TOKEN_RE = re.compile(r"^rgt1\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$")
 SHARE_DIR = Path("/usr/local/share/recovera-upgrade")
@@ -1398,7 +1398,11 @@ def transition_status(config, args, directory):
         result["detail"] = "No operating-system upgrade has been published."
         return result, None
     except UpgradeError as exc:
-        result["detail"] = f"Could not check for an operating-system upgrade: {exc}"
+        if "(404)" in str(exc):
+            # Gateways that do not carry the channel yet.
+            result["detail"] = "No operating-system upgrade has been published."
+        else:
+            result["detail"] = f"Could not check for an operating-system upgrade: {exc}"
         return result, None
     manifest = release[2]
     origin = manifest.get("from") or {}

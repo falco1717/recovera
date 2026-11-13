@@ -65,8 +65,9 @@ repository becomes private.
 
 ## Default gateway
 
-Appliances from Recovera 0.6.39 list `https://recoveragw.rjproductionsut.com`
-in `UPDATE_ORIGINS` (the package adds it to older configurations that have no
+Appliances from Recovera 0.6.40 list `https://recoveragw.rjproductionsut.com`
+(gateway A, on jprod-sb; also `recoveragwa`) and `https://recoveragwb.rjproductionsut.com`
+(gateway B, on rj-or-sb) in `UPDATE_ORIGINS` (the package adds it to older configurations that have no
 origin). The gateway is used as soon as an access token is installed; an
 appliance without a token keeps updating from GitHub directly. The update page
 shows the source in use and the token's subject and expiry.

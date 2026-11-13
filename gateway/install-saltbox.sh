@@ -56,7 +56,7 @@ for alias in "${aliases[@]}"; do rule="$rule || Host(\`$alias\`)"; done
 {
   printf 'RECOVERA_GATEWAY_TRAEFIK_RULE=%s\n' "$rule"
   printf 'RECOVERA_GATEWAY_REPOSITORY=%s\n' "${RECOVERA_GATEWAY_REPOSITORY:-falco1717/recovera}"
-  printf 'RECOVERA_GATEWAY_CHANNELS=stable\n'
+  printf 'RECOVERA_GATEWAY_CHANNELS=%s\n' "${RECOVERA_GATEWAY_CHANNELS:-stable jammy-noble-transition noble-stable}"
   printf 'RECOVERA_GATEWAY_SYNC_INTERVAL=900\n'
 } >"$gateway_dir/.env.saltbox"
 chmod 0600 "$gateway_dir/.env.saltbox"

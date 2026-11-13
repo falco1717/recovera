@@ -1,5 +1,18 @@
 # Changelog
 
+## v0.6.40 - 2026-11-13
+
+- Both update gateways are configured: `recoveragw` (gateway A, jprod-sb) and
+  `recoveragwb` (gateway B, rj-or-sb), tried in order. The package adds gateway
+  B to configurations that 0.6.39 pointed at gateway A only.
+- The gateways also serve the `jammy-noble-transition` and `noble-stable`
+  channels. A channel with nothing published is served as an empty pointer, so
+  the Operating System Upgrade card reports "No operating-system upgrade has
+  been published" instead of a gateway error, and one unavailable channel no
+  longer stops the gateway from refreshing the others.
+- Empty `jammy-noble-transition` and `noble-stable` channel pointers are
+  committed, ready for the first releases.
+
 ## v0.6.39 - 2026-11-13
 
 Updates through the Recovera update gateway by default, and an operating-system
