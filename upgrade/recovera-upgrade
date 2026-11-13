@@ -1697,6 +1697,10 @@ def parser():
     install_transition.add_argument("--if-approved", action="store_true")
     install_transition.add_argument("--drain-wait", type=int, default=3 * 3600)
     install_transition.add_argument("--no-reboot", dest="reboot", action="store_false")
+    for command in (check_transition, approve, install_transition):
+        # Local pointer and assets, for testing a transition before it is published.
+        command.add_argument("--channel-file", type=Path)
+        command.add_argument("--source-dir", type=Path)
     prepare = sub.add_parser("prepare-image-layout")
     prepare.add_argument("--dry-run", action="store_true")
     revert = sub.add_parser("revert-image-layout")

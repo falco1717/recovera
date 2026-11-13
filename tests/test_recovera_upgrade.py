@@ -1056,6 +1056,19 @@ class RecoveraUpgradeTests(unittest.TestCase):
         self.assertIn('UPDATER, "install-transition", "--if-approved"', schedule)
         self.assertNotIn('"approve-transition"', schedule)
 
+    def test_image_builder_strips_builder_network_and_login_identity(self):
+        builder = (ROOT / "tools" / "build-upgrade-image.sh").read_text()
+        for value in ('"$mountpoint/etc/netplan"/90-NM-*.yaml', '"$mountpoint/root/.ssh/authorized_keys"',
+                      '"$mountpoint/var/lib/NetworkManager/secret_key"', '"$mountpoint/etc/recovera/gateway-token"',
+                      'cloud-init.disabled', 'passwd -l ubuntu'):
+            self.assertIn(value, builder)
+        migration = (ROOT / "upgrade" / "recovera-migrate-config").read_text()
+        self.assertIn("for path in /etc/netplan/90-NM-*.yaml; do copy_path", migration)
+        arguments = self.module.parser().parse_args(
+            ["install-transition", "--channel-file", "pointer.json", "--source-dir", "assets"])
+        self.assertEqual(self.module.release_arguments(argparse.Namespace(
+            signers=None, channel_file=arguments.channel_file, source_dir=arguments.source_dir)).source_dir, Path("assets"))
+
 
 if __name__ == "__main__":
     unittest.main()
