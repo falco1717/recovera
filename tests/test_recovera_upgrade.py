@@ -368,7 +368,7 @@ class RecoveraUpgradeTests(unittest.TestCase):
         self.assertNotIn('mount --rbind "/$filesystem"', builder)
         self.assertIn('mount -t sysfs sysfs "$mountpoint/sys"', builder)
         self.assertIn('--compression-level)', builder)
-        self.assertIn('xz -T0 "-$COMPRESSION_LEVEL"', builder)
+        self.assertIn('xz -T0 --memlimit-compress="${RECOVERA_XZ_MEMLIMIT:-1GiB}" "-$COMPRESSION_LEVEL"', builder)
         self.assertIn("minimum_bytes + 2 * 1024 * 1024 * 1024", builder)
         self.assertIn("RECOVERA_IMAGE_WORK_ROOT", builder)
 
