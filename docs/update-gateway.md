@@ -127,9 +127,33 @@ cd gateway
 sudo docker compose ps
 sudo docker compose logs --tail=100 gateway
 sudo docker compose exec -T gateway /opt/recovera-gateway/recovera-gateway sync
+sudo docker compose exec -T gateway /opt/recovera-gateway/recovera-gateway status
 sudo docker compose pull
 sudo docker compose up -d --build
 ```
+
+`status` prints what the last synchronization recorded: each channel's cached
+release, version and sequence, its last success and last error, and the free
+space in the cache. It contains no tokens.
+
+### Cache behaviour for large images
+
+- A release becomes visible only after every asset in its signed manifest has
+  been downloaded and verified in a temporary directory and renamed into
+  place; the channel pointer is written after that.
+- Before downloading a release the gateway checks that the cache can hold it
+  plus a reserve (`RECOVERA_GATEWAY_SPACE_RESERVE`, default 1 GiB).
+- A cached release is verified in full once, then again only if its files
+  change; a 2 GB operating-system image is not re-hashed every interval.
+- After a synchronization in which every channel succeeded, releases that no
+  channel uses are removed. Each channel keeps its current release and
+  `RECOVERA_GATEWAY_KEEP_PREVIOUS` earlier ones (default 1), so an appliance
+  part-way through a download can finish it. Nothing is removed after a failed
+  synchronization.
+- Release assets are served with `Accept-Ranges: bytes`. One byte range per
+  request is honoured (206 with `Content-Range`); malformed, multi-part and
+  out-of-range requests get 416. Appliances use this to resume an interrupted
+  image part instead of restarting it.
 
 Monitor `/healthz` externally at every location. Also perform an authenticated
 channel check; `/healthz` intentionally proves only that the process is alive.

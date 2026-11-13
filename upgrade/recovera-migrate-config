@@ -47,6 +47,21 @@ for path in \
   copy_path "$path"
 done
 for path in /etc/ssh/ssh_host_*; do copy_path "$path"; done
+# Administrator-created sudo rules (such as one for backup-admin) belong to the
+# local accounts carried below. Package-owned rules come from the image, and
+# every carried rule must pass visudo or it is left behind.
+for path in /etc/sudoers.d/*; do
+  [ -f "$path" ] && [ ! -L "$path" ] || continue
+  name=${path##*/}
+  case "$name" in *~|*.*) continue;; esac  # sudo ignores these names
+  [ "$(stat -c %u "$path")" = 0 ] || continue
+  dpkg -S "$path" >/dev/null 2>&1 && continue
+  install -D -m 0440 -o root -g root "$path" "$target/etc/sudoers.d/$name"
+  if ! visudo -cqf "$target/etc/sudoers.d/$name" >/dev/null 2>&1; then
+    rm -f "$target/etc/sudoers.d/$name"
+    echo "left sudo rule $name behind: visudo rejected it" >&2
+  fi
+done
 for name in os2Version sirisUIVersion syncVersion; do
   [ -e "$versions/$name" ] && cp -a "$versions/$name" "$target/datto/config/$name"
 done
