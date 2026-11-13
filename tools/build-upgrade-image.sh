@@ -97,7 +97,20 @@ mounted=yes
 rsync -aHAX --numeric-ids --one-file-system \
   --exclude=/dev --exclude=/proc --exclude=/sys --exclude=/run --exclude=/tmp \
   --exclude=/host --exclude=/mnt --exclude=/media --exclude=/var/tmp \
+  --exclude='/home/*' --exclude='/var/log/journal/*' --exclude='/var/cache/apt/archives/*.deb' \
   "$ROOT"/ "$mountpoint"/
+# Ubuntu 24.04 cloud images keep /boot on its own partition, which
+# --one-file-system skips. The image boots its kernel from its own /boot.
+if mountpoint -q "$ROOT/boot"; then
+  rsync -aHAX --numeric-ids --one-file-system --exclude=/efi --exclude=/grub \
+    "$ROOT/boot"/ "$mountpoint/boot"/
+fi
+
+# The offline installer's package set (~2 GB) is not needed once installed;
+# keep only the control package, the rollback baseline for package updates.
+if [ -d "$mountpoint/opt/recovera/debs" ]; then
+  find "$mountpoint/opt/recovera/debs" -maxdepth 1 -type f ! -name 'recovera-appliance_*.deb' -delete
+fi
 
 # A release image is generic. The receiving appliance injects its identity only
 # after the signed base image has been verified. Never publish builder secrets.

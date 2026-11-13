@@ -590,12 +590,17 @@ def transition_readiness(manifest, host, *, require_drained):
     origin = manifest.get("from") or {}
     os_info = local_os()
     starts = origin.get("os_version_ids") or []
-    add("starting-release", os_info.get("version_id") in starts,
-        f"this transition starts from Ubuntu {', '.join(starts)}; this appliance runs "
-        f"{os_info.get('version_id') or 'an unknown release'}")
+    current = os_info.get("version_id") or "an unknown release"
+    starting = current in starts
+    add("starting-release", starting,
+        f"Runs Ubuntu {current}, which this upgrade supports" if starting else
+        f"this transition starts from Ubuntu {', '.join(starts)}; this appliance runs {current}")
     minimum = origin.get("minimum_version")
     if minimum:
-        add("recovera-version", version_at_least(installed_version("recovera-appliance"), minimum),
+        installed = installed_version("recovera-appliance")
+        recent = version_at_least(installed, minimum)
+        add("recovera-version", recent,
+            f"Recovera {installed} is installed (needs {minimum} or newer)" if recent else
             f"install Recovera {minimum} or newer before this transition")
     health = pool_health()
     add("pool", health == "ONLINE", f"homePool is {health or 'not imported'}, not ONLINE"
@@ -604,7 +609,8 @@ def transition_readiness(manifest, host, *, require_drained):
     needed = int(image["size"]) + int(image["uncompressed_size"]) + 1024 * 1024 * 1024
     free = shutil.disk_usage(host if Path(host).exists() else "/").free
     add("disk-space", free >= needed,
-        f"the image host needs {needed // 2**20} MiB free and has {free // 2**20} MiB")
+        f"{free // 2**20} MiB free on the system disk; the upgrade needs {needed // 2**20} MiB" if free >= needed
+        else f"the image host needs {needed // 2**20} MiB free and has {free // 2**20} MiB")
     drained, detail = replication_drained()
     add("replication", drained, detail, blocking=require_drained)
     restores = active_restores()
@@ -909,6 +915,9 @@ def command_install_image(config, args, release):
                         "transition": bool(manifest.get("from"))},
             "previous": current,
             "release_tag": pointer["release_tag"],
+            # A package transaction belongs to the root being replaced; its
+            # rollback files are not in the new image.
+            "last_transaction": None,
         })
         atomic_json(state_path(), state)
         PENDING_MARKER.touch(mode=0o600, exist_ok=True)
@@ -1259,6 +1268,23 @@ def command_validation_failed(config, args):
             run(["systemctl", "reboot"])
 
 
+def record_boot_rollback(state, previous):
+    """After selecting the previous system for the next boot, record it as installed."""
+    current = current_release()
+    state["last_rollback"] = {"version": current.get("version"), "time": int(time.time()),
+                              "reason": "operator requested rollback"}
+    if previous.get("version"):
+        state["installed"] = previous
+        state["installed_sequence"] = int(previous.get("sequence", 0))
+    state["pending"] = None
+    state["transition_approval"] = None
+    if current.get("version") and (state.get("transition_last_attempt") or {}).get("version") == current.get("version"):
+        state["transition_last_attempt"] = {"time": int(time.time()), "version": current.get("version"),
+                                            "result": "rolled back by an administrator to the previous system"}
+    atomic_json(state_path(), state)
+    PENDING_MARKER.unlink(missing_ok=True)
+
+
 def command_rollback(config, args):
     require_root()
     with UpgradeLock():
@@ -1280,9 +1306,11 @@ def command_rollback(config, args):
             print(f"Rolled back Recovera package release {transaction.get('version')}.")
         elif previous_image_available(previous, config) and BOOT_HELPER.exists():
             run([BOOT_HELPER, "rollback", previous["version"]])
+            record_boot_rollback(state, previous)
             print(f"Selected Recovera image {previous['version']} for rollback.")
         elif read_json(layout_path(), {}).get("fallback_entry") and BOOT_HELPER.exists():
             run([BOOT_HELPER, "fallback"])
+            record_boot_rollback(state, previous)
             print("Selected the conventional installation for rollback.")
         else:
             raise UpgradeError("there is no rollback transaction available")
