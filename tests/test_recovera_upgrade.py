@@ -1,7 +1,10 @@
 import argparse
+import os
+import base64
 import contextlib
 import subprocess
 import sys
+import argparse
 import importlib.machinery
 import importlib.util
 import io
@@ -240,15 +243,16 @@ class RecoveraUpgradeTests(unittest.TestCase):
             "CHANNEL_BRANCH": "main", "HOST_ROOT": "/host",
             "UPDATE_ORIGINS": "https://west.example https://east.example",
         }
-        with mock.patch.object(
+        with mock.patch.dict("os.environ", {"RECOVERA_GATEWAY_TOKEN": "rgt1.e30.c2ln"}), \
+             mock.patch.object(
             self.module, "request",
             side_effect=[self.module.UpgradeError("west unavailable"),
                          io.BytesIO(json.dumps(pointer).encode())],
         ) as requester:
             self.assertEqual(self.module.fetch_channel(config), pointer)
+            assets = self.module.release_assets(pointer, config)
         self.assertEqual(requester.call_count, 2)
         self.assertEqual(config["_ACTIVE_GATEWAY_ORIGIN"], "https://east.example")
-        assets = self.module.release_assets(pointer, config)
         self.assertEqual(assets["__release_base_urls__"], [
             "https://east.example/v1/releases/package-v0.7.0",
             "https://west.example/v1/releases/package-v0.7.0",
@@ -848,6 +852,209 @@ class RecoveraUpgradeTests(unittest.TestCase):
         control = (ROOT / "tools" / "build-recovera-appliance-deb.sh").read_text()
         self.assertIn('"$stage/usr/local/share/recovera-upgrade/07_recovera_images"', control)
         self.assertIn('"$stage/usr/local/share/recovera-upgrade/99_recovera_images.cfg"', control)
+
+    # --- 0.6.39: gateway by default, update source, approved OS upgrade ---
+
+    def gateway_token(self, sub="Backup-Bitches", channels=("stable",), exp=None):
+        payload = {"channels": sorted(channels), "exp": exp or 4102444800, "iat": 1700000000,
+                   "jti": "x" * 32, "sub": sub, "v": 1}
+        encoded = base64.urlsafe_b64encode(json.dumps(payload).encode()).decode().rstrip("=")
+        return f"rgt1.{encoded}.c2lnbmF0dXJl"
+
+    def test_gateways_are_used_only_with_an_access_token(self):
+        config = {"UPDATE_ORIGINS": "https://recoveragw.example", "GATEWAY_TOKEN_FILE": "/nonexistent"}
+        with mock.patch.dict("os.environ", {}, clear=False):
+            os.environ.pop("RECOVERA_GATEWAY_TOKEN", None)
+            self.assertEqual(self.module.active_gateway_origins(config), [])
+            source = self.module.update_source(config)
+            self.assertEqual(source["mode"], "github")
+            self.assertIn("No gateway access token", source["detail"])
+        with mock.patch.dict("os.environ", {"RECOVERA_GATEWAY_TOKEN": self.gateway_token()}):
+            self.assertEqual(self.module.active_gateway_origins(config), ["https://recoveragw.example"])
+            source = self.module.update_source(config)
+            self.assertEqual(source["mode"], "gateway")
+            self.assertEqual(source["token"]["subject"], "Backup-Bitches")
+            self.assertFalse(source["token"]["expired"])
+        conf = (ROOT / "upgrade" / "recovera-upgrade.conf").read_text()
+        self.assertIn("UPDATE_ORIGINS=https://recoveragw.rjproductionsut.com", conf)
+        self.assertIn("TRANSITION_CHANNEL=jammy-noble-transition", conf)
+
+    def test_gateway_token_is_validated_before_installing(self):
+        for bad in ("", "not-a-token", "rgt1.@@@.sig", "rgt1." + base64.urlsafe_b64encode(b"[]").decode().rstrip("=") + ".s"):
+            with self.subTest(bad=bad), self.assertRaises(self.module.UpgradeError):
+                self.module.decode_gateway_token(bad)
+        self.assertEqual(self.module.decode_gateway_token(self.gateway_token(sub="DC"))["sub"], "DC")
+
+    def test_set_gateway_token_installs_and_rolls_back_on_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            conf = root / "upgrade.conf"
+            conf.write_text("REPOSITORY=falco1717/recovera\nCHANNEL=stable\nCHANNEL_BRANCH=main\n"
+                            "HOST_ROOT=/host\nUPDATE_ORIGINS=\n")
+            token_path = root / "gateway-token"
+            config = self.module.read_config(conf)
+            config["GATEWAY_TOKEN_FILE"] = str(token_path)
+            arguments = argparse.Namespace(config=conf)
+            good = self.gateway_token(channels=("stable", "jammy-noble-transition"))
+
+            def read_token(value):
+                # Windows cannot express mode 0600; Linux CI covers the permission check.
+                path = Path(value.get("GATEWAY_TOKEN_FILE", "/nonexistent"))
+                return path.read_text().strip() if path.is_file() else None
+
+            with mock.patch.object(self.module, "require_root", lambda: None), \
+                 mock.patch.object(self.module, "gateway_token", side_effect=read_token), \
+                 mock.patch.object(self.module, "UpgradeLock", lambda: contextlib.nullcontext()), \
+                 mock.patch("sys.stdout", new_callable=io.StringIO):
+                with mock.patch("sys.stdin", io.StringIO(self.gateway_token(channels=("noble-stable",)))):
+                    with self.assertRaisesRegex(self.module.UpgradeError, "does not include"):
+                        self.module.command_set_gateway_token(config, arguments)
+                with mock.patch("sys.stdin", io.StringIO(self.gateway_token(exp=1000))):
+                    with self.assertRaisesRegex(self.module.UpgradeError, "expired"):
+                        self.module.command_set_gateway_token(config, arguments)
+                with mock.patch("sys.stdin", io.StringIO(good)), \
+                     mock.patch.object(self.module, "fetch_channel",
+                                       side_effect=self.module.UpgradeError("401 from gateway")):
+                    with self.assertRaisesRegex(self.module.UpgradeError, "401"):
+                        self.module.command_set_gateway_token(config, arguments)
+                self.assertFalse(token_path.exists())
+                self.assertIn("UPDATE_ORIGINS=\n", conf.read_text())
+                with mock.patch("sys.stdin", io.StringIO(good)), \
+                     mock.patch.object(self.module, "fetch_channel", return_value={}) as fetch:
+                    self.assertEqual(self.module.command_set_gateway_token(config, arguments), 0)
+                fetched = fetch.call_args.args[0]
+                self.assertEqual(fetched["UPDATE_ORIGINS"], "https://recoveragw.rjproductionsut.com")
+            self.assertEqual(token_path.read_text().strip(), good)
+            self.assertIn("GATEWAY_TOKEN_FILE=" + str(token_path), conf.read_text())
+
+    def transition_manifest(self):
+        manifest = self.image_manifest(os={"id": "ubuntu", "version_id": "24.04"},
+                                       **{"from": {"os_version_ids": ["22.04"], "minimum_version": "0.6.37"}})
+        manifest["channel"] = "jammy-noble-transition"
+        return manifest
+
+    def transition_fixture(self, directory, manifest=None, state=None):
+        root = Path(directory)
+        state_file = root / "state.json"
+        state_file.write_text(json.dumps(state or {}))
+        manifest = manifest or self.transition_manifest()
+        release = ({"release_tag": "image-v0.7.0"}, {}, manifest, root / "m.json", root / "m.sig")
+        patches = [
+            mock.patch.dict("os.environ", {"RECOVERA_UPGRADE_STATE": str(state_file),
+                                           "RECOVERA_RELEASE_FILE": str(root / "none"),
+                                           "RECOVERA_IMAGE_LAYOUT": str(root / "layout.json")}),
+            mock.patch.object(self.module, "get_release", return_value=release),
+            mock.patch.object(self.module, "transition_readiness", return_value=[]),
+            mock.patch.object(self.module, "require_root", lambda: None),
+            mock.patch.object(self.module, "UpgradeLock", lambda: contextlib.nullcontext()),
+            mock.patch("sys.stdout", new_callable=io.StringIO),
+        ]
+        config = {"HOST_ROOT": str(root), "TRANSACTION_ROOT": str(root / "tx"), "CHANNEL": "stable"}
+        return root, state_file, config, release, patches
+
+    def test_transition_is_offered_only_from_its_starting_release(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root, state_file, config, _, patches = self.transition_fixture(directory)
+            with contextlib.ExitStack() as stack:
+                for patch in patches:
+                    stack.enter_context(patch)
+                result, _ = self.module.transition_status(config, argparse.Namespace(signers=None), root)
+                self.assertTrue(result["available"])
+                self.assertEqual(result["version"], "0.7.0")
+                with mock.patch.object(self.module, "local_os", return_value=dict(self.NOBLE)):
+                    result, _ = self.module.transition_status(config, argparse.Namespace(signers=None), root)
+                self.assertFalse(result["available"])
+                self.assertIn("already runs Ubuntu 24.04", result["detail"])
+                with mock.patch.object(self.module, "get_release",
+                                       side_effect=self.module.NoReleaseError("none")):
+                    result, _ = self.module.transition_status(config, argparse.Namespace(signers=None), root)
+                self.assertFalse(result["available"])
+                self.assertIn("No operating-system upgrade", result["detail"])
+
+    def test_transition_needs_approval_and_runs_drain_layout_then_install(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root, state_file, config, release, patches = self.transition_fixture(directory)
+            with contextlib.ExitStack() as stack:
+                for patch in patches:
+                    stack.enter_context(patch)
+                install = stack.enter_context(mock.patch.object(self.module, "command_install_image"))
+                prepare = stack.enter_context(mock.patch.object(self.module, "command_prepare_image_layout"))
+                stack.enter_context(mock.patch.object(self.module, "transition_preflight"))
+                maintenance = stack.enter_context(mock.patch.object(self.module, "peer_maintenance", return_value=0))
+                arguments = argparse.Namespace(if_approved=True, drain_wait=60, reboot=True, signers=None)
+                # Nothing approved: the update window does nothing.
+                self.assertEqual(self.module.command_install_transition(config, arguments), 0)
+                install.assert_not_called()
+                with self.assertRaisesRegex(self.module.UpgradeError, "0.7.0, not 0.6.9"):
+                    self.module.command_approve_transition(config, argparse.Namespace(version="0.6.9", start="window", signers=None))
+                self.module.command_approve_transition(config, argparse.Namespace(version="0.7.0", start="window", signers=None))
+                self.assertEqual(json.loads(state_file.read_text())["transition_approval"]["version"], "0.7.0")
+                self.assertEqual(self.module.command_install_transition(config, arguments), 0)
+                prepare.assert_called_once()
+                maintenance.assert_any_call("on", "--reason", "Ubuntu operating-system upgrade", "--wait", "60")
+                install.assert_called_once()
+                self.assertEqual(install.call_args.args[0]["CHANNEL"], "jammy-noble-transition")
+                self.assertTrue(install.call_args.args[1].reboot)
+
+    def test_transition_defers_when_replication_does_not_drain(self):
+        approval = {"transition_approval": {"version": "0.7.0", "sequence": 7}}
+        with tempfile.TemporaryDirectory() as directory:
+            root, state_file, config, release, patches = self.transition_fixture(directory, state=approval)
+            (root / "layout.json").write_text(json.dumps({"mode": "loop-image-v1"}))
+            with contextlib.ExitStack() as stack:
+                for patch in patches:
+                    stack.enter_context(patch)
+                install = stack.enter_context(mock.patch.object(self.module, "command_install_image"))
+                stack.enter_context(mock.patch.object(self.module, "transition_preflight"))
+                maintenance = stack.enter_context(mock.patch.object(self.module, "peer_maintenance",
+                                                                    side_effect=[4, 0]))
+                arguments = argparse.Namespace(if_approved=True, drain_wait=60, reboot=True, signers=None)
+                self.assertEqual(self.module.command_install_transition(config, arguments), 0)
+                install.assert_not_called()
+                self.assertEqual(maintenance.call_args_list[-1].args, ("off",))
+                state = json.loads(state_file.read_text())
+                self.assertIn("deferred", state["transition_last_attempt"]["result"])
+                self.assertEqual(state["transition_approval"]["version"], "0.7.0", "stays approved for a retry")
+
+    def test_transition_approval_is_dropped_when_the_published_upgrade_changes(self):
+        approval = {"transition_approval": {"version": "0.6.99", "sequence": 6}}
+        with tempfile.TemporaryDirectory() as directory:
+            root, state_file, config, release, patches = self.transition_fixture(directory, state=approval)
+            with contextlib.ExitStack() as stack:
+                for patch in patches:
+                    stack.enter_context(patch)
+                install = stack.enter_context(mock.patch.object(self.module, "command_install_image"))
+                arguments = argparse.Namespace(if_approved=True, drain_wait=60, reboot=True, signers=None)
+                self.assertEqual(self.module.command_install_transition(config, arguments), 0)
+                install.assert_not_called()
+                state = json.loads(state_file.read_text())
+                self.assertIsNone(state["transition_approval"])
+                self.assertIn("approve it again", state["transition_last_attempt"]["result"])
+
+    def test_failed_transition_clears_the_approval(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = root / "state.json"
+            state.write_text(json.dumps({"pending": {"version": "0.7.0", "transition": True},
+                                         "previous": {"type": "package", "version": "0.6.39"},
+                                         "transition_approval": {"version": "0.7.0"}}))
+            with mock.patch.dict("os.environ", {"RECOVERA_UPGRADE_STATE": str(state),
+                                                "RECOVERA_RELEASE_FILE": str(root / "none")}), \
+                 mock.patch.object(self.module, "UpgradeLock", lambda: contextlib.nullcontext()), \
+                 mock.patch.object(self.module, "require_root", lambda: None), \
+                 mock.patch.object(self.module, "PENDING_MARKER", root / "pending"), \
+                 mock.patch.object(self.module, "run") as run:
+                self.module.command_validation_failed({"HOST_ROOT": str(root)},
+                                                      argparse.Namespace(reason="apache down", reboot=False))
+            value = json.loads(state.read_text())
+            self.assertIsNone(value["transition_approval"])
+            self.assertIn("returned to its previous system", value["transition_last_attempt"]["result"])
+            self.assertEqual(run.call_args_list[0].args[0][1], "fallback")
+
+    def test_schedule_runs_an_approved_transition_when_no_package_update_is_due(self):
+        schedule = (ROOT / "upgrade" / "recovera-upgrade-schedule").read_text()
+        self.assertIn('UPDATER, "install-transition", "--if-approved"', schedule)
+        self.assertNotIn('"approve-transition"', schedule)
 
 
 if __name__ == "__main__":

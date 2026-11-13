@@ -63,6 +63,14 @@ gateway publishes no host port. The GitHub token argument may be omitted while
 the repository is public, but synchronization will require it after the
 repository becomes private.
 
+## Default gateway
+
+Appliances from Recovera 0.6.39 list `https://recoveragw.rjproductionsut.com`
+in `UPDATE_ORIGINS` (the package adds it to older configurations that have no
+origin). The gateway is used as soon as an access token is installed; an
+appliance without a token keeps updating from GitHub directly. The update page
+shows the source in use and the token's subject and expiry.
+
 ## Issue an appliance credential
 
 Run this only on a trusted administrative workstation that holds the gateway
@@ -76,8 +84,15 @@ python3 gateway/recovera-gateway-token \
   --output customer-or-appliance-name.token
 ```
 
-Copy the token to an appliance over a trusted channel, then configure all
-gateway origins:
+Issue tokens for every channel the appliance may need, for example
+`--channel jammy-noble-transition --channel noble-stable` in addition to the
+default `stable`, so it can receive the operating-system upgrade and the
+updates that follow it.
+
+Paste the token into **Configure → Device → Update Now → Update gateway access
+token**, or run `sudo recovera-upgrade set-gateway-token < appliance.token`.
+Either way it is checked against the gateway before it is kept. To configure it
+by hand instead:
 
 ```bash
 sudo install -o root -g root -m 0600 appliance.token /etc/recovera/gateway-token

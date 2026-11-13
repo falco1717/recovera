@@ -12,6 +12,7 @@
         'Recovera pairing CA. An agent can be protected by only one appliance. Keep it paired to its current ' +
         'appliance and use Configure → Off-site Target to replicate its backups.';
     let availableRelease = null;
+    let availableTransition = null;
     let currentPolicy = {channel: 'stable', window: {start: 21, end: 5}};
 
     function normalizedText(element) {
@@ -171,10 +172,42 @@
             '<dt class="col-sm-4">Installed version</dt><dd id="recovera-installed-version" class="col-sm-8">Loading…</dd>',
             '<dt class="col-sm-4">Available version</dt><dd id="recovera-available-version" class="col-sm-8">Not checked</dd>',
             '<dt class="col-sm-4">Scheduled checks</dt><dd id="recovera-update-policy-summary" class="col-sm-8">Loading…</dd>',
+            '<dt class="col-sm-4">Update source</dt><dd id="recovera-update-source" class="col-sm-8">Loading…</dd>',
             '</dl>',
             '<button id="recovera-update-check" class="btn btn-secondary me-2" type="button">Check for updates</button>',
             '<button id="recovera-update-install" class="btn btn-primary" type="button" disabled>Update now</button>',
             '<p class="text-secondary mt-3 mb-0">Every package is verified by its Recovera signature and checksum before installation.</p>',
+            '<details class="mt-3"><summary>Update gateway access token</summary>',
+            '<p class="mt-2 mb-2">Paste the gateway access token issued for this appliance. It is checked against the update gateway before it is saved.</p>',
+            '<textarea id="recovera-gateway-token" class="form-control font-monospace mb-2" rows="3" spellcheck="false" autocomplete="off" placeholder="rgt1.…"></textarea>',
+            '<button id="recovera-gateway-token-save" class="btn btn-secondary" type="button">Save token</button>',
+            '</details>',
+            '</div>'
+        ].join('');
+        return panel;
+    }
+
+    function createOsUpgradePanel() {
+        const panel = document.createElement('div');
+        panel.id = 'settingRecoveraOsUpgrade';
+        panel.className = 'card my-3';
+        panel.innerHTML = [
+            '<div class="card-body">',
+            '<h3 class="text-secondary fw-medium mb-3">Operating System Upgrade</h3>',
+            '<p>Move this appliance to a newer Ubuntu release in place. Backups, settings and pairings are kept. ',
+            'The new system starts once and becomes permanent only after its checks pass; otherwise the appliance ',
+            'returns to its current system automatically.</p>',
+            '<div id="recovera-os-message" class="alert d-none" role="alert"></div>',
+            '<dl class="row mb-3">',
+            '<dt class="col-sm-4">Current system</dt><dd id="recovera-os-current" class="col-sm-8">Loading…</dd>',
+            '<dt class="col-sm-4">Available upgrade</dt><dd id="recovera-os-available" class="col-sm-8">Not checked</dd>',
+            '<dt class="col-sm-4">Status</dt><dd id="recovera-os-status" class="col-sm-8">—</dd>',
+            '</dl>',
+            '<ul id="recovera-os-readiness" class="list-unstyled mb-3"></ul>',
+            '<button id="recovera-os-check" class="btn btn-secondary me-2" type="button">Check for an OS upgrade</button>',
+            '<button id="recovera-os-approve" class="btn btn-primary me-2 d-none" type="button">Install in the next update window</button>',
+            '<button id="recovera-os-start" class="btn btn-outline-primary me-2 d-none" type="button">Install now</button>',
+            '<button id="recovera-os-cancel" class="btn btn-outline-secondary d-none" type="button">Cancel the scheduled upgrade</button>',
             '</div>'
         ].join('');
         return panel;
@@ -451,8 +484,142 @@
         window.setTimeout(loadStorageStatus, 0);
     }
 
+    function dateText(epoch) {
+        return epoch ? new Date(Number(epoch) * 1000).toLocaleString() : '';
+    }
+
+    function showSource(source) {
+        const element = document.getElementById('recovera-update-source');
+        if (!element) return;
+        if (!source) {
+            element.textContent = 'Unknown';
+            return;
+        }
+        if (source.mode === 'gateway') {
+            const host = (source.origins || []).map(function (origin) { return origin.replace(/^https:\/\//, ''); }).join(', ');
+            const token = source.token || {};
+            element.textContent = 'Recovera update gateway (' + host + ')' +
+                (token.subject ? ' — access for ' + token.subject + ', valid until ' +
+                    new Date(token.expires * 1000).toLocaleDateString() : '');
+        } else {
+            element.textContent = 'GitHub directly' + (source.detail ? ' — ' + source.detail : '');
+        }
+    }
+
+    function setOsMessage(message, success) {
+        const box = document.getElementById('recovera-os-message');
+        if (!box) return;
+        box.className = 'alert ' + (success ? 'alert-success' : 'alert-danger');
+        box.textContent = message;
+    }
+
+    function osName(os) {
+        return os && os.version_id ? 'Ubuntu ' + os.version_id : 'Unknown';
+    }
+
+    function showTransition(value) {
+        const current = document.getElementById('recovera-os-current');
+        if (!current) return;
+        current.textContent = osName(value.os);
+        availableTransition = value.available ? value : null;
+        document.getElementById('recovera-os-available').textContent = value.available
+            ? osName(value.target_os) + ' (Recovera ' + value.version + ', ' + bytes(value.download_size) + ' download)'
+            : (value.detail || 'None');
+        const approval = value.approval;
+        const attempt = value.last_attempt;
+        let status = '—';
+        if (approval) {
+            status = (approval.start === 'now' ? 'Started ' : 'Scheduled for the next update window, approved ') +
+                dateText(approval.approved);
+        }
+        if (attempt && attempt.result) {
+            status += (status === '—' ? '' : '. ') + 'Last attempt ' + dateText(attempt.time) + ': ' + attempt.result;
+        }
+        document.getElementById('recovera-os-status').textContent = status;
+        const list = document.getElementById('recovera-os-readiness');
+        list.textContent = '';
+        (value.readiness || []).forEach(function (check) {
+            const item = document.createElement('li');
+            let text = check.detail;
+            if (!check.ok && !check.blocking && check.check === 'replication') {
+                text = 'Replication will be paused automatically and allowed to finish before the upgrade.';
+            } else if (!check.ok && !check.blocking && check.check === 'restores') {
+                text = check.detail + '. The upgrade waits until they are finished.';
+            }
+            item.textContent = (check.ok ? '✓ ' : (check.blocking ? '✗ ' : '• ')) + text;
+            item.className = check.ok ? 'text-success' : (check.blocking ? 'text-danger' : 'text-secondary');
+            list.appendChild(item);
+        });
+        const blocked = (value.readiness || []).some(function (check) { return check.blocking && !check.ok; });
+        document.getElementById('recovera-os-approve').classList.toggle('d-none', !availableTransition || !!approval);
+        document.getElementById('recovera-os-start').classList.toggle('d-none', !availableTransition);
+        document.getElementById('recovera-os-cancel').classList.toggle('d-none', !approval);
+        document.getElementById('recovera-os-approve').disabled = blocked;
+        document.getElementById('recovera-os-start').disabled = blocked;
+    }
+
+    async function loadTransition() {
+        const button = document.getElementById('recovera-os-check');
+        if (!button) return;
+        button.disabled = true;
+        button.textContent = 'Checking…';
+        try {
+            showTransition(await request('update-transition'));
+        } catch (error) {
+            setOsMessage(error.message, false);
+        } finally {
+            button.disabled = false;
+            button.textContent = 'Check for an OS upgrade';
+        }
+    }
+
+    async function transitionAction(action) {
+        if (action !== 'cancel' && !availableTransition) return;
+        if (action === 'start' && !window.confirm(
+            'Upgrade to ' + osName(availableTransition.target_os) + ' now? Replication is paused and allowed to finish, ' +
+            'the upgrade (' + bytes(availableTransition.download_size) + ') is downloaded from the update gateway, and ' +
+            'the appliance reboots. It returns to its current system automatically if the new one does not pass its checks.'
+        )) return;
+        if (action === 'approve' && !window.confirm(
+            'Upgrade to ' + osName(availableTransition.target_os) + ' during the next update window? The appliance ' +
+            'will reboot unattended.'
+        )) return;
+        try {
+            const value = await request('update-transition', 'POST', {
+                action: action, version: availableTransition ? availableTransition.version : ''
+            });
+            showTransition(value);
+            setOsMessage(action === 'cancel' ? 'The operating-system upgrade was cancelled.' :
+                action === 'start' ? 'The operating-system upgrade has started. The appliance will reboot when it is ready.' :
+                'The operating-system upgrade will run in the next update window.', true);
+        } catch (error) {
+            setOsMessage(error.message, false);
+        }
+    }
+
+    async function saveGatewayToken() {
+        const field = document.getElementById('recovera-gateway-token');
+        const button = document.getElementById('recovera-gateway-token-save');
+        const token = (field.value || '').trim();
+        if (!token) return;
+        button.disabled = true;
+        button.textContent = 'Checking with the gateway…';
+        try {
+            const value = await request('update-gateway-token', 'POST', {token: token});
+            field.value = '';
+            showSource(value.source);
+            setMessage('The gateway access token was verified and saved.', true);
+        } catch (error) {
+            setMessage(error.message, false);
+        } finally {
+            button.disabled = false;
+            button.textContent = 'Save token';
+        }
+    }
+
     function showStatus(value) {
         currentPolicy = value.policy || currentPolicy;
+        showSource(value.updater && value.updater.source);
         document.getElementById('recovera-installed-version').textContent = value.installed_version || 'Unknown';
         if (value.release) {
             availableRelease = value.release.available ? value.release : null;
@@ -529,7 +696,24 @@
         addUpdateNowNavigation();
         document.getElementById('recovera-update-check').addEventListener('click', function () { loadStatus(true); });
         document.getElementById('recovera-update-install').addEventListener('click', installUpdate);
+        document.getElementById('recovera-gateway-token-save').addEventListener('click', saveGatewayToken);
+        if (!document.getElementById('settingRecoveraOsUpgrade')) {
+            const osPanel = createOsUpgradePanel();
+            panel.parentElement.insertBefore(osPanel, panel.nextSibling);
+            const updateLink = document.querySelector('a[href="#settingRecoveraUpdateNow"]');
+            if (updateLink && updateLink.parentElement && !document.querySelector('a[href="#settingRecoveraOsUpgrade"]')) {
+                const link = updateLink.cloneNode(false);
+                link.href = '#settingRecoveraOsUpgrade';
+                link.textContent = 'Operating System Upgrade';
+                updateLink.parentElement.insertBefore(link, updateLink.nextSibling);
+            }
+        }
+        document.getElementById('recovera-os-check').addEventListener('click', loadTransition);
+        document.getElementById('recovera-os-approve').addEventListener('click', function () { transitionAction('approve'); });
+        document.getElementById('recovera-os-start').addEventListener('click', function () { transitionAction('start'); });
+        document.getElementById('recovera-os-cancel').addEventListener('click', function () { transitionAction('cancel'); });
         window.setTimeout(function () { loadStatus(false); }, 0);
+        window.setTimeout(loadTransition, 0);
     }
 
     if (document.readyState === 'loading') {

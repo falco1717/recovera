@@ -41,6 +41,9 @@ DEFAULT_OS_RELEASE = Path("/etc/os-release")
 LEGACY_OS = ("ubuntu", "22.04")
 PHP_FPM_SERVICE_RE = re.compile(r"^php(?:[0-9]+\.[0-9]+)?-fpm(?:\.service)?$")
 CHANNEL_RE = re.compile(r"^[0-9A-Za-z][0-9A-Za-z._-]{0,31}$")
+DEFAULT_UPDATE_ORIGIN = "https://recoveragw.rjproductionsut.com"
+DEFAULT_TRANSITION_CHANNEL = "jammy-noble-transition"
+GATEWAY_TOKEN_RE = re.compile(r"^rgt1\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$")
 SHARE_DIR = Path("/usr/local/share/recovera-upgrade")
 GRUB_SCRIPT = Path("/etc/grub.d/07_recovera_images")
 GRUB_DEFAULTS = Path("/etc/default/grub.d/99_recovera_images.cfg")
@@ -230,6 +233,59 @@ def gateway_origins(config):
     return origins
 
 
+def active_gateway_origins(config):
+    """Gateways to use. Without an access token the gateways would refuse every
+    request, so such an appliance keeps updating from GitHub directly."""
+    origins = gateway_origins(config)
+    if not origins:
+        return []
+    try:
+        credential = gateway_token(config)
+    except UpgradeError:
+        credential = None
+    return origins if credential else []
+
+
+def decode_gateway_token(value):
+    """The (unverified) payload of an rgt1 gateway access token."""
+    value = (value or "").strip()
+    if not GATEWAY_TOKEN_RE.fullmatch(value):
+        raise UpgradeError("this is not a Recovera gateway access token")
+    encoded = value.split(".")[1]
+    try:
+        payload = json.loads(base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4)))
+    except (ValueError, json.JSONDecodeError) as exc:
+        raise UpgradeError("the gateway access token is damaged") from exc
+    if (not isinstance(payload, dict) or payload.get("v") != 1
+            or not isinstance(payload.get("channels"), list)
+            or not isinstance(payload.get("exp"), int) or not isinstance(payload.get("sub"), str)):
+        raise UpgradeError("the gateway access token is damaged")
+    return payload
+
+
+def update_source(config):
+    """Where this appliance gets updates from, for the WebUI."""
+    origins = gateway_origins(config)
+    source = {"mode": "github", "origins": origins, "token": None, "detail": None}
+    try:
+        credential = gateway_token(config)
+    except UpgradeError as exc:
+        credential = None
+        source["detail"] = str(exc)
+    if credential:
+        try:
+            payload = decode_gateway_token(credential)
+            source["token"] = {"subject": payload["sub"], "channels": payload["channels"],
+                               "expires": payload["exp"], "expired": payload["exp"] <= time.time()}
+        except UpgradeError as exc:
+            source["detail"] = str(exc)
+    if origins and credential:
+        source["mode"] = "gateway"
+    elif origins and not source["detail"]:
+        source["detail"] = "No gateway access token is installed; updating from GitHub."
+    return source
+
+
 def credential_for_url(url, config):
     target = urllib.parse.urlsplit(url)
     for origin in gateway_origins(config):
@@ -313,7 +369,7 @@ def fetch_channel(config, local_channel=None):
     if local_channel:
         pointer = read_json(local_channel)
     else:
-        origins = gateway_origins(config)
+        origins = active_gateway_origins(config)
         if origins:
             channel_name = urllib.parse.quote(config["CHANNEL"], safe="")
             failures = []
@@ -368,7 +424,7 @@ def release_assets(pointer, config, source_dir=None):
     repo = validated_repository(config)
     tag = pointer["release_tag"]
     tag_path = urllib.parse.quote(tag, safe="")
-    origins = gateway_origins(config)
+    origins = active_gateway_origins(config)
     if origins:
         active = config.get("_ACTIVE_GATEWAY_ORIGIN")
         ordered = ([active] if active in origins else []) + [item for item in origins if item != active]
@@ -524,11 +580,44 @@ def active_restores():
     return found
 
 
+def transition_readiness(manifest, host, *, require_drained):
+    """Each precondition of an operating-system transition as {check, ok, detail}."""
+    checks = []
+
+    def add(name, ok, detail, blocking=True):
+        checks.append({"check": name, "ok": bool(ok), "detail": detail, "blocking": blocking})
+
+    origin = manifest.get("from") or {}
+    os_info = local_os()
+    starts = origin.get("os_version_ids") or []
+    add("starting-release", os_info.get("version_id") in starts,
+        f"this transition starts from Ubuntu {', '.join(starts)}; this appliance runs "
+        f"{os_info.get('version_id') or 'an unknown release'}")
+    minimum = origin.get("minimum_version")
+    if minimum:
+        add("recovera-version", version_at_least(installed_version("recovera-appliance"), minimum),
+            f"install Recovera {minimum} or newer before this transition")
+    health = pool_health()
+    add("pool", health == "ONLINE", f"homePool is {health or 'not imported'}, not ONLINE"
+        if health != "ONLINE" else "homePool is ONLINE")
+    image = manifest["image"]
+    needed = int(image["size"]) + int(image["uncompressed_size"]) + 1024 * 1024 * 1024
+    free = shutil.disk_usage(host if Path(host).exists() else "/").free
+    add("disk-space", free >= needed,
+        f"the image host needs {needed // 2**20} MiB free and has {free // 2**20} MiB")
+    drained, detail = replication_drained()
+    add("replication", drained, detail, blocking=require_drained)
+    restores = active_restores()
+    add("restores", not restores, "restores are active: " + ", ".join(restores) if restores
+        else "no restores are active", blocking=require_drained)
+    return checks
+
+
 def transition_preflight(manifest, host, args):
     """Refuse an operating-system transition unless the appliance is ready for it."""
     origin = manifest.get("from")
-    os_info = local_os()
     if origin is None:
+        os_info = local_os()
         target = manifest.get("os")
         if target and (target["id"], target["version_id"]) != (os_info.get("id"), os_info.get("version_id")):
             raise UpgradeError(
@@ -536,29 +625,12 @@ def transition_preflight(manifest, host, args):
                 "to another OS release needs a transition release"
             )
         return
-    if os_info.get("version_id") not in origin["os_version_ids"]:
-        raise UpgradeError(
-            f"this transition starts from Ubuntu {', '.join(origin['os_version_ids'])}; "
-            f"this appliance runs {os_info.get('version_id') or 'an unknown release'}"
-        )
-    minimum = origin.get("minimum_version")
-    if minimum and not version_at_least(installed_version("recovera-appliance"), minimum):
-        raise UpgradeError(f"install Recovera {minimum} or newer before this transition")
-    problems = []
-    health = pool_health()
-    if health != "ONLINE":
-        problems.append(f"homePool is {health or 'not imported'}, not ONLINE")
-    drained, detail = replication_drained()
-    if not drained and not getattr(args, "allow_busy", False):
-        problems.append(detail)
-    restores = active_restores()
-    if restores and not getattr(args, "allow_busy", False):
-        problems.append("restores are active: " + ", ".join(restores))
-    image = manifest["image"]
-    needed = int(image["size"]) + int(image["uncompressed_size"]) + 1024 * 1024 * 1024
-    free = shutil.disk_usage(host).free
-    if free < needed:
-        problems.append(f"the image host needs {needed // 2**20} MiB free and has {free // 2**20} MiB")
+    checks = transition_readiness(manifest, host,
+                                  require_drained=not getattr(args, "allow_busy", False))
+    for check in checks[:2]:
+        if check["check"] in ("starting-release", "recovera-version") and not check["ok"]:
+            raise UpgradeError(check["detail"])
+    problems = [check["detail"] for check in checks if check["blocking"] and not check["ok"]]
     if problems:
         raise UpgradeError("the appliance is not ready for this transition:\n- " + "\n- ".join(problems))
 
@@ -833,7 +905,8 @@ def command_install_image(config, args, release):
         current = current_release()
         state = read_json(state_path(), {})
         state.update({
-            "pending": {"version": manifest["version"], "sequence": manifest["sequence"], "image": str(target)},
+            "pending": {"version": manifest["version"], "sequence": manifest["sequence"], "image": str(target),
+                        "transition": bool(manifest.get("from"))},
             "previous": current,
             "release_tag": pointer["release_tag"],
         })
@@ -1134,6 +1207,10 @@ def command_mark_success(config, args):
         if pending.get("version") != current.get("version"):
             raise UpgradeError("the running image is not the pending upgrade")
         run([BOOT_HELPER, "commit", current["version"], pending["image"]])
+        if pending.get("transition"):
+            state["transition_approval"] = None
+            state["transition_last_attempt"] = {"time": int(time.time()), "version": current["version"],
+                                                "result": "completed"}
         state["installed_sequence"] = int(current["sequence"])
         state["installed"] = current
         state["pending"] = None
@@ -1155,6 +1232,13 @@ def command_validation_failed(config, args):
     with UpgradeLock():
         state = read_json(state_path(), {})
         pending = state.get("pending") or {}
+        if pending.get("transition"):
+            # Back on the previous system: an administrator must approve again.
+            state["transition_approval"] = None
+            state["transition_last_attempt"] = {
+                "time": int(time.time()), "version": pending.get("version"),
+                "result": f"failed ({args.reason}); the appliance returned to its previous system",
+            }
         if pending.get("type") == "package":
             rollback_package_transaction(config, pending)
             failed_version = pending.get("version")
@@ -1208,8 +1292,18 @@ def command_rollback(config, args):
 
 def command_status(config, args):
     current = current_release()
+    try:
+        os_info = local_os()
+    except UpgradeError:
+        os_info = None
+    state = read_json(state_path(), {})
     value = {
         "updater_version": UPDATER_VERSION,
+        "os": os_info,
+        "source": update_source(config),
+        "transition": {"approval": state.get("transition_approval"),
+                       "last_attempt": state.get("transition_last_attempt"),
+                       "available": state.get("transition_available")},
         "current": current,
         "state": status_state(current),
         "image_layout": read_json(layout_path(), None),
@@ -1217,6 +1311,220 @@ def command_status(config, args):
         "package_updates_supported": shutil.which("apt-get") is not None and shutil.which("dpkg-deb") is not None,
     }
     print(json.dumps(value, indent=2, sort_keys=True))
+
+
+def set_config_value(path, key, value):
+    lines = Path(path).read_text().splitlines()
+    replaced = False
+    for index, line in enumerate(lines):
+        if line.split("=", 1)[0].strip() == key and not line.lstrip().startswith("#"):
+            lines[index] = f"{key}={value}"
+            replaced = True
+    if not replaced:
+        lines.append(f"{key}={value}")
+    temporary = Path(str(path) + ".tmp")
+    temporary.write_text("\n".join(lines) + "\n")
+    temporary.chmod(Path(path).stat().st_mode & 0o777)
+    os.replace(temporary, path)
+
+
+def command_set_gateway_token(config, args):
+    """Install a gateway access token (read from stdin) and prove it works."""
+    require_root()
+    credential = sys.stdin.read().strip()
+    payload = decode_gateway_token(credential)
+    if payload["exp"] <= time.time():
+        raise UpgradeError("this gateway access token has expired")
+    if config["CHANNEL"] not in payload["channels"]:
+        raise UpgradeError(f"this token does not include this appliance's {config['CHANNEL']} channel "
+                           f"(it allows: {', '.join(payload['channels'])})")
+    token_path = Path(config.get("GATEWAY_TOKEN_FILE", "/etc/recovera/gateway-token"))
+    config_file = Path(args.config)
+    previous_token = token_path.read_bytes() if token_path.exists() else None
+    previous_config = config_file.read_bytes()
+    with UpgradeLock():
+        try:
+            token_path.parent.mkdir(parents=True, exist_ok=True)
+            temporary = token_path.with_name(token_path.name + ".new")
+            temporary.write_text(credential + "\n")
+            temporary.chmod(0o600)
+            os.replace(temporary, token_path)
+            if read_config(config_file).get("GATEWAY_TOKEN_FILE") != str(token_path):
+                set_config_value(config_file, "GATEWAY_TOKEN_FILE", str(token_path))
+            if not gateway_origins(config):
+                set_config_value(config_file, "UPDATE_ORIGINS", DEFAULT_UPDATE_ORIGIN)
+            fresh = read_config(config_file)
+            fresh["CHANNEL"] = config["CHANNEL"]
+            if not active_gateway_origins(fresh):
+                raise UpgradeError("the gateway configuration could not be enabled")
+            fetch_channel(fresh)
+        except Exception:
+            if previous_token is None:
+                token_path.unlink(missing_ok=True)
+            else:
+                token_path.write_bytes(previous_token)
+                token_path.chmod(0o600)
+            config_file.write_bytes(previous_config)
+            raise
+    print(json.dumps({"installed": True, "source": update_source(read_config(config_file))},
+                     indent=2, sort_keys=True))
+    return 0
+
+
+def transition_config(config):
+    channel = config.get("TRANSITION_CHANNEL") or DEFAULT_TRANSITION_CHANNEL
+    if not CHANNEL_RE.fullmatch(channel):
+        raise UpgradeError("invalid TRANSITION_CHANNEL")
+    value = dict(config)
+    value["CHANNEL"] = channel
+    return value
+
+
+def release_arguments(args):
+    return argparse.Namespace(channel_file=getattr(args, "channel_file", None),
+                              source_dir=getattr(args, "source_dir", None), signers=args.signers)
+
+
+def transition_status(config, args, directory):
+    """The published operating-system upgrade and whether it applies here."""
+    tconfig = transition_config(config)
+    state = read_json(state_path(), {})
+    result = {"channel": tconfig["CHANNEL"], "available": False, "os": local_os(),
+              "approval": state.get("transition_approval"),
+              "last_attempt": state.get("transition_last_attempt")}
+    try:
+        release = get_release(tconfig, release_arguments(args), directory)
+    except NoReleaseError:
+        result["detail"] = "No operating-system upgrade has been published."
+        return result, None
+    except UpgradeError as exc:
+        result["detail"] = f"Could not check for an operating-system upgrade: {exc}"
+        return result, None
+    manifest = release[2]
+    origin = manifest.get("from") or {}
+    target = manifest.get("os") or {}
+    result.update({"version": manifest["version"], "sequence": manifest["sequence"],
+                   "target_os": target, "download_size": int(manifest["image"]["size"])})
+    if result["os"].get("version_id") not in (origin.get("os_version_ids") or []):
+        result["detail"] = ("This appliance already runs Ubuntu "
+                            f"{result['os'].get('version_id')}." if target.get("version_id") ==
+                            result["os"].get("version_id") else "This upgrade does not apply to this appliance.")
+        return result, release
+    result["available"] = True
+    result["readiness"] = transition_readiness(manifest, Path(config["HOST_ROOT"]), require_drained=False)
+    return result, release
+
+
+def command_check_transition(config, args):
+    root = config_path(config, "TRANSACTION_ROOT", DEFAULT_TRANSACTION_ROOT)
+    root.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="transition-", dir=root) as temporary:
+        result, _ = transition_status(config, args, Path(temporary))
+    if args.cache:
+        state = read_json(state_path(), {})
+        state["transition_available"] = {key: result.get(key) for key in
+                                         ("available", "version", "target_os", "download_size", "detail")}
+        state["transition_available"]["checked"] = int(time.time())
+        atomic_json(state_path(), state)
+    print(json.dumps(result, indent=2, sort_keys=True))
+    return 0
+
+
+def command_approve_transition(config, args):
+    require_root()
+    root = config_path(config, "TRANSACTION_ROOT", DEFAULT_TRANSACTION_ROOT)
+    root.mkdir(parents=True, exist_ok=True)
+    with UpgradeLock(), tempfile.TemporaryDirectory(prefix="transition-", dir=root) as temporary:
+        result, _ = transition_status(config, args, Path(temporary))
+        if not result["available"]:
+            raise UpgradeError(result.get("detail") or "no operating-system upgrade is available")
+        if args.version != result["version"]:
+            raise UpgradeError(f"the available operating-system upgrade is {result['version']}, not {args.version}")
+        state = read_json(state_path(), {})
+        state["transition_approval"] = {"version": result["version"], "sequence": result["sequence"],
+                                        "approved": int(time.time()), "start": args.start}
+        atomic_json(state_path(), state)
+    print(json.dumps({"approved": state["transition_approval"]}, indent=2, sort_keys=True))
+    return 0
+
+
+def command_cancel_transition(config, args):
+    require_root()
+    with UpgradeLock():
+        state = read_json(state_path(), {})
+        if (state.get("pending") or {}).get("transition"):
+            raise UpgradeError("the operating-system upgrade is already staged and cannot be cancelled")
+        state["transition_approval"] = None
+        atomic_json(state_path(), state)
+    print(json.dumps({"approved": None}))
+    return 0
+
+
+def record_transition_attempt(version, result):
+    state = read_json(state_path(), {})
+    state["transition_last_attempt"] = {"time": int(time.time()), "version": version, "result": result}
+    atomic_json(state_path(), state)
+
+
+def peer_maintenance(action, *extra):
+    if not PEER_COMMAND.exists():
+        return 0
+    return run([PEER_COMMAND, "maintenance", action, *extra], check=False, capture=True).returncode
+
+
+def command_install_transition(config, args):
+    """Run an approved operating-system upgrade without an administrator present."""
+    require_root()
+    state = read_json(state_path(), {})
+    approval = state.get("transition_approval")
+    if not approval:
+        if args.if_approved:
+            return 0
+        raise UpgradeError("no operating-system upgrade has been approved on this appliance")
+    host = Path(config["HOST_ROOT"])
+    root = config_path(config, "TRANSACTION_ROOT", DEFAULT_TRANSACTION_ROOT)
+    root.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="transition-", dir=root) as temporary:
+        result, release = transition_status(config, args, Path(temporary))
+        if not result["available"] or release is None:
+            state["transition_approval"] = None
+            atomic_json(state_path(), state)
+            record_transition_attempt(approval.get("version"), "cancelled: " + (result.get("detail") or "not available"))
+            return 0
+        manifest = release[2]
+        if manifest["version"] != approval.get("version"):
+            state["transition_approval"] = None
+            atomic_json(state_path(), state)
+            record_transition_attempt(approval.get("version"),
+                                      f"cancelled: the published upgrade changed to {manifest['version']}; approve it again")
+            return 0
+        tconfig = transition_config(config)
+        ensure_newer(manifest)
+        try:
+            transition_preflight(manifest, host, argparse.Namespace(allow_busy=True))
+        except UpgradeError as exc:
+            record_transition_attempt(manifest["version"], f"waiting: {exc}")
+            raise
+        layout = read_json(layout_path(), {})
+        if layout.get("mode") != "loop-image-v1":
+            command_prepare_image_layout(config, argparse.Namespace(dry_run=False))
+        record_transition_attempt(manifest["version"], "pausing replication")
+        if peer_maintenance("on", "--reason", "Ubuntu operating-system upgrade",
+                            "--wait", str(args.drain_wait)) != 0:
+            peer_maintenance("off")
+            record_transition_attempt(manifest["version"],
+                                      "deferred: replication was still running; it will be retried")
+            print("replication is still running; the operating-system upgrade will be retried")
+            return 0
+        record_transition_attempt(manifest["version"], "downloading and installing")
+        try:
+            with UpgradeLock():
+                command_install_image(tconfig, argparse.Namespace(reboot=args.reboot, allow_busy=False), release)
+        except Exception as exc:
+            peer_maintenance("off")
+            record_transition_attempt(manifest["version"], f"failed before reboot: {exc}")
+            raise
+    return 0
 
 
 def root_filesystem_uuid():
@@ -1374,6 +1682,17 @@ def parser():
             command.add_argument("--reboot", action="store_true")
             command.add_argument("--allow-busy", action="store_true",
                                  help="skip the replication and restore idle checks of a transition")
+    sub.add_parser("set-gateway-token", help="install a gateway access token read from stdin")
+    check_transition = sub.add_parser("check-transition")
+    check_transition.add_argument("--cache", action="store_true")
+    approve = sub.add_parser("approve-transition")
+    approve.add_argument("--version", required=True)
+    approve.add_argument("--start", choices=("window", "now"), default="window")
+    sub.add_parser("cancel-transition")
+    install_transition = sub.add_parser("install-transition")
+    install_transition.add_argument("--if-approved", action="store_true")
+    install_transition.add_argument("--drain-wait", type=int, default=3 * 3600)
+    install_transition.add_argument("--no-reboot", dest="reboot", action="store_false")
     prepare = sub.add_parser("prepare-image-layout")
     prepare.add_argument("--dry-run", action="store_true")
     revert = sub.add_parser("revert-image-layout")
@@ -1397,8 +1716,8 @@ def main():
     os.environ["NEEDRESTART_SUSPEND"] = "1"
     try:
         config = read_config(args.config)
-        if args.command in ("check", "install"):
-            if args.channel:
+        if args.command in ("check", "install", "set-gateway-token"):
+            if getattr(args, "channel", None):
                 if not CHANNEL_RE.fullmatch(args.channel):
                     raise UpgradeError("invalid channel name")
                 if getattr(args, "cache", False):
@@ -1414,6 +1733,11 @@ def main():
             "validation-failed": command_validation_failed,
             "rollback": command_rollback,
             "prepare-image-layout": command_prepare_image_layout,
+            "set-gateway-token": command_set_gateway_token,
+            "check-transition": command_check_transition,
+            "approve-transition": command_approve_transition,
+            "cancel-transition": command_cancel_transition,
+            "install-transition": command_install_transition,
             "revert-image-layout": command_revert_image_layout,
         }[args.command](config, args) or 0
     except (UpgradeError, FileNotFoundError, ValueError, subprocess.SubprocessError) as exc:

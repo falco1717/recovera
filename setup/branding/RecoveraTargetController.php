@@ -60,6 +60,8 @@ final class RecoveraTargetController extends AbstractController
             'update-check' => ['GET', '/v1/admin/update/check'],
             'update-install' => ['POST', '/v1/admin/update/install'],
             'update-policy' => [$request->isMethod('POST') ? 'POST' : 'GET', '/v1/admin/update/policy'],
+            'update-transition' => [$request->isMethod('POST') ? 'POST' : 'GET', '/v1/admin/update/transition'],
+            'update-gateway-token' => ['POST', '/v1/admin/update/gateway-token'],
             'storage-status' => ['GET', '/v1/admin/storage/status'],
             'storage-expand' => ['POST', '/v1/admin/storage/expand'],
             'replication-activity' => ['GET', '/v1/admin/replication-activity'],
@@ -84,7 +86,8 @@ final class RecoveraTargetController extends AbstractController
             CURLOPT_UNIX_SOCKET_PATH => '/run/recovera-peer/http.sock',
             CURLOPT_CONNECTTIMEOUT => 5,
             CURLOPT_TIMEOUT => in_array($operation, ['update-install', 'storage-expand'], true) ? 3600
-                : ($operation === 'update-check' ? 120 : 30),
+                : (in_array($operation, ['update-transition', 'update-gateway-token'], true) ? 200
+                : ($operation === 'update-check' ? 120 : 30)),
             CURLOPT_HTTPHEADER => ['Content-Type: application/json', 'X-Recovera-Internal: ' . $token],
         ]);
         if ($method === 'POST') {
