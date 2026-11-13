@@ -1342,6 +1342,40 @@ class RecoveraUpgradeTests(unittest.TestCase):
                  mock.patch("sys.stdout", new_callable=io.StringIO):
                 self.assertEqual(self.module.command_cancel_transition({}, argparse.Namespace()), 0)
 
+    def test_previous_system_after_an_interrupted_image_boot_does_not_reboot(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = root / "state.json"
+            state.write_text(json.dumps({
+                "installed": {"type": "package", "version": "0.6.45", "sequence": 46},
+                "previous": {"type": "package", "version": "0.6.45", "sequence": 46},
+                "pending": {"version": "0.6.45-noble.1", "sequence": 47, "transition": True,
+                            "image": "/host/recovera/images/0.6.45-noble.1.img"},
+                "transition_approval": {"version": "0.6.45-noble.1", "start": "now"},
+            }))
+            # The conventional 22.04 root booted instead of the staged image.
+            release = root / "release.json"
+            release.write_text(json.dumps({"schema": 1, "sequence": 46, "version": "0.6.45"}))
+            marker = root / "pending"
+            marker.write_text("")
+            environment = {"RECOVERA_UPGRADE_STATE": str(state), "RECOVERA_RELEASE_FILE": str(release)}
+            with mock.patch.dict("os.environ", environment), \
+                 mock.patch.object(self.module, "UpgradeLock", lambda: contextlib.nullcontext()), \
+                 mock.patch.object(self.module, "require_root", lambda: None), \
+                 mock.patch.object(self.module, "PENDING_MARKER", marker), \
+                 mock.patch.object(self.module, "validate_services") as services, \
+                 mock.patch.object(self.module, "run") as run, \
+                 mock.patch("sys.stdout", new_callable=io.StringIO):
+                self.module.command_mark_success({"HOST_ROOT": str(root)}, argparse.Namespace())
+            run.assert_not_called()
+            services.assert_not_called()
+            value = json.loads(state.read_text())
+            self.assertIsNone(value["pending"])
+            self.assertIsNone(value["transition_approval"])
+            self.assertIn("interrupted before validation", value["transition_last_attempt"]["result"])
+            self.assertEqual(value["installed"]["version"], "0.6.45")
+            self.assertFalse(marker.exists())
+
 
 if __name__ == "__main__":
     unittest.main()

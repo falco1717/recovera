@@ -32,6 +32,10 @@ both ways, and an administrator rollback to 22.04).
   system, but the stale entry made `cancel-transition` (and the UI) treat the
   upgrade as still staged. Found by forcing a validation failure (Apache
   unable to start) on the test appliance, which otherwise fell back correctly.
+- If the one-time boot of a staged image never reaches validation (power loss,
+  reset or crash), the previous system now records the attempt as interrupted
+  and clears it on its next boot. It used to treat this as a failed validation
+  of itself and reboot once more.
 
 ## v0.6.44 - 2026-11-13
 

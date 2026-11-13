@@ -1329,6 +1329,12 @@ def command_mark_success(config, args):
         pending = state.get("pending")
         if not pending:
             raise UpgradeError("there is no pending upgrade")
+        if pending.get("type") != "package" and pending.get("version") != current_release().get("version"):
+            # GRUB's one-time entry was spent by a boot that never reached
+            # validation (power loss, reset, crash), and this is the previous
+            # system. Nothing to undo and no reason to reboot again.
+            record_interrupted_image(state, pending)
+            return
         validate_services(config)
         if pending.get("type") == "package":
             for source in pending.get("packages", []):
@@ -1352,6 +1358,22 @@ def command_mark_success(config, args):
         atomic_json(state_path(), state)
         PENDING_MARKER.unlink(missing_ok=True)
         print(f"Recovera {current['version']} passed validation and is now the default image.")
+
+
+def record_interrupted_image(state, pending):
+    reason = "interrupted before validation (power loss, reset or crash)"
+    if pending.get("transition"):
+        state["transition_approval"] = None
+        state["transition_last_attempt"] = {
+            "time": int(time.time()), "version": pending.get("version"),
+            "result": f"{reason}; the appliance returned to its previous system",
+        }
+    state["last_failure"] = {"version": pending.get("version"), "reason": reason}
+    state["pending"] = None
+    atomic_json(state_path(), state)
+    PENDING_MARKER.unlink(missing_ok=True)
+    print(f"Recovera {pending.get('version')} did not reach validation; "
+          "this appliance is running its previous system.")
 
 
 def previous_image_available(previous, config):
