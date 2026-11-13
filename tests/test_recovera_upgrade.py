@@ -1303,6 +1303,7 @@ class RecoveraUpgradeTests(unittest.TestCase):
         self.assertIn('visudo -cqf "$target/etc/sudoers.d/$name"', rules)
         self.assertIn('rm -f "$target/etc/sudoers.d/$name"', rules)
         self.assertIn("-m 0440 -o root -g root", rules)
+        self.assertIn('[ "$name" = 90-cloud-init-users ] && continue', rules)
 
     def test_failed_image_validation_clears_the_staged_transition(self):
         with tempfile.TemporaryDirectory() as directory:
