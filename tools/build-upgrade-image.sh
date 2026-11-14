@@ -7,6 +7,7 @@ ROOT=
 VERSION=
 SEQUENCE=
 CHANNEL=stable
+ALSO_CHANNELS=
 OUTPUT=
 SIGNING_KEY=
 PART_SIZE=1900M
@@ -20,6 +21,7 @@ CHANNELS_DIR=$REPO_ROOT/upgrade/channels
 usage() {
   echo "usage: sudo $0 --root DIR --version VERSION --sequence N --output DIR [--signing-key FILE] [--channel NAME] [--compression-level 0-9]" >&2
   echo "       [--os-version 24.04] [--from-os 22.04[,..] --minimum-version 0.6.37] [--channels-dir DIR]" >&2
+  echo "       [--also-channel NAME ...]  (publishable on these channels too, e.g. a candidate channel)" >&2
 }
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -27,6 +29,7 @@ while [ "$#" -gt 0 ]; do
     --version) VERSION=$2; shift 2;;
     --sequence) SEQUENCE=$2; shift 2;;
     --channel) CHANNEL=$2; shift 2;;
+    --also-channel) ALSO_CHANNELS="${ALSO_CHANNELS:+$ALSO_CHANNELS,}$2"; shift 2;;
     --os-version) OS_VERSION=$2; shift 2;;
     --from-os) FROM_OS=$2; shift 2;;
     --minimum-version) MINIMUM_VERSION=$2; shift 2;;
@@ -44,6 +47,10 @@ done
 [[ "$VERSION" =~ ^[0-9A-Za-z][0-9A-Za-z._-]{0,63}$ ]] || { echo "invalid version" >&2; exit 2; }
 [[ "$COMPRESSION_LEVEL" =~ ^[0-9]$ ]] || { echo "compression level must be 0 through 9" >&2; exit 2; }
 [[ "$CHANNEL" =~ ^[0-9A-Za-z][0-9A-Za-z._-]{0,31}$ ]] || { echo "invalid channel" >&2; exit 2; }
+for extra in ${ALSO_CHANNELS//,/ }; do
+  [[ "$extra" =~ ^[0-9A-Za-z][0-9A-Za-z._-]{0,31}$ ]] && [ "$extra" != "$CHANNEL" ] || {
+    echo "invalid --also-channel $extra" >&2; exit 2; }
+done
 [ -z "$OS_VERSION" ] || [[ "$OS_VERSION" =~ ^[0-9]{2}\.[0-9]{2}$ ]] || { echo "invalid --os-version" >&2; exit 2; }
 [ -z "$FROM_OS" ] || [[ "$FROM_OS" =~ ^[0-9]{2}\.[0-9]{2}(,[0-9]{2}\.[0-9]{2})*$ ]] || { echo "invalid --from-os" >&2; exit 2; }
 [ -z "$MINIMUM_VERSION" ] || [ -n "$FROM_OS" ] || { echo "--minimum-version needs --from-os" >&2; exit 2; }
@@ -51,8 +58,11 @@ if [ -n "$FROM_OS" ]; then
   [ -n "$OS_VERSION" ] || { echo "--from-os needs --os-version" >&2; exit 2; }
   # An operating-system transition is opt-in: it must never sit on a channel
   # that the automatic update window installs from.
-  if [[ ",$FROM_OS," != *",$OS_VERSION,"* ]] && [[ "$CHANNEL" != *-transition ]]; then
-    echo "an OS transition image must use a *-transition channel, not $CHANNEL" >&2; exit 2
+  if [[ ",$FROM_OS," != *",$OS_VERSION,"* ]]; then
+    for name in "$CHANNEL" ${ALSO_CHANNELS//,/ }; do
+      [[ "$name" == *-transition ]] || {
+        echo "an OS transition image must use *-transition channels only, not $name" >&2; exit 2; }
+    done
   fi
 fi
 # One sequence counter across every channel (see build-package-release.sh).
@@ -212,10 +222,10 @@ split -b "$PART_SIZE" -d -a 3 "$compressed" "$OUTPUT/recovera-$VERSION.img.xz.pa
 
 manifest=$OUTPUT/recovera-image-manifest.json
 python3 - "$VERSION" "$SEQUENCE" "$CHANNEL" "$image" "$compressed" "$OUTPUT" \
-  "$OS_VERSION" "$FROM_OS" "$MINIMUM_VERSION" > "$manifest" <<'PY'
+  "$OS_VERSION" "$FROM_OS" "$MINIMUM_VERSION" "$ALSO_CHANNELS" > "$manifest" <<'PY'
 import hashlib, json, pathlib, sys
 (version, sequence, channel, raw_name, compressed_name, output_name,
- os_version, from_os, minimum_version) = sys.argv[1:]
+ os_version, from_os, minimum_version, also_channels) = sys.argv[1:]
 def digest(path):
     value = hashlib.sha256()
     with open(path, 'rb') as stream:
@@ -234,6 +244,8 @@ manifest = {
               'sha256': digest(compressed), 'uncompressed_size': raw.stat().st_size,
               'uncompressed_sha256': digest(raw), 'parts': parts},
 }
+if also_channels:
+    manifest['channels'] = [channel] + also_channels.split(',')
 if os_version:
     manifest['os'] = {'id': 'ubuntu', 'version_id': os_version}
 if from_os:

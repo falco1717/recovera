@@ -479,7 +479,9 @@ class Cache:
                     self.github.download(available[name], temporary / name)
                 self.verify_signature(temporary / manifest_name, temporary / signature_name)
                 manifest = json.loads((temporary / manifest_name).read_text(encoding="utf-8"))
-                if (manifest.get("channel") != channel or manifest.get("version") != pointer.get("version")
+                channels = manifest.get("channels") if isinstance(manifest.get("channels"), list) else [manifest.get("channel")]
+                if (channel not in channels or manifest.get("channel") not in channels
+                        or manifest.get("version") != pointer.get("version")
                         or int(manifest.get("sequence", -1)) != int(pointer.get("sequence", -2))):
                     raise GatewayError("signed manifest does not match channel pointer")
                 names = self.manifest_assets(manifest)

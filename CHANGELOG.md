@@ -28,6 +28,12 @@ run, and more safety checks. See `docs/image-update-architecture.md`.
   just because the signed updater installed a newer `recovera-appliance` than
   the install bundle pinned (true of every updated appliance; seen on the
   24.04 image after the gateway-backed transition test).
+- One signed image can now be published on several channels: the manifest's
+  optional `channels` list (signed with it) names every channel it may appear
+  on, so the release tested on the candidate channel is the exact artifact the
+  production transition pointer later points at, not a rebuild. Builder:
+  `--also-channel NAME`. The gateway accepts a pointer whose channel is in the
+  list.
 - `upgrade/schema/image-manifest.schema.json` (JSON Schema 2020-12) documents
   the image manifest, including reserved fields for release notes, key ID,
   required space, rollback target, expiry, rollout rules and deltas.
