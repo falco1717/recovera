@@ -1,10 +1,10 @@
 {
   "schema": 1,
   "channel": "noble-stable",
-  "type": "package",
-  "release_tag": null,
-  "manifest_asset": null,
-  "signature_asset": null,
-  "sequence": 0,
-  "version": null
+  "type": "image",
+  "release_tag": "image-v0.6.47-noble.1",
+  "manifest_asset": "recovera-image-manifest.json",
+  "signature_asset": "recovera-image-manifest.json.sig",
+  "sequence": 51,
+  "version": "0.6.47-noble.1"
 }
