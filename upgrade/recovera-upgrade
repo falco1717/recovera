@@ -593,11 +593,28 @@ def verify_signature(manifest_path, signature_path, signers):
         raise UpgradeError("release manifest signature verification failed")
 
 
+def manifest_channels(manifest):
+    """Every channel a signed manifest may be published on.
+
+    `channel` is the primary one. An optional `channels` list lets one tested
+    release move from a candidate channel to its production channel without a
+    rebuild; the signature covers the list, so a gateway cannot add to it.
+    """
+    primary = manifest.get("channel")
+    extra = manifest.get("channels")
+    if extra is None:
+        return [primary]
+    if (not isinstance(extra, list) or primary not in extra or len(set(extra)) != len(extra)
+            or not all(isinstance(item, str) and CHANNEL_RE.fullmatch(item) for item in extra)):
+        raise UpgradeError("release manifest contains an invalid channel list")
+    return list(extra)
+
+
 def validate_release_identity(manifest, pointer, config):
     required = ("schema", "sequence", "version", "channel", "architecture")
     if any(key not in manifest for key in required) or manifest["schema"] not in (1, 2):
         raise UpgradeError("unsupported or incomplete release manifest")
-    if manifest["channel"] != config["CHANNEL"]:
+    if config["CHANNEL"] not in manifest_channels(manifest):
         raise UpgradeError("release manifest channel does not match appliance channel")
     if not re.fullmatch(r"[0-9A-Za-z][0-9A-Za-z._-]{0,63}", str(manifest["version"])):
         raise UpgradeError("release manifest contains an invalid version")

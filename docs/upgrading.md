@@ -77,9 +77,13 @@ explicitly so all three operations update the files firmware actually reads.
 From Recovera 0.6.39 the upgrade is delivered like any other release, through
 the update gateway, and an administrator only approves it:
 
-1. Publish the transition image on the `jammy-noble-transition` channel
-   (`upgrade/channels/jammy-noble-transition.json`). Appliances never install
-   from that channel on their own.
+1. Build the image once with `--channel jammy-noble-transition
+   --also-channel jammy-noble-candidate-transition`, sign it, and publish it
+   on the candidate channel first; a test appliance whose token lists that
+   channel (and whose `TRANSITION_CHANNEL` names it) runs the whole upgrade
+   through both gateways. Then point `jammy-noble-transition`
+   (`upgrade/channels/jammy-noble-transition.json`) at the **same release**.
+   Appliances never install from either channel on their own.
 2. On each appliance, **Configure → Device → Operating System Upgrade** shows
    the available upgrade, its download size and a readiness checklist (starting
    release, Recovera version, pool health, disk space, replication, restores).

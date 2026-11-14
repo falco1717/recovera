@@ -1619,6 +1619,23 @@ class RecoveraUpgradeTests(unittest.TestCase):
         self.assertIn("""want=$(grep -vc '^recovera-appliance=' "$INSTALL_DIR/lists/all-packages-versions.txt")""", verify)
         self.assertEqual(verify.count("grep -v '^recovera-appliance='"), 2)
 
+    def test_one_signed_release_can_serve_its_candidate_and_production_channels(self):
+        channels = self.module.manifest_channels
+        self.assertEqual(channels({"channel": "stable"}), ["stable"])
+        both = {"channel": "jammy-noble-transition",
+                "channels": ["jammy-noble-transition", "jammy-noble-candidate-transition"]}
+        self.assertEqual(channels(both), ["jammy-noble-transition", "jammy-noble-candidate-transition"])
+        for bad in (["jammy-noble-candidate-transition"], ["jammy-noble-transition", "jammy-noble-transition"],
+                    "jammy-noble-transition", ["jammy-noble-transition", "bad channel"]):
+            with self.assertRaises(self.module.UpgradeError):
+                channels({"channel": "jammy-noble-transition", "channels": bad})
+        builder = (ROOT / "tools" / "build-upgrade-image.sh").read_text()
+        self.assertIn("--also-channel) ALSO_CHANNELS=", builder)
+        self.assertIn("manifest['channels'] = [channel] + also_channels.split(',')", builder)
+        self.assertIn('for name in "$CHANNEL" ${ALSO_CHANNELS//,/ }; do', builder)
+        gateway = (ROOT / "gateway" / "recovera-gateway").read_text()
+        self.assertIn("if (channel not in channels or manifest.get(\"channel\") not in channels", gateway)
+
 
 if __name__ == "__main__":
     unittest.main()
