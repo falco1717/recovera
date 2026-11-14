@@ -1641,6 +1641,136 @@ class RecoveraUpgradeTests(unittest.TestCase):
         gateway = (ROOT / "gateway" / "recovera-gateway").read_text()
         self.assertIn("if (channel not in channels or manifest.get(\"channel\") not in channels", gateway)
 
+    # --- 0.6.47: boot-time state race, Datto's own 24.04 package builds ---
+
+    def committed_noble_fixture(self, root):
+        """The state a stale write left on an appliance after its 24.04 commit."""
+        state = root / "state.json"
+        state.write_text(json.dumps({
+            "installed": {"channel": "stable", "schema": 1, "sequence": 48, "type": "package", "version": "0.6.46"},
+            "installed_sequence": 48,
+            "pending": {"image": "/host/recovera/images/0.6.46-noble.1.img", "sequence": 49,
+                        "transition": True, "version": "0.6.46-noble.1"},
+            "transition_approval": {"version": "0.6.46-noble.1", "sequence": 49},
+            "transition_last_attempt": {"result": "cancelled: This appliance already runs Ubuntu 24.04.",
+                                        "version": "0.6.46-noble.1"},
+        }))
+        release = root / "release.json"
+        release.write_text(json.dumps({"schema": 1, "sequence": 49, "version": "0.6.46-noble.1"}))
+        return {"RECOVERA_UPGRADE_STATE": str(state), "RECOVERA_RELEASE_FILE": str(release)}, state
+
+    def test_scheduled_check_records_a_commit_that_a_stale_write_undid(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            environment, state = self.committed_noble_fixture(root)
+            with mock.patch.dict("os.environ", environment), \
+                 mock.patch.object(self.module, "PENDING_MARKER", root / "pending"), \
+                 mock.patch("sys.stderr", new_callable=io.StringIO):
+                self.module.cache_check_result({"available": False, "channel": "noble-stable"})
+            value = json.loads(state.read_text())
+            self.assertIsNone(value["pending"])
+            self.assertEqual(value["installed"]["version"], "0.6.46-noble.1")
+            self.assertEqual(value["installed_sequence"], 49)
+            self.assertIsNone(value["transition_approval"])
+            self.assertEqual(value["transition_last_attempt"]["result"], "completed")
+            self.assertEqual(value["available"], {"available": False, "channel": "noble-stable"})
+
+    def test_reconcile_leaves_a_release_that_still_awaits_validation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            environment, state = self.committed_noble_fixture(root)
+            marker = root / "pending"
+            marker.write_text("")
+            with mock.patch.dict("os.environ", environment), \
+                 mock.patch.object(self.module, "PENDING_MARKER", marker):
+                staged = json.loads(state.read_text())
+                self.assertFalse(self.module.reconcile_committed_image(staged))
+                marker.unlink()
+                # A staged image that has not booted yet is not the running release.
+                staged["pending"]["version"] = "0.6.47-noble.1"
+                self.assertFalse(self.module.reconcile_committed_image(staged))
+                staged["pending"] = {"type": "package", "version": "0.6.46-noble.1"}
+                self.assertFalse(self.module.reconcile_committed_image(staged))
+
+    def test_short_state_writes_reread_instead_of_restoring_an_old_copy(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory) / "state.json"
+            state.write_text(json.dumps({"pending": {"version": "a"}}))
+            with mock.patch.dict("os.environ", {"RECOVERA_UPGRADE_STATE": str(state)}):
+                before = self.module.read_json(state)
+                # Validation commits after the attempt note started.
+                state.write_text(json.dumps({"pending": None, "installed": {"version": "a"}}))
+                self.module.record_transition_attempt("a", "cancelled")
+            value = json.loads(state.read_text())
+            self.assertIsNone(value["pending"])
+            self.assertEqual(value["installed"], {"version": "a"})
+            self.assertEqual(before["pending"], {"version": "a"})
+        source = UPDATER.read_text()
+        for stale in ('cached = read_json(state_path(), {})\n        cached["available"] = result',
+                      'state = read_json(state_path(), {})\n    state["transition_last_attempt"]'):
+            self.assertNotIn(stale, source)
+
+    def test_install_transition_waits_while_a_release_awaits_validation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            environment, state = self.committed_noble_fixture(root)
+            marker = root / "pending"
+            marker.write_text("")
+            before = state.read_text()
+            with mock.patch.dict("os.environ", environment), \
+                 mock.patch.object(self.module, "require_root", lambda: None), \
+                 mock.patch.object(self.module, "PENDING_MARKER", marker), \
+                 mock.patch.object(self.module, "transition_status") as status:
+                arguments = argparse.Namespace(if_approved=True)
+                self.assertEqual(self.module.command_install_transition({"HOST_ROOT": str(root)}, arguments), 0)
+                status.assert_not_called()
+                with self.assertRaises(self.module.UpgradeError):
+                    self.module.command_install_transition({"HOST_ROOT": str(root)},
+                                                           argparse.Namespace(if_approved=False))
+            self.assertEqual(state.read_text(), before)
+
+    def test_withdrawn_approval_keeps_a_newer_one(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory) / "state.json"
+            newer = {"version": "0.6.47-noble.1", "sequence": 51}
+            state.write_text(json.dumps({"transition_approval": newer}))
+            with mock.patch.dict("os.environ", {"RECOVERA_UPGRADE_STATE": str(state)}):
+                self.module.withdraw_transition_approval({"version": "0.6.46-noble.1"}, "0.6.46-noble.1", "cancelled")
+                self.assertEqual(json.loads(state.read_text())["transition_approval"], newer)
+                self.module.withdraw_transition_approval(newer, "0.6.47-noble.1", "cancelled")
+                self.assertIsNone(json.loads(state.read_text())["transition_approval"])
+
+    def test_scheduled_check_runs_after_validation_and_skips_a_staged_release(self):
+        service = (ROOT / "upgrade" / "recovera-upgrade-check.service").read_text()
+        self.assertIn("After=network-online.target recovera-upgrade-validate.service", service)
+        loader = importlib.machinery.SourceFileLoader(
+            "recovera_upgrade_schedule_pending", str(ROOT / "upgrade" / "recovera-upgrade-schedule"))
+        with tempfile.TemporaryDirectory() as directory:
+            pending = Path(directory) / "pending"
+            pending.write_text("")
+            policy = Path(directory) / "policy.json"
+            policy.write_text(json.dumps({"channel": "stable", "window": {"start": 0, "end": 0}}))
+            environment = {"RECOVERA_PENDING_MARKER": str(pending), "RECOVERA_UPGRADE_POLICY": str(policy),
+                           "RECOVERA_MAINTENANCE": str(Path(directory) / "absent")}
+            with mock.patch.dict("os.environ", environment):
+                spec = importlib.util.spec_from_loader(loader.name, loader)
+                schedule = importlib.util.module_from_spec(spec)
+                loader.exec_module(schedule)
+                with mock.patch.object(schedule.subprocess, "run") as run, \
+                     mock.patch("sys.stdout", new_callable=io.StringIO):
+                    self.assertEqual(schedule.main(), 0)
+                run.assert_not_called()
+
+    def test_bundle_and_appliance_refuse_another_releases_datto_builds(self):
+        bundle = (ROOT / "tools" / "make-bundle.sh").read_text()
+        self.assertIn("built for another Ubuntu release than the base application", bundle)
+        self.assertFalse((ROOT / "tools" / "build-php-xattr-deb.sh").exists())
+        setup = (ROOT / "setup" / "setup.sh").read_text()
+        verify = setup[setup.index("verify() {"):]
+        self.assertIn('check "Datto packages are built for Ubuntu $VERSION_ID"', verify)
+        self.assertIn('check "PHP loads the libvirt extension"', verify)
+        self.assertIn("function_exists(\\\"libvirt_connect\\\")", verify)
+
 
 if __name__ == "__main__":
     unittest.main()

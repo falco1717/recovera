@@ -944,6 +944,48 @@ def state_path():
     return Path(os.environ.get("RECOVERA_UPGRADE_STATE", DEFAULT_STATE))
 
 
+def update_state(mutate):
+    """Apply `mutate(state)` to a fresh read of the state file and write it back.
+
+    Short bookkeeping writes (cached checks, attempt notes) run beside long
+    operations such as validation at boot. Re-reading under a lock keeps them
+    from writing back a copy taken before another process committed; a stale
+    copy once restored "pending" over a completed operating-system upgrade.
+    """
+    path = state_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.with_name(path.name + ".lock").open("a+") as lock:
+        if fcntl is not None:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+        state = read_json(path, {})
+        result = mutate(state)
+        atomic_json(path, state)
+        return result
+
+
+def reconcile_committed_image(state):
+    """Finish recording an image commit that a stale write undid.
+
+    Validation commits by writing the state and then removing the pending
+    marker. A pending image with no marker that is the running release was
+    therefore committed; a lost write left only the bookkeeping behind.
+    """
+    pending = state.get("pending") or {}
+    if not pending or pending.get("type") == "package" or PENDING_MARKER.exists():
+        return False
+    current = current_release()
+    if not current.get("version") or pending.get("version") != current.get("version"):
+        return False
+    if pending.get("transition"):
+        state["transition_approval"] = None
+        state["transition_last_attempt"] = {"time": int(time.time()), "version": current["version"],
+                                            "result": "completed"}
+    state["installed_sequence"] = int(current.get("sequence", 0))
+    state["installed"] = current
+    state["pending"] = None
+    return True
+
+
 def phase_path():
     """Durable record of the latest update operation, beside the shared state."""
     return state_path().with_name("phase.json")
@@ -1085,9 +1127,7 @@ def command_check(config, args):
             "sequence": None,
         }
         if args.cache:
-            cached = read_json(state_path(), {})
-            cached["available"] = result
-            atomic_json(state_path(), cached)
+            cache_check_result(result)
         print(json.dumps(result, indent=2, sort_keys=True))
         return 0
     available = int(manifest["sequence"]) > int(current.get("sequence", 0))
@@ -1111,11 +1151,19 @@ def command_check(config, args):
         "reboot_required": bool(manifest.get("reboot_required", True)),
     }
     if args.cache:
-        cached = read_json(state_path(), {})
-        cached["available"] = result
-        atomic_json(state_path(), cached)
+        cache_check_result(result)
     print(json.dumps(result, indent=2, sort_keys=True))
     return 0 if available else 3
+
+
+def cache_check_result(result):
+    """Record a scheduled check, repairing a commit that a stale write undid."""
+    def mutate(state):
+        if reconcile_committed_image(state):
+            print("recorded the running image as committed (its state had been overwritten)",
+                  file=sys.stderr)
+        state["available"] = result
+    update_state(mutate)
 
 
 def require_root():
@@ -1865,11 +1913,10 @@ def command_check_transition(config, args):
     with tempfile.TemporaryDirectory(prefix="transition-", dir=root) as temporary:
         result, _ = transition_status(config, args, Path(temporary))
     if args.cache:
-        state = read_json(state_path(), {})
-        state["transition_available"] = {key: result.get(key) for key in
-                                         ("available", "version", "target_os", "download_size", "detail")}
-        state["transition_available"]["checked"] = int(time.time())
-        atomic_json(state_path(), state)
+        cached = {key: result.get(key) for key in
+                  ("available", "version", "target_os", "download_size", "detail")}
+        cached["checked"] = int(time.time())
+        update_state(lambda state: state.__setitem__("transition_available", cached))
     print(json.dumps(result, indent=2, sort_keys=True))
     return 0
 
@@ -1905,9 +1952,17 @@ def command_cancel_transition(config, args):
 
 
 def record_transition_attempt(version, result):
-    state = read_json(state_path(), {})
-    state["transition_last_attempt"] = {"time": int(time.time()), "version": version, "result": result}
-    atomic_json(state_path(), state)
+    attempt = {"time": int(time.time()), "version": version, "result": result}
+    update_state(lambda state: state.__setitem__("transition_last_attempt", attempt))
+
+
+def withdraw_transition_approval(approval, version, result):
+    """Clear an approval that no longer applies, unless it changed meanwhile."""
+    def mutate(state):
+        if state.get("transition_approval") == approval:
+            state["transition_approval"] = None
+        state["transition_last_attempt"] = {"time": int(time.time()), "version": version, "result": result}
+    update_state(mutate)
 
 
 def peer_maintenance(action, *extra):
@@ -1919,8 +1974,13 @@ def peer_maintenance(action, *extra):
 def command_install_transition(config, args):
     """Run an approved operating-system upgrade without an administrator present."""
     require_root()
-    state = read_json(state_path(), {})
-    approval = state.get("transition_approval")
+    if PENDING_MARKER.exists():
+        # A staged release is waiting for its reboot or for validation of the
+        # boot in progress; validation owns the state until it has committed.
+        if args.if_approved:
+            return 0
+        raise UpgradeError("a staged release is waiting for its reboot or validation")
+    approval = read_json(state_path(), {}).get("transition_approval")
     if not approval:
         if args.if_approved:
             return 0
@@ -1931,16 +1991,14 @@ def command_install_transition(config, args):
     with tempfile.TemporaryDirectory(prefix="transition-", dir=root) as temporary:
         result, release = transition_status(config, args, Path(temporary))
         if not result["available"] or release is None:
-            state["transition_approval"] = None
-            atomic_json(state_path(), state)
-            record_transition_attempt(approval.get("version"), "cancelled: " + (result.get("detail") or "not available"))
+            withdraw_transition_approval(approval, approval.get("version"),
+                                         "cancelled: " + (result.get("detail") or "not available"))
             return 0
         manifest = release[2]
         if manifest["version"] != approval.get("version"):
-            state["transition_approval"] = None
-            atomic_json(state_path(), state)
-            record_transition_attempt(approval.get("version"),
-                                      f"cancelled: the published upgrade changed to {manifest['version']}; approve it again")
+            withdraw_transition_approval(
+                approval, approval.get("version"),
+                f"cancelled: the published upgrade changed to {manifest['version']}; approve it again")
             return 0
         tconfig = transition_config(config)
         ensure_newer(manifest)

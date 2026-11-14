@@ -1,6 +1,6 @@
 [Unit]
 Description=Install signed Recovera updates during the configured window
-After=network-online.target
+After=network-online.target recovera-upgrade-validate.service
 Wants=network-online.target
 ConditionPathExists=/etc/recovera/upgrade.conf
 

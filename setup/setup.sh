@@ -1647,6 +1647,17 @@ verify() {
   check "legacy cloud control plane is isolated"          "/usr/local/sbin/recovera-cloud-isolation verify"
   # libvirtd is socket-activated with --timeout 120, so "inactive" is normal; ask it instead
   check "libvirt answers (virsh version)"                  "virsh -c qemu:///system version"
+  # Agentless (ESX/Hyper-V) backups and screenshot verification call libvirt from PHP.
+  # A libvirt-php built for another PHP release installs cleanly and never loads.
+  check "PHP loads the libvirt extension"                  "php -r 'exit(function_exists(\"libvirt_connect\") ? 0 : 1);'"
+  # Datto tags its own builds "...ubuntuNN.NN". One built for another Ubuntu release
+  # (a leftover of a reference appliance's in-place upgrade) may install yet not work.
+  local VERSION_ID foreign
+  VERSION_ID=$(. /etc/os-release; echo "$VERSION_ID")
+  foreign=$(dpkg-query -W -f='${Package}=${Version}\n' | grep -E '[0-9]ubuntu[0-9]{2}\.(04|10)$' \
+    | grep -vE "ubuntu${VERSION_ID//./\\.}\$" | tr '\n' ' ')
+  check "Datto packages are built for Ubuntu $VERSION_ID"  "[ -z \"$foreign\" ]"
+  [ -z "$foreign" ] || echo "        built for another release: $foreign"
   check "RAM for recovery verification: ${mem_gb} GB >= ${MIN_RAM_GB} GB" \
                                                             "[ $mem_gb -ge $MIN_RAM_GB ]"
   if [ "$REQUIRE_KVM" = yes ]; then

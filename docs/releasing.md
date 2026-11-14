@@ -6,6 +6,11 @@ payload is private and must not be copied into the Git repository.
 1. Run the unit and integration tests and confirm a clean worktree.
 2. Confirm `setup/release.env` pins the intended private payload tag, asset, and
    SHA-256 digest.
+   The payload's package export (`tools/export-installed-packages.sh`) must
+   come from a Datto appliance running the bundle's Ubuntu release natively.
+   An appliance upgraded in place keeps some of Datto's previous-release
+   builds ("...ubuntu22.04" on 24.04); they install but fail at run time, so
+   `tools/make-bundle.sh` refuses them.
 3. Generate `SHA256SUMS` for the small release metadata files:
 
    ```bash

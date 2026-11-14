@@ -1,5 +1,34 @@
 # Changelog
 
+## v0.6.47 - 2026-11-14
+
+Fixes found on the first production 24.04 upgrades.
+
+- 24.04 images now carry Datto's own Ubuntu 24.04 builds of its packages. The
+  5.12.2 package export had come from an appliance upgraded in place, and 32
+  packages were still its 22.04 builds. The visible failure: `libvirt-php`
+  was built for PHP 8.1, never loaded in PHP 8.3, and every agentless
+  (ESX/Hyper-V) backup and screenshot verification failed with
+  `Undefined constant VIR_CRED_AUTHNAME`. Also replaced: `speedsync` (7.0),
+  `vddk-fuse`, `vmware-vix-disklib`, `datto-netctl`, `dtcserver`,
+  `rly-client`, `stitchfs`, `transmnt`, `mercuryftp`, `metalibvirt` (1.2.2,
+  prebuilt instead of compiled on the appliance), `smartmontools`,
+  `targetcli-fb` and others. Our locally built `php-xattr` is replaced by
+  Datto's `php8.3-xattr`; `tools/build-php-xattr-deb.sh` is gone. Eleven
+  22.04-only leftovers (`libicu70`, `libpython3.10`, `perl-modules-5.34`,
+  `target-restore`, `zsender`, ...) are removed.
+- `tools/make-bundle.sh` refuses an export whose Datto builds target another
+  Ubuntu release than the base application, and `setup.sh verify` checks that
+  PHP loads the libvirt extension and that no Datto package is built for
+  another Ubuntu release.
+- Boot-time race: the hourly update check could catch up at boot, run while
+  `recovera-upgrade-validate` committed a new release, and write back a copy
+  of the state taken before the commit (the release stayed "pending" and the
+  operating-system upgrade read "cancelled"). The check now runs after
+  validation and skips while a release is staged, short state writes re-read
+  the state under a lock, and the scheduled check repairs a commit that such
+  a write undid (pending image, no pending marker, image is running).
+
 ## v0.6.46 - 2026-11-13
 
 The image-update architecture work: one updater with explicit phases, a dry
