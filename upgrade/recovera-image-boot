@@ -60,6 +60,10 @@ case "${1:-}" in
     on_boot_root update-grub
     on_boot_root grub-reboot "$(entry "$2")"
     ;;
+  unstage)
+    [ "$#" -eq 1 ] || exit 2
+    clear_transient_boot_state
+    ;;
   commit)
     [ "$#" -eq 3 ] && valid_version "$2" && [ -f "$3" ] || exit 2
     on_boot_root grub-set-default "$(entry "$2")"
@@ -79,5 +83,5 @@ case "${1:-}" in
     on_boot_root grub-set-default "$fallback_entry"
     clear_transient_boot_state
     ;;
-  *) echo "usage: $0 {stage VERSION IMAGE|commit VERSION IMAGE|rollback VERSION|fallback}" >&2; exit 2 ;;
+  *) echo "usage: $0 {stage VERSION IMAGE|unstage|commit VERSION IMAGE|rollback VERSION|fallback}" >&2; exit 2 ;;
 esac

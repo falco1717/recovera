@@ -1521,6 +1521,57 @@ class RecoveraUpgradeTests(unittest.TestCase):
             self.module.transition_preflight(manifest, Path("."), argparse.Namespace(allow_busy=False))
         self.assertIn("backups are running: RJ-OR-SB (running)", raised.exception.blockers)
 
+    def test_disruptive_activity_covers_backups_restores_and_the_top_of_the_hour(self):
+        import datetime
+        idle = [{"check": "backups", "ok": True, "blocking": True, "detail": "no backups are running"},
+                {"check": "network", "ok": False, "blocking": True, "detail": "no default route"}]
+        busy = [{"check": "backups", "ok": False, "blocking": True,
+                 "detail": "backups are running: jprod-sb (transfer (prepare_volume))"}]
+        with mock.patch.object(self.module, "operational_checks", return_value=idle),              mock.patch.object(self.module, "active_restores", return_value=[]):
+            # A missing route does not make a restart disruptive.
+            self.assertEqual(self.module.disruptive_activity(datetime.datetime(2026, 11, 14, 2, 20)), [])
+            self.assertEqual(self.module.disruptive_activity(datetime.datetime(2026, 11, 14, 1, 55)),
+                             ["scheduled backups start at the top of the hour"])
+        with mock.patch.object(self.module, "operational_checks", return_value=busy),              mock.patch.object(self.module, "active_restores", return_value=["virtual machine screenshot"]):
+            self.assertEqual(self.module.disruptive_activity(datetime.datetime(2026, 11, 14, 2, 5)),
+                             ["backups are running: jprod-sb (transfer (prepare_volume))",
+                              "restores are active: virtual machine screenshot"])
+
+    def _fake_clock(self):
+        clock = [0.0]
+        return clock, mock.patch.object(self.module.time, "monotonic", lambda: clock[0]),             mock.patch.object(self.module.time, "sleep", lambda seconds: clock.__setitem__(0, clock[0] + seconds))
+
+    def test_wait_until_idle_needs_a_quiet_settle_period(self):
+        clock, monotonic, sleep = self._fake_clock()
+        # Idle, then a queued backup starts, then it finishes: the settle restarts.
+        readings = iter([[], ["backups are running: jprod-sb (running)"]] + [[]] * 20)
+        with monotonic, sleep, contextlib.redirect_stdout(io.StringIO()),              mock.patch.object(self.module, "disruptive_activity", side_effect=lambda: next(readings)):
+            self.module.wait_until_idle("restart", wait=3600, settle=180, poll=30)
+        self.assertEqual(clock[0], 30 + 30 + 180)
+
+    def test_wait_until_idle_blocks_when_the_appliance_stays_busy(self):
+        clock, monotonic, sleep = self._fake_clock()
+        busy = ["backups are running: RJ-OR-SB (running)"]
+        with monotonic, sleep, contextlib.redirect_stdout(io.StringIO()),              mock.patch.object(self.module, "disruptive_activity", return_value=busy),              self.assertRaises(self.module.BlockedError) as raised:
+            self.module.wait_until_idle("restart into Recovera 0.6.48", wait=600, settle=180, poll=30)
+        self.assertEqual(raised.exception.blockers, busy)
+        self.assertEqual(clock[0], 600)
+
+    def test_image_install_rechecks_activity_right_before_rebooting(self):
+        source = UPDATER.read_text()
+        install = source[source.index("def command_install_image"):source.index("def dpkg_field")]
+        self.assertLess(install.index("transition_preflight("), install.index("wait_until_idle("))
+        before_staging = install.index('record_phase("STAGING")')
+        self.assertIn("wait_until_idle(", install[install.index("inspect_image("):before_staging])
+        reboot = install[install.index('record_phase("READY_TO_REBOOT")'):]
+        self.assertLess(reboot.index("disruptive_activity()"), reboot.index('record_phase("REBOOTING")'))
+        self.assertLess(reboot.index('run([BOOT_HELPER, "unstage"]'), reboot.index('record_phase("REBOOTING")'))
+        self.assertIn("PENDING_MARKER.unlink", reboot[:reboot.index('record_phase("REBOOTING")')])
+        helper = (ROOT / "upgrade" / "recovera-image-boot").read_text()
+        self.assertIn('  unstage)\n    [ "$#" -eq 1 ] || exit 2\n    clear_transient_boot_state', helper)
+        packages = source[source.index("def command_install_packages"):source.index("def command_install(")]
+        self.assertLess(packages.index("wait_until_idle("), packages.index('record_phase("DOWNLOADING"'))
+
     def test_failures_record_failed_or_blocked_but_keep_a_rollback(self):
         with tempfile.TemporaryDirectory() as directory, \
                 mock.patch.dict("os.environ", self._state_env(directory)):
