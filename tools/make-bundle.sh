@@ -78,6 +78,25 @@ for candidate in "$B"/debs/*.deb; do
   fi
 done
 [ -n "$source_deb" ] || { echo "required base application package not found"; exit 1; }
+
+# Datto tags its own builds "...ubuntuNN.NN". A reference appliance upgraded in
+# place keeps some of the previous release's builds; they install, then fail
+# at run time (a 22.04 libvirt-php never loads in PHP 8.3). Export from an
+# appliance whose Datto packages are all built for the bundle's release.
+release=$(dpkg-deb -f "$source_deb" Version | grep -oE 'ubuntu[0-9]{2}\.(04|10)$' || true)
+if [ -n "$release" ]; then
+  mixed=$(for deb in "$B"/debs/*.deb; do
+    version=$(dpkg-deb -f "$deb" Version)
+    if [[ "$version" =~ [0-9]ubuntu[0-9]{2}\.(04|10)$ ]] && [[ "$version" != *"$release" ]]; then
+      echo "  $(dpkg-deb -f "$deb" Package)=$version"
+    fi
+  done)
+  if [ -n "$mixed" ]; then
+    echo "packages built for another Ubuntu release than the base application (${release#ubuntu}):"
+    echo "$mixed"
+    exit 1
+  fi
+fi
 tmp=$(mktemp -d)
 cleanup() {
   # The source package contains deliberately non-traversable config directories

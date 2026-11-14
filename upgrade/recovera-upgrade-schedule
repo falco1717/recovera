@@ -13,6 +13,8 @@ POLICY = Path(os.environ.get("RECOVERA_UPGRADE_POLICY", "/etc/recovera/update-po
 UPDATER = os.environ.get("RECOVERA_UPGRADE_COMMAND", "/usr/local/sbin/recovera-upgrade")
 # Set by `recovera-peer maintenance on` while the appliance is drained.
 MAINTENANCE = Path(os.environ.get("RECOVERA_MAINTENANCE", "/run/recovera/maintenance"))
+# Present from staging until validation commits the booted release.
+PENDING = Path(os.environ.get("RECOVERA_PENDING_MARKER", "/host/recovera/pending"))
 
 
 def main() -> int:
@@ -30,6 +32,10 @@ def main() -> int:
         return 0
     if MAINTENANCE.exists():
         print("recovera-upgrade-schedule: appliance is in maintenance; skipping")
+        return 0
+    if PENDING.exists():
+        # The timer catches up at boot, alongside validation of a new release.
+        print("recovera-upgrade-schedule: a staged release awaits its reboot or validation; skipping")
         return 0
     if channel != "stable" or not 0 <= start <= 23 or not 0 <= end <= 23:
         print("recovera-upgrade-schedule: unsupported policy", file=sys.stderr)
