@@ -1196,6 +1196,11 @@ class RecoveraUpgradeTests(unittest.TestCase):
         self.assertIn("--exclude='/home/*'", builder)
         self.assertIn("--exclude='/var/log/journal/*'", builder)
         self.assertIn("! -name 'recovera-appliance_*.deb' -delete", builder)
+        # Excluded from the copy, not only deleted after it (freed blocks keep data).
+        copy = builder[builder.index("rsync -aHAX --numeric-ids --one-file-system"):]
+        copy = copy[:copy.index('"$ROOT"/ "$mountpoint"/')]
+        self.assertLess(copy.index("--include='/opt/recovera/debs/recovera-appliance_*.deb'"),
+                        copy.index("--exclude='/opt/recovera/debs/*'"))
 
     # --- 0.6.45: resumable image downloads ---
 
