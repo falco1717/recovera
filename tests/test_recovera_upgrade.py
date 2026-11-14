@@ -1770,6 +1770,8 @@ class RecoveraUpgradeTests(unittest.TestCase):
         self.assertIn('check "Datto packages are built for Ubuntu $VERSION_ID"', verify)
         self.assertIn('check "PHP loads the libvirt extension"', verify)
         self.assertIn("function_exists(\\\"libvirt_connect\\\")", verify)
+        # Only installed packages: a removed one keeps its version in "rc" state.
+        self.assertIn("awk -F '\\t' '$1 ~ /^ii/ {print $2}'", verify)
 
 
 if __name__ == "__main__":
