@@ -1654,8 +1654,10 @@ verify() {
   # (a leftover of a reference appliance's in-place upgrade) may install yet not work.
   local VERSION_ID foreign
   VERSION_ID=$(. /etc/os-release; echo "$VERSION_ID")
-  foreign=$(dpkg-query -W -f='${Package}=${Version}\n' | grep -E '[0-9]ubuntu[0-9]{2}\.(04|10)$' \
-    | grep -vE "ubuntu${VERSION_ID//./\\.}\$" | tr '\n' ' ')
+  # Installed packages only: a removed package keeps its version while its
+  # configuration files remain ("rc").
+  foreign=$(dpkg-query -W -f='${db:Status-Abbrev}\t${Package}=${Version}\n' | awk -F '\t' '$1 ~ /^ii/ {print $2}' \
+    | grep -E '[0-9]ubuntu[0-9]{2}\.(04|10)$' | grep -vE "ubuntu${VERSION_ID//./\\.}\$" | tr '\n' ' ')
   check "Datto packages are built for Ubuntu $VERSION_ID"  "[ -z \"$foreign\" ]"
   [ -z "$foreign" ] || echo "        built for another release: $foreign"
   check "RAM for recovery verification: ${mem_gb} GB >= ${MIN_RAM_GB} GB" \
