@@ -1,5 +1,20 @@
 # Changelog
 
+## v0.6.48 - 2026-11-14
+
+- Automatic updates no longer restart the appliance during a backup. The
+  backup, restore, package-manager and migration checks used to run only in
+  the dry-run report and before an operating-system transition. An image
+  update started at 01:02 while a 01:00 agent backup was running, verified
+  for minutes, and the next run rebooted the appliance in the middle of the
+  02:00 backup. Image and package installs now wait (up to two hours) for
+  three quiet minutes before starting and again before staging, check once
+  more just before the reboot, and never restart in the ten minutes before
+  the hour, when Datto starts scheduled backups. If the appliance stays busy
+  the run is recorded as blocked and retried; an image staged moments
+  earlier is withdrawn (`recovera-image-boot unstage`) so an unrelated
+  restart does not boot it.
+
 ## v0.6.47 - 2026-11-14
 
 Fixes found on the first production 24.04 upgrades.

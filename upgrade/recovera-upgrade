@@ -779,6 +779,59 @@ def operational_checks(*, require_idle):
     return checks
 
 
+# Datto queues a scheduled backup on the hour and starts it about a minute
+# later; `snapctl asset:backup:list` reads idle until it starts. So activity
+# must stay away for a settle period, and nothing restarts the appliance in the
+# minutes before the hour.
+IDLE_SETTLE_SECONDS = 180
+IDLE_WAIT_SECONDS = 2 * 3600
+IDLE_POLL_SECONDS = 30
+TOP_OF_HOUR_GUARD_MINUTES = 10
+
+
+def disruptive_activity(now=None):
+    """What restarting services or the appliance would interrupt right now."""
+    problems = [check["detail"] for check in operational_checks(require_idle=True)
+                if check["check"] != "network" and not check["ok"]]
+    restores = active_restores()
+    if restores:
+        problems.append("restores are active: " + ", ".join(restores))
+    if (now or datetime.datetime.now()).minute >= 60 - TOP_OF_HOUR_GUARD_MINUTES:
+        problems.append("scheduled backups start at the top of the hour")
+    return problems
+
+
+def wait_until_idle(purpose, *, wait=None, settle=None, poll=None):
+    """Return once nothing disruptive has run for `settle` seconds.
+
+    Raises BlockedError if the appliance is still busy after `wait` seconds;
+    the caller has changed nothing it cannot undo, and the next run retries.
+    """
+    wait = IDLE_WAIT_SECONDS if wait is None else wait
+    settle = IDLE_SETTLE_SECONDS if settle is None else settle
+    poll = IDLE_POLL_SECONDS if poll is None else poll
+    deadline = time.monotonic() + wait
+    quiet_since = None
+    reported = None
+    while True:
+        problems = disruptive_activity()
+        now = time.monotonic()
+        if problems:
+            quiet_since = None
+            if problems != reported:
+                print(f"Waiting to {purpose}: " + "; ".join(problems), flush=True)
+                reported = problems
+        elif quiet_since is None:
+            quiet_since = now
+        if quiet_since is not None and now - quiet_since >= settle:
+            return
+        if now >= deadline:
+            problems = problems or ["backups or restores kept starting"]
+            raise BlockedError(f"the appliance stayed busy, so it did not {purpose}:\n- "
+                               + "\n- ".join(problems), problems)
+        time.sleep(max(0.0, min(poll, deadline - now)))
+
+
 def update_window(now=None):
     """(open, window) for the configured automatic update window."""
     window = {"start": 21, "end": 5}
@@ -1294,6 +1347,9 @@ def command_install_image(config, args, release):
     pointer, assets, manifest, manifest_path, signature_path = release
     host = Path(config["HOST_ROOT"])
     transition_preflight(manifest, host, args)
+    guarded = args.reboot and not getattr(args, "allow_busy", False)
+    if guarded:
+        wait_until_idle(f"start installing Recovera {manifest['version']}")
     images = host / "recovera/images"
     downloads = host / "recovera/downloads"
     images.mkdir(parents=True, exist_ok=True)
@@ -1314,6 +1370,14 @@ def command_install_image(config, args, release):
         pending.unlink(missing_ok=True)
         raise
     inspect_image(pending, manifest)
+    if guarded:
+        # Verification takes minutes; a backup may have started meanwhile.
+        # Nothing is staged yet, so a timeout here leaves the appliance as it was.
+        try:
+            wait_until_idle(f"restart into Recovera {manifest['version']}")
+        except BlockedError:
+            pending.unlink(missing_ok=True)
+            raise
     record_phase("STAGING")
     migrate_appliance_config(pending)
     os.replace(pending, target)
@@ -1321,6 +1385,7 @@ def command_install_image(config, args, release):
     shutil.copyfile(signature_path, images / f"{manifest['version']}.manifest.sig")
     current = current_release()
     state = read_json(state_path(), {})
+    unstaged = {key: state.get(key) for key in ("pending", "previous", "release_tag", "last_transaction")}
     state.update({
         "pending": {"version": manifest["version"], "sequence": manifest["sequence"], "image": str(target),
                     "transition": bool(manifest.get("from"))},
@@ -1344,6 +1409,17 @@ def command_install_image(config, args, release):
     record_phase("READY_TO_REBOOT")
     print(f"Recovera {manifest['version']} is verified and staged for one-time boot.")
     if args.reboot:
+        if guarded and disruptive_activity():
+            try:
+                wait_until_idle(f"restart into Recovera {manifest['version']}")
+            except BlockedError:
+                # Withdraw the one-time boot so an unrelated restart does not
+                # start the new system; the next run stages it again.
+                run([BOOT_HELPER, "unstage"], check=False)
+                state.update(unstaged)
+                atomic_json(state_path(), state)
+                PENDING_MARKER.unlink(missing_ok=True)
+                raise
         record_phase("REBOOTING")
         run(["systemctl", "reboot"])
     else:
@@ -1506,6 +1582,10 @@ def commit_package_transaction(config, state):
 def command_install_packages(config, args, release):
     require_root()
     pointer, assets, manifest, manifest_path, signature_path = release
+    guarded = args.reboot and not getattr(args, "allow_busy", False)
+    if guarded:
+        # Installing restarts services; the automatic run waits for quiet.
+        wait_until_idle(f"install Recovera {manifest['version']}")
     root = config_path(config, "TRANSACTION_ROOT", DEFAULT_TRANSACTION_ROOT)
     transaction_dir = root / f"{int(manifest['sequence']):08d}-{manifest['version']}"
     downloads = transaction_dir / "packages"
@@ -1599,6 +1679,8 @@ def command_install_packages(config, args, release):
         record_phase("READY_TO_REBOOT")
         print(f"Recovera {manifest['version']} package update is installed and awaiting reboot validation.")
         if args.reboot:
+            if guarded and disruptive_activity():
+                wait_until_idle(f"restart to validate Recovera {manifest['version']}")
             record_phase("REBOOTING")
             run(["systemctl", "reboot"])
         else:
