@@ -2,9 +2,9 @@
   "schema": 1,
   "channel": "jammy-noble-transition",
   "type": "image",
-  "release_tag": "image-v0.6.46-noble.1",
-  "manifest_asset": "recovera-image-manifest.json",
-  "signature_asset": "recovera-image-manifest.json.sig",
-  "sequence": 49,
-  "version": "0.6.46-noble.1"
+  "release_tag": null,
+  "manifest_asset": null,
+  "signature_asset": null,
+  "sequence": 0,
+  "version": null
 }
